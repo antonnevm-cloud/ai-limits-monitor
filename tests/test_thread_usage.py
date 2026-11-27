@@ -145,6 +145,22 @@ def test_claude_spend_counts_each_answer_once_and_includes_subagents(journals):
     assert daily["trade_demo"][1] == pytest.approx(opus_1000 + cost_of(50_000, 0.20) + opus_1000 + cost_of(1000, 2))
 
 
+def test_claude_spend_includes_workflow_agents(journals):
+    claude, _codex, week_start, _main, _rollout, _now = journals
+    scanner = UsageScanner(claude, None)
+    now = week_start + dt.timedelta(days=3)
+    before = scanner.scan({"claude": week_start}, {"claude": 30.0}, now=now).spend("claude", "s1").cost
+    # Агенты инструмента Workflow пишут журналы глубже обычных субагентов: subagents/workflows/<запуск>/.
+    run = claude / "C--Workspace-Clients-Example-trade-demo" / "s1" / "subagents" / "workflows" / "wf_demo-1"
+    run.mkdir(parents=True)
+    (run / "agent-w.jsonl").write_text(
+        claude_line("wf1", week_start + dt.timedelta(days=2), USAGE, model="claude-sonnet-5-5", sidechain=True),
+        encoding="utf-8")
+    report = scanner.scan({"claude": week_start}, {"claude": 30.0}, now=now)
+    assert report.spend("claude", "s1").cost == pytest.approx(before + cost_of(1000, 2))
+    assert report.spend("claude", "agent-w") is None and report.spend("claude", "wf_demo-1") is None
+
+
 def test_rescan_reads_only_new_complete_lines(journals):
     claude, _codex, week_start, main, _rollout, _now = journals
     scanner = UsageScanner(claude, None)

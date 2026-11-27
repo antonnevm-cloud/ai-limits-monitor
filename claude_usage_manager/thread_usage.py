@@ -143,9 +143,18 @@ class UsageScanner:
                     path = Path(entry.path)
                     yield path, path.stem, False
                 elif entry.is_dir():
-                    for child in self._entries(Path(entry.path) / "subagents"):
-                        if child.name.endswith(".jsonl") and child.is_file():
-                            yield Path(child.path), entry.name, True
+                    # Субагенты инструмента Agent лежат прямо в subagents, агенты Workflow глубже:
+                    # subagents/workflows/<запуск>/. Все они тратят лимит этого треда.
+                    for child in self._jsonl_tree(Path(entry.path) / "subagents"):
+                        yield child, entry.name, True
+
+    @classmethod
+    def _jsonl_tree(cls, root: Path) -> Iterator[Path]:
+        for entry in cls._entries(root):
+            if entry.name.endswith(".jsonl") and entry.is_file():
+                yield Path(entry.path)
+            elif entry.is_dir(follow_symlinks=False):
+                yield from cls._jsonl_tree(Path(entry.path))
 
     @staticmethod
     def _entries(root) -> Iterator[os.DirEntry[str]]:
