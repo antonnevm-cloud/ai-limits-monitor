@@ -63,6 +63,13 @@ class BackendService:
             }
 
     def request_refresh(self):
+        # Явное обновление (кнопка, сохранение подключений) спрашивает клиентов заново,
+        # а не отдает запомненный ответ или запомненный отказ.
+        from .grok_provider import reset_cli_cache
+        from .quota import reset_codex_rate_limits_cache
+
+        reset_cli_cache()
+        reset_codex_rate_limits_cache()
         self._requested.set()
         for pending in self._provider_requests.values():
             self._wake_provider(pending)

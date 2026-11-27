@@ -167,18 +167,19 @@ def _cli_response(messages: "queue.Queue[dict[str, Any] | None]", request_id: in
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("Grok CLI response timeout")
+            raise TimeoutError("Grok Build не ответил вовремя")
         try:
             message = messages.get(timeout=remaining)
         except queue.Empty as error:
-            raise TimeoutError("Grok CLI response timeout") from error
+            raise TimeoutError("Grok Build не ответил вовремя") from error
         if message is None:
-            raise RuntimeError("Grok CLI closed the response stream")
+            raise RuntimeError("Grok Build завершился без ответа. Проверь установку клиента и вход в Grok.")
         if message.get("id") != request_id:
             continue
         failure = message.get("error")
         if isinstance(failure, dict):
-            raise RuntimeError(f"Grok CLI error {failure.get('code')}: {str(failure.get('message') or 'unknown')[:160]}")
+            raise RuntimeError(f"Grok Build отказал в запросе лимита (код {failure.get('code')}): "
+                               f"{str(failure.get('message') or 'без описания')[:160]}")
         return message
 
 
@@ -203,7 +204,7 @@ def read_billing_from_cli(init_timeout: float = CLI_INIT_TIMEOUT, billing_timeou
             env=provider_environment("grok"),
         )
         if process.stdin is None or process.stdout is None:
-            raise RuntimeError("Grok CLI pipes are unavailable")
+            raise RuntimeError("Не удалось связаться с запущенным Grok Build")
         messages: "queue.Queue[dict[str, Any] | None]" = queue.Queue()
         threading.Thread(target=_cli_reader, args=(process.stdout, messages), name="grok-billing-reader", daemon=True).start()
 
@@ -242,12 +243,14 @@ def _billing_cached(now: dt.datetime) -> tuple[dict[str, Any], dt.datetime]:
             _CLI_CACHE.clear()
             _CLI_CACHE["profile"] = key
         cached, stamp = _CLI_CACHE.get("value"), _CLI_CACHE.get("stamp")
-        if cached is not None and stamp is not None and monotonic_now - stamp < CLI_CACHE_SECONDS:
+        if (cached is not None and stamp is not None and monotonic_now - stamp < CLI_CACHE_SECONDS
+                and not _period_ended(cached, now)):
             return cached, _CLI_CACHE["observed"]
         failure = _CLI_CACHE.get("failure")
         if failure is not None and monotonic_now - failure[0] < failure[2]:
             raise RuntimeError(failure[1])
         retry_seconds = CLI_CACHE_SECONDS
+        incomplete_streak = 0
         try:
             value = read_billing_from_cli()
             observed = now
@@ -261,10 +264,16 @@ def _billing_cached(now: dt.datetime) -> tuple[dict[str, Any], dt.datetime]:
                               and start is not None and end is not None and start <= observed < end
                               and dt.timedelta(days=6) <= end - start <= dt.timedelta(days=8)
                               and config.get("creditUsagePercent") is None)
-                retry_seconds = CLI_INVALID_RETRY_SECONDS if incomplete else CLI_CACHE_SECONDS
-                raise ValueError("Grok CLI вернул недельный лимит в неожиданном виде")
+                if incomplete:
+                    # Неделя действует, а процента еще нет: повтор с нарастающей паузой, а не каждые 20 с.
+                    incomplete_streak = _CLI_CACHE.get("incomplete", 0) + 1
+                    retry_seconds = min(CLI_CACHE_SECONDS * 4,
+                                        CLI_INVALID_RETRY_SECONDS * 2 ** (incomplete_streak - 1))
+                    raise ValueError("Grok Build пока не сообщил процент недельного лимита")
+                raise ValueError("Grok Build вернул недельный лимит в неожиданном виде")
         except ValueError as error:
             _CLI_CACHE.pop("value", None)
+            _CLI_CACHE["incomplete"] = incomplete_streak
             _CLI_CACHE["failure"] = (time.monotonic(), str(error)[:240], retry_seconds)
             raise RuntimeError(str(error)) from error
         except (OSError, RuntimeError, subprocess.SubprocessError, TimeoutError) as error:
@@ -272,8 +281,17 @@ def _billing_cached(now: dt.datetime) -> tuple[dict[str, Any], dt.datetime]:
             _CLI_CACHE["failure"] = (time.monotonic(), str(error)[:240], CLI_FAILURE_SECONDS)
             raise
         _CLI_CACHE.pop("failure", None)
+        _CLI_CACHE.pop("incomplete", None)
         _CLI_CACHE["value"], _CLI_CACHE["stamp"], _CLI_CACHE["observed"] = value, time.monotonic(), observed
         return value, observed
+
+
+def _period_ended(value: dict[str, Any], now: dt.datetime) -> bool:
+    """Ответ CLI о неделе, которая уже закончилась, не показывается как текущий."""
+    config = value.get("config") if isinstance(value, dict) else None
+    period = config.get("currentPeriod") if isinstance(config, dict) else None
+    end = _timestamp(period.get("end")) if isinstance(period, dict) else None
+    return end is not None and end <= now
 
 
 def reset_cli_cache() -> None:

@@ -14,10 +14,18 @@ from .quota_monitor_model import MonitorData, build_compact_rows, build_rows, ca
 from .utils import parse_iso
 
 
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _open(target, *, timeout):
+    """Запрос к сборщику на 127.0.0.1 напрямую: системный прокси для него не нужен и может его сломать."""
+    return _DIRECT.open(target, timeout=timeout)
+
+
 def request_backend_refresh(*, base_url=f"http://127.0.0.1:{DEFAULT_PORT}"):
     try:
         request = urllib.request.Request(base_url + profile_api_path("/v1/refresh"), data=b"", method="POST")
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with _open(request, timeout=2) as response:
             return response.status == 202
     except (OSError, ValueError, urllib.error.URLError):
         return False
@@ -32,7 +40,7 @@ def existing_backend_available() -> bool:
         return False
     try:
         url = f"http://127.0.0.1:{DEFAULT_PORT}" + profile_api_path("/health")
-        with urllib.request.urlopen(url, timeout=0.6) as response:
+        with _open(url, timeout=0.6) as response:
             health = json.loads(response.read(4096))
         if not (isinstance(health, dict) and health.get("service") == "ai-limits-monitor"
                 and health.get("schema_version") == 1 and health.get("mode") == "backend"
@@ -76,7 +84,7 @@ def read_monitor_data(db, *, base_url=f"http://127.0.0.1:{DEFAULT_PORT}"):
     connected = False
     providers = {}
     try:
-        with urllib.request.urlopen(base_url + profile_api_path("/v1/snapshot"), timeout=2) as response:
+        with _open(base_url + profile_api_path("/v1/snapshot"), timeout=2) as response:
             payload = json.load(response)
         if isinstance(payload, dict) and payload.get("schema_version") == 1 and isinstance(payload.get("providers"), dict):
             providers = payload["providers"]

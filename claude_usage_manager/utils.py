@@ -71,6 +71,16 @@ def log_path() -> pathlib.Path:
     return data_dir() / "app.log"
 
 
+def client_workdir() -> pathlib.Path:
+    """Пустой рабочий каталог для запуска клиентов (agy, вход в Codex, Grok, Claude).
+
+    Клиент считает текущий каталог рабочей папкой проекта и не должен видеть историю и настройки монитора.
+    """
+    path = data_dir() / "client-workdir"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def claude_root() -> pathlib.Path:
     """Корень локальных данных Claude Code."""
     from .provider_settings import provider_profile

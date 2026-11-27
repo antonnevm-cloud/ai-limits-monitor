@@ -27,7 +27,7 @@ from .edge_grip import GRIP_WIDTH, EdgeGrip
 from .thread_view import FIELDS as THREAD_VIEW_FIELDS, SETTING_KEY as THREAD_VIEW_KEY, ThreadView
 from .toggle_switch import ToggleSwitch
 from .claude_local import bridge_command, install_statusline_command, manual_resets_edit_text, save_manual_resets
-from .claude_local import claude_root, read_statusline_quota, statusline_path
+from .claude_local import _owned_command, claude_root, read_statusline_quota, statusline_path
 from .claude_reset_dialog import ClaudeManualResetsDialog
 from .quota_columns import QuotaColumns, cell_label, limit_suffix, manual_reset_suffix, percent_text, primary_cell
 from .qt_theme import COLORS,build_stylesheet
@@ -1365,11 +1365,12 @@ class MonitorWindow(QMainWindow):
             QMessageBox.warning(self, 'Claude · локальная интеграция', str(error))
             return
         if result == 'conflict':
+            QApplication.clipboard().setText(bridge_command())
             QMessageBox.warning(
                 self, 'Claude · локальная интеграция',
-                'В Claude Code уже настроена своя строка состояния. '
-                'Она не изменена. Для объединения потребуется вручную добавить '
-                'локальный обработчик AI Limits в существующую команду.',
+                'В Claude Code уже настроена своя строка состояния. Она не изменена. '
+                'Чтобы получать лимиты, передай тот же ввод JSON из своей команды и этой команде '
+                '(она скопирована в буфер обмена):\n\n' + bridge_command(),
             )
         elif result == 'already':
             QMessageBox.information(self, 'Claude · локальная интеграция',
@@ -1390,13 +1391,14 @@ class MonitorWindow(QMainWindow):
             path = claude_root() / "settings.json"
             settings = json.loads(path.read_text(encoding="utf-8-sig")) if path.is_file() else {}
             entry = settings.get("statusLine", {}) if isinstance(settings, dict) else {}
-            configured = (
-                isinstance(entry, dict)
-                and entry.get("type") == "command"
-                and entry.get("command") == bridge_command()
-            )
+            command = entry.get("command") if isinstance(entry, dict) else None
             snapshot_file = statusline_path()
             snapshot_exists = snapshot_file.is_file()
+            # Обработчик монитора, вызванный из своей строки состояния, тоже считается подключением.
+            configured = (
+                isinstance(command, str)
+                and (command == bridge_command() or _owned_command(command) or snapshot_exists)
+            )
             snapshot = read_statusline_quota()
         except (OSError, ValueError, TypeError) as error:
             QMessageBox.warning(self, "Claude · проверка данных",

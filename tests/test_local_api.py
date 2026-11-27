@@ -133,6 +133,50 @@ def test_loopback_http_endpoints_and_refresh():
         server.stop()
 
 
+def test_loopback_api_rejects_browsers_and_coalesces_refresh():
+    import http.client
+
+    calls = []
+    server = LocalApiServer(lambda: {"codex": _state("codex", 1)}, lambda: calls.append(1), port=0)
+    server.start()
+    host, port = server.address
+
+    def call(method, path, headers=None, body=None):
+        connection = http.client.HTTPConnection(host, port, timeout=3)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    try:
+        # Подмена DNS: чужое имя узла, указывающее на 127.0.0.1.
+        assert call("GET", "/v1/snapshot", {"Host": f"attacker.example:{port}"})[0] == 403
+        # Страница браузера всегда присылает Origin.
+        assert call("POST", "/v1/refresh", {"Origin": "https://attacker.example"})[0] == 403
+        # Тело запроса не рвет соединение, повтор в течение 10 с не запускает новое обновление.
+        assert call("POST", "/v1/refresh", {"Content-Type": "application/json"}, b'{"x": 1}')[0] == 202
+        assert call("POST", "/v1/refresh")[0] == 202
+        assert calls == [1]
+    finally:
+        server.stop()
+
+
+def test_loopback_api_refuses_port_taken_by_another_program():
+    import socket
+
+    taken = socket.socket()
+    taken.bind(("127.0.0.1", 0))
+    taken.listen(1)
+    try:
+        server = LocalApiServer(lambda: {}, port=taken.getsockname()[1])
+        with pytest.raises(OSError):
+            server.start()
+    finally:
+        taken.close()
+
+
 def test_local_api_rejects_non_loopback_binding():
     with pytest.raises(ValueError, match="127.0.0.1"):
         LocalApiServer(lambda: {}, host="0.0.0.0")

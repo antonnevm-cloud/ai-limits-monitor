@@ -348,7 +348,7 @@ def test_codex_native_app_server_is_live_in_unified_widget(tmp_path, monkeypatch
         "codex": {"source_state": "live", "source": snapshot.source},
     }}
     monkeypatch.setattr(
-        backend_client.urllib.request, "urlopen",
+        backend_client, "_open",
         lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode("utf-8")),
     )
     result, connected = backend_client.read_monitor_data(db)

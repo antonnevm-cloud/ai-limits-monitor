@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -17,7 +18,7 @@ from . import provider_settings
 from .models import QuotaSnapshot, QuotaWindow
 from .process_utils import run_hidden
 from .statusline_command import statusline_command
-from .utils import data_dir, parse_iso
+from .utils import client_workdir, data_dir, parse_iso
 
 
 CLI_SOURCE = "antigravity:cli-usage"
@@ -131,9 +132,19 @@ def _snapshot(source: str, buckets: dict, observed: dt.datetime, now: dt.datetim
     return result
 
 
+_MODEL_TURN_PAUSE = 30 * 60
+_paused_until = 0.0
+
+
 def _native_usage(executable: Path, now: dt.datetime | None = None) -> QuotaSnapshot:
+    global _paused_until
     result = QuotaSnapshot(provider="antigravity", source=CLI_SOURCE)
-    options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=data_dir())
+    if time.monotonic() < _paused_until:
+        result.error = ("agy передал /usage модели вместо служебной команды. "
+                        "Опрос приостановлен на 30 минут, чтобы не расходовать квоту.")
+        return result
+    options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                   cwd=client_workdir(), env=provider_settings.provider_environment("antigravity"))
     try:
         version = run_hidden([str(executable), "--version"], timeout=5, **options)
         matched = re.fullmatch(rb"v?(\d{1,4})\.(\d{1,4})\.(\d{1,4})", version.stdout.strip())
@@ -148,6 +159,12 @@ def _native_usage(executable: Path, now: dt.datetime | None = None) -> QuotaSnap
         if len(report.stdout) > _MAX_INPUT:
             raise ValueError
         payload = json.loads(report.stdout)
+        if isinstance(payload, dict) and payload.get("num_turns") not in (0, None):
+            # Команда ушла модели: каждый повтор тратил бы квоту, поэтому опрос ставится на паузу.
+            _paused_until = time.monotonic() + _MODEL_TURN_PAUSE
+            result.error = ("agy передал /usage модели вместо служебной команды. "
+                            "Опрос приостановлен на 30 минут, чтобы не расходовать квоту.")
+            return result
         if not isinstance(payload, dict) or payload.get("status") != "SUCCESS" or payload.get("num_turns") != 0:
             raise ValueError
         command = payload.get("command")

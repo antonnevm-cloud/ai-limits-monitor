@@ -105,7 +105,9 @@ def test_manual_statusline_uses_unsaved_profile_and_preserves_existing_handler(d
     existing.write_text(body, encoding="utf-8")
     page.inputs["profile"].setText(str(first))
     page.statusline.click()
-    assert "другая настройка" in page.result.text()
+    assert "своя строка состояния" in page.result.text()
+    # Команду монитора можно вызвать из своей строки состояния: она показана и скопирована.
+    assert "--claude-statusline" in page.result.text()
     assert existing.read_text(encoding="utf-8") == body
     second = tmp_path / "second"
     page.inputs["profile"].setText(str(second))

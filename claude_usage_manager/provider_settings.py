@@ -77,11 +77,20 @@ def load_connections(*, strict: bool = False) -> dict[str, Connection]:
         return {key: _from_dict(key, raw.get(key, {})) for key in PROVIDER_NAMES}
     except FileNotFoundError:
         return {key: Connection() for key in PROVIDER_NAMES}
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError) as error:
         if strict:
             raise ValueError("Не удалось прочитать connections.json. Проверь настройки подключения.") from None
+        global _DAMAGED_REPORTED
+        if not _DAMAGED_REPORTED:
+            _DAMAGED_REPORTED = True
+            utils.get_logger().warning(
+                "Не удалось прочитать %s (%s): все источники выключены до исправления в окне \"Подключения\".",
+                utils.data_dir() / "connections.json", error)
         # Поврежденный файл не должен самовольно запускать отключенные клиенты.
         return {key: Connection(enabled=False) for key in PROVIDER_NAMES}
+
+
+_DAMAGED_REPORTED = False
 
 
 def validate_connection(provider: str, connection: Connection) -> Connection:
