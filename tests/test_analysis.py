@@ -1,4 +1,7 @@
 import datetime as dt
+import os
+
+import pytest
 
 from claude_usage_manager.analysis import (
     Analyzer,
@@ -78,6 +81,31 @@ def test_scan_exact_boundaries(make_claude_root, tmp_path):
     temp.mkdir()
     _metadata, events, _aliases = scan_logs(make_claude_root.root, START, END, temp)
     assert len(events) == 2
+
+
+def test_arbitrary_project_folder_and_user_request_reach_the_report(make_claude_root):
+    prompt = "Read GitHub issue 41 and explain the cause"
+    project = r"F:\Team\Clients\Network\v2"
+    make_claude_root("arbitrary-project", "S1.jsonl", [
+        {"type": "user", "sessionId": "S1", "cwd": project, "timestamp": START.isoformat(),
+         "message": {"content": prompt}},
+        _assistant("m1", START.isoformat()),
+    ])
+    metadata, _, _ = scan_logs(make_claude_root.root, START, END)
+    rows = merge_sessions([{"sessionId": "S1", "projectPath": "arbitrary-project"}], metadata, {})
+    assert rows[0].title == prompt
+    assert rows[0].project == "v2"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Проверка командного файла Windows")
+def test_ccusage_cmd_runs_from_a_custom_windows_folder(tmp_path, monkeypatch):
+    from claude_usage_manager import analysis
+
+    program = tmp_path / "Пакеты %TEMP% & !" / "ccusage.cmd"
+    program.parent.mkdir()
+    program.write_text('@echo off\necho {"first":"%1","last":"%6"}\n', encoding="ascii")
+    monkeypatch.setattr(analysis, "find_ccusage", lambda: program)
+    assert analysis.run_ccusage(tmp_path) == {"first": "claude", "last": "--offline"}
 
 
 def test_scan_stages_long_project_under_short_alias(make_claude_root, tmp_path):

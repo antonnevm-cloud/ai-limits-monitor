@@ -39,6 +39,19 @@ def _git_bash_installed() -> bool:
     return any((root / "bin/bash.exe").is_file() for root in roots)
 
 
+def _system_powershell() -> str:
+    import ctypes
+
+    directory = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(directory, len(directory))
+    if not 0 < length < len(directory):
+        raise OSError("Не удалось найти системный каталог Windows.")
+    program = Path(directory.value) / "WindowsPowerShell/v1.0/powershell.exe"
+    if not program.is_file():
+        raise FileNotFoundError("Системный Windows PowerShell не найден.")
+    return program.as_posix()
+
+
 def statusline_command(flag: str, *arguments: str) -> str:
     program = _monitor_program()
     args = [flag, *arguments]
@@ -50,13 +63,21 @@ def statusline_command(flag: str, *arguments: str) -> str:
     command_line = program + args
     # agy использует cmd, Claude Code выбирает Git Bash либо PowerShell.
     uses_cmd = flag == "--antigravity-statusline"
+    uses_bash = not uses_cmd and _git_bash_installed()
     special = any(c in value for value in command_line for c in ('%', '!', '"', '$', '^', '\\', chr(96), '\r', '\n'))
-    if special or (not uses_cmd and not _git_bash_installed()):
-        # Этот вызов одинаково читают все три оболочки, пути остаются литералами.
+    if special or not (uses_cmd or uses_bash):
         literals = ["'" + value.replace("'", "''") + "'" for value in command_line]
         script = "& " + " ".join(literals) + "; exit $LASTEXITCODE"
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-        return "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encoded
+        shell = _system_powershell()
+        if not re.fullmatch(r"[A-Za-z0-9:/_.-]+", shell):
+            if uses_cmd:
+                shell = f'call "{shell}"'
+            elif uses_bash:
+                shell = shlex.quote(shell)
+            else:
+                shell = "& '" + shell.replace("'", "''") + "'"
+        return shell + " -NoProfile -NonInteractive -EncodedCommand " + encoded
     words = [f'"{path}"' for path in program]
     words.extend(arg if re.fullmatch(r"[A-Za-z0-9_-]+", arg) else f'"{arg}"' for arg in args)
     # CALL сохраняет кавычки вокруг первого пути в cmd /c.

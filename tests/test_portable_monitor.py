@@ -20,7 +20,7 @@ def test_installed_widget_reuses_only_compatible_backend(monkeypatch):
     health = {"mode": "backend", "schema_version": 1, "status": "ok", "service": "ai-limits-monitor"}
     monkeypatch.setattr(backend_client.urllib.request, "urlopen",
                         lambda *a, **kw: io.BytesIO(json.dumps(health).encode()))
-    assert backend_client.existing_backend_available()
+    assert not backend_client.existing_backend_available()
     save_connections(load_connections())
     assert not backend_client.existing_backend_available()
     health.update(connections_schema=1, data_store=data_store_id())

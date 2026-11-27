@@ -669,6 +669,17 @@ class CacheThreadRow(QFrame):
         return True
 
 
+def invalidate_parent_layouts(widget: QWidget) -> None:
+    """Сразу пересчитывает размеры вложенного блока, карточки и окна."""
+    widget.updateGeometry()
+    parent = widget.parentWidget()
+    while parent is not None:
+        if parent.layout() is not None:
+            parent.layout().invalidate()
+        parent.updateGeometry()
+        parent = parent.parentWidget()
+
+
 class CacheThreadsBlock(QFrame):
     """Список тредов одного агента; строки обновляются по секундам без пересборки.
 
@@ -734,18 +745,7 @@ class CacheThreadsBlock(QFrame):
         # Размеры вложенных раскладок обновляются через очередь событий; окну нужна актуальная высота сразу.
         self._outer.invalidate()
         self._outer.activate()
-        self._invalidate_parents()
-
-    def _invalidate_parents(self) -> None:
-        """Сбрасывает запомненные размеры раскладок выше блока (карточка агента, окно), чтобы окно сразу увидело новую высоту."""
-        # updateGeometry сбрасывает размеры карточки, запомненные раскладкой окна; invalidate одной раскладки этого не делает.
-        self.updateGeometry()
-        parent = self.parentWidget()
-        while parent is not None:
-            if parent.layout() is not None:
-                parent.layout().invalidate()
-            parent.updateGeometry()
-            parent = parent.parentWidget()
+        invalidate_parent_layouts(self)
 
     def set_content(
         self,
@@ -847,7 +847,7 @@ class CacheThreadsBlock(QFrame):
         if width == self.minimumWidth():
             return False
         self.setMinimumWidth(width)
-        self._invalidate_parents()
+        invalidate_parent_layouts(self)
         return True
 
     def tick(self, now: dt.datetime) -> None:
@@ -856,7 +856,7 @@ class CacheThreadsBlock(QFrame):
             self._box.invalidate()
             self._box.activate()
             self._outer.invalidate()
-            self._invalidate_parents()
+            invalidate_parent_layouts(self)
             self.content_changed.emit()
 
     def _clear(self) -> None:

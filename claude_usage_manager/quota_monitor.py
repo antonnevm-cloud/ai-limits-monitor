@@ -3,10 +3,11 @@ from __future__ import annotations
 import ctypes, datetime as dt, json, logging, re, sys, time, traceback
 from html import escape
 from pathlib import Path
-from PySide6.QtCore import QByteArray,QObject,QPoint,QRect,QRectF,QRunnable,Qt,QThreadPool,QTimer,Signal,Slot
-from PySide6.QtGui import QCloseEvent,QColor,QFont,QIcon,QPainter,QPen,QPixmap
+from PySide6.QtCore import QByteArray,QObject,QPoint,QPointF,QRect,QRectF,QRunnable,QSize,Qt,QThreadPool,QTimer,Signal,Slot
+from PySide6.QtGui import QCloseEvent,QColor,QFont,QIcon,QPainter,QPen,QPixmap,QPolygonF
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication,QBoxLayout,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLayout,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
+from PySide6.QtWidgets import QApplication,QBoxLayout,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLayout,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QStyle,QStyleOptionToolButton,QStylePainter,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
+from .antigravity_details_qt import AntigravityDetails
 from .database import Database
 from .subscription_payments import next_monthly_payment, parse_last_payment
 from .icon import ensure_icon
@@ -30,9 +31,9 @@ from .qt_theme import COLORS,build_stylesheet
 from .quota_monitor_model import PROVIDERS,PROVIDER_LABELS,MonitorData,ProviderState,build_compact_rows,build_rows,cached_states,manual_reset_tooltip,refresh_monitor_data
 from .utils import get_logger,now_local,setup_logging
 from .windows_ui import enable_per_monitor_dpi_awareness,set_window_always_on_top
+from .widget_ipc import acquire_widget_mutex as _mutex
 
 MONITOR_NAME='AI Limits Monitor'; MONITOR_VERSION=APP_VERSION; DEFAULT_REFRESH=60; CACHE_SCAN_MS=10000; USAGE_SCAN_MS=30000; FORECAST_REFRESH_TICKS=30; FORECAST_SAMPLES_TTL=60; DEFAULT_LIST_WIDTH=380; CACHE_PROVIDERS=('claude','codex','grok'); CACHE_TTL_CHOICES={300,600,900,1800,3600}
-_MUTEX_NAME='AIUsageMonitor_SingleInstance_v1'; _ALREADY_EXISTS=183
 BADGES={'claude':'C','codex':'X','grok':'G','antigravity':'A'}
 BADGE_COLORS={'claude':'#A86F58','codex':'#426D72','grok':'#6A6F76','antigravity':'#5D4A87'}
 COMPACT_WIDTH=180; COMPACT_MIN_WIDTH=180; COMPACT_MIN_HEIGHT=150; FIT_SETTLE_MS=60; CACHE_SCREEN_MARGIN=24; MAX_USER_WIDTH=3000; DRAWER_WIDTH=300
@@ -171,12 +172,37 @@ class ProviderIcon(QLabel):
             mono=QPixmap(pix.size());mono.setDevicePixelRatio(dpr);mono.fill(Qt.GlobalColor.transparent);painter=QPainter(mono);painter.drawPixmap(0,0,pix);painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn);painter.fillRect(QRectF(0,0,ICON_LOGICAL_SIZE,ICON_LOGICAL_SIZE),QColor('#F0F3F7'));painter.end();self.setPixmap(mono)
         else:self.setText('•')
 
+_COMMAND_GLYPHS = {
+    'refresh': ('#8ED9CB', '<path d="M16 8a6.2 6.2 0 1 0 .2 4.5M16.5 3.5v5h-5"/>'),
+    'analytics': ('#94C3FF', '<path d="M3 16.5h14M5.5 12v-2.5M10 12V4M14.5 12V7"/>'),
+    'menu': ('#C5CFDE', '<g fill="#C5CFDE" stroke="none"><circle cx="3.5" cy="10" r="1.65"/>'
+                          '<circle cx="10" cy="10" r="1.65"/><circle cx="16.5" cy="10" r="1.65"/></g>'),
+    'hide': ('#B0BDCC', '<path d="M4 13.5h12"/>'),
+}
+
+
+def _command_icon(name):
+    color, glyph = _COMMAND_GLYPHS[name]
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="{color}" '
+           f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{glyph}</svg>')
+    renderer = QSvgRenderer(QByteArray(svg.encode('ascii')))
+    icon = QIcon()
+    for side in (16, 20, 24, 32, 48, 64):
+        pixmap = QPixmap(side, side)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter, QRectF(0, 0, side, side))
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
 class DisclosureButton(QToolButton):
     SIDE = 26
 
-    def __init__(self, agent_name):
+    def __init__(self, details_name):
         super().__init__()
-        self.agent_name = agent_name
+        self.details_name = details_name
         self.setObjectName('CardDisclosure')
         self.setCheckable(True)
         self.setFixedSize(self.SIDE, self.SIDE)
@@ -194,11 +220,32 @@ class DisclosureButton(QToolButton):
         self.setChecked(expanded)
         self.setArrowType(arrow)
         verb = 'Свернуть' if expanded else 'Развернуть'
-        label = f'{verb} треды {self.agent_name}'
+        label = f'{verb} {self.details_name}'
         self.setAccessibleName(label)
         self.setToolTip(label)
 
+    def paintEvent(self, event):
+        option = QStyleOptionToolButton()
+        self.initStyleOption(option)
+        option.arrowType = Qt.ArrowType.NoArrow
+        option.features &= ~QStyleOptionToolButton.ToolButtonFeature.Arrow
+        painter = QStylePainter(self)
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, option)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.width() / 2, self.height() / 2)
+        if self.isChecked():
+            painter.rotate(90)
+        color = '#A4D2FF' if self.isChecked() or self.hasFocus() else '#C0CCD8'
+        pen = QPen(QColor(color), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(QPolygonF([QPointF(-2, -4), QPointF(2, 0), QPointF(-2, 4)]))
+
     def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            if self.isChecked() != (event.key() == Qt.Key.Key_Right):
+                self.click()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if not event.isAutoRepeat():
                 self.click()
@@ -222,15 +269,9 @@ class CompactRow(QFrame):
         h = QHBoxLayout(self._identity)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
-        self.disclosure = None
-        if row.provider in CACHE_PROVIDERS:
-            self.disclosure = DisclosureButton(self.agent_name)
-            h.addWidget(self.disclosure, 0, Qt.AlignmentFlag.AlignVCenter)
-        else:
-            spacer = QWidget()
-            spacer.setFixedSize(DisclosureButton.SIDE, 1)
-            spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            h.addWidget(spacer)
+        details = 'лимиты' if row.provider == 'antigravity' else 'треды'
+        self.disclosure = DisclosureButton(f'{details} {self.agent_name}')
+        h.addWidget(self.disclosure, 0, Qt.AlignmentFlag.AlignVCenter)
         self.icon = ProviderIcon(row.provider)
         h.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
         identity = QVBoxLayout()
@@ -491,32 +532,40 @@ class MonitorWindow(QMainWindow):
         layout.setSpacing(3)
 
         header = QHBoxLayout()
-        header.setContentsMargins(2, 0, 0, 0)
-        title = QLabel('AI Limits')
+        header.setContentsMargins(4, 0, 1, 0)
+        header.setSpacing(7)
+        title = ElidedLabel('AI Limits')
         title.setObjectName('WidgetTitle')
+        title.setAccessibleName('AI Limits')
         title.setToolTip('Потяни за заголовок, чтобы переместить виджет')
-        header.addWidget(title)
-        header.addStretch()
+        header.addWidget(title, 1)
         self.updated = QLabel()
         self.updated.setObjectName('UpdatedLabel')
         header.addWidget(self.updated)
-        self.hide_button = self._command_button('Скрыть', 'Скрыть виджет в области уведомлений')
+        self.hide_button = self._command_button('hide', 'Скрыть', 'Скрыть виджет в области уведомлений')
         self.hide_button.setObjectName('HideWidget')
         self.hide_button.clicked.connect(self.hide_to_tray)
         header.addWidget(self.hide_button)
         layout.addLayout(header)
 
-        self.actions = QWidget()
+        self.actions = QFrame()
+        self.actions.setObjectName('WidgetActions')
+        self.actions.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         commands = QHBoxLayout(self.actions)
-        commands.setContentsMargins(0, 0, 0, 0)
-        commands.setSpacing(2)
-        self.refresh_button = self._command_button('Обновить', 'Обновить данные о лимитах')
+        commands.setContentsMargins(2, 2, 2, 2)
+        commands.setSpacing(1)
+        self.refresh_button = self._command_button('refresh', 'Обновить', 'Обновить данные о лимитах')
         self.refresh_button.clicked.connect(self.refresh_now)
-        self.analytics_button = self._command_button('Аналитика', 'Открыть подробную аналитику расхода')
+        self.analytics_button = self._command_button('analytics', 'Аналитика', 'Расход по сеансам, проектам и моделям')
         self.analytics_button.clicked.connect(self.open_detail)
-        self.menu_button = self._command_button('Меню', 'Настройки вида, подключения и другие команды')
-        for button in (self.refresh_button, self.analytics_button, self.menu_button):
-            commands.addWidget(button, 1)
+        self.menu_button = self._command_button('menu', 'Меню', 'Настройки вида, подключения и другие команды')
+        self._data_commands = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._data_commands.setSpacing(1)
+        self._data_commands.addWidget(self.refresh_button)
+        self._data_commands.addWidget(self.analytics_button)
+        commands.addLayout(self._data_commands)
+        commands.addStretch()
+        commands.addWidget(self.menu_button)
         layout.addWidget(self.actions)
 
         self.drawer = self._make_drawer()
@@ -532,9 +581,12 @@ class MonitorWindow(QMainWindow):
         self._build_grips()
 
     @staticmethod
-    def _command_button(text, tip):
+    def _command_button(glyph, text, tip):
         button = QPushButton(text)
         button.setObjectName('WidgetCommand')
+        button.setFlat(True)
+        button.setIcon(_command_icon(glyph))
+        button.setIconSize(QSize(16, 16))
         button.setAccessibleName(text)
         button.setToolTip(tip)
         button.setAccessibleDescription(tip)
@@ -609,6 +661,7 @@ class MonitorWindow(QMainWindow):
             item=self.rows_box.takeAt(0);w=item.widget()
             if w:w.hide();w.setParent(None);w.deleteLater()
     def _init_cache_threads(self,scan):
+        self.antigravity_expanded = self.db.get_setting('monitor_ag_quota_expanded', '0') == '1'
         self._connection_generation = 0
         self.cache_scanner=ThreadScanner(codex_ttl=self._load_int('monitor_cache_codex_ttl',CODEX_TTL_DEFAULT,CACHE_TTL_CHOICES),grok_ttl=self._load_int('monitor_cache_grok_ttl',GROK_TTL_DEFAULT,CACHE_TTL_CHOICES));self.cache_enabled=self.db.get_setting('monitor_cache_threads','1')!='0'
         self.cache_expanded={p:True for p,v in self._load_json('monitor_cache_expanded').items() if p in CACHE_PROVIDERS and v is True};self.cache_show_all={}
@@ -717,6 +770,12 @@ class MonitorWindow(QMainWindow):
         self.db.set_setting('monitor_cache_expanded',json.dumps(self.cache_expanded,sort_keys=True))
         if expanded and self._cache_scan:self._start_cache_scan();self._start_usage_scan()
         self._render()
+
+    def _set_antigravity_expanded(self, expanded):
+        self.antigravity_expanded = expanded
+        self.db.set_setting('monitor_ag_quota_expanded', '1' if expanded else '0')
+        self._render()
+
     def set_cache_show_all(self,provider,show_all):
         self.cache_show_all[provider]=bool(show_all);self._render()
     def _tick_cache(self):
@@ -870,16 +929,26 @@ class MonitorWindow(QMainWindow):
                 header = CompactRow(row, state, running=running, font_delta=delta, payment=payment)
                 self.header_rows[provider] = header
                 self.rows_box.addWidget(AgentCard(header))
-                if header.disclosure is not None:
+                if provider == 'antigravity':
+                    header.disclosure.clicked.connect(self._set_antigravity_expanded)
+                else:
                     header.disclosure.clicked.connect(lambda checked, p=provider: self.toggle_cache_provider(p))
             else:
                 header = self.header_rows[provider]
                 changed |= header.set_data(row, state, running)
                 changed |= header.set_payment(payment)
-            expanded = self.cache_enabled and header.disclosure is not None and bool(self.cache_expanded.get(provider))
-            if header.disclosure is not None:
-                header.disclosure.setVisible(self.cache_enabled)
-                header.disclosure.set_expanded(expanded)
+            card = header.parentWidget()
+            if provider == 'antigravity':
+                header.disclosure.set_expanded(self.antigravity_expanded)
+                block = None
+                if self.antigravity_expanded:
+                    block = card.block or AntigravityDetails(card)
+                    changed |= block.set_rows(self.data.rows.get(provider, []))
+                details_changed |= card.set_details(None, block)
+                continue
+            expanded = self.cache_enabled and bool(self.cache_expanded.get(provider))
+            header.disclosure.setVisible(self.cache_enabled)
+            header.disclosure.set_expanded(expanded)
             block = self.cache_blocks.get(provider)
             if expanded and block is None:
                 block = self._make_cache_block(provider)
@@ -893,7 +962,7 @@ class MonitorWindow(QMainWindow):
             else:
                 self.forecast_bars.pop(provider, None)
                 bar = None
-            details_changed |= header.parentWidget().set_details(bar, block)
+            details_changed |= card.set_details(bar, block)
         if not rebuilt:
             self._refill_cache_blocks()
             self._refresh_forecasts()
@@ -934,6 +1003,9 @@ class MonitorWindow(QMainWindow):
 
     def _cap_cache_blocks(self, layout, width, area):
         blocks = list(self.cache_blocks.values())
+        header = self.header_rows.get('antigravity')
+        if header is not None and header.parentWidget().block is not None:
+            blocks.append(header.parentWidget().block)
         if not blocks or area is None:
             return
         for block in blocks:
@@ -945,6 +1017,21 @@ class MonitorWindow(QMainWindow):
             for block, cap in zip(blocks, caps):
                 block.set_height_cap(cap)
 
+    def _fit_commands(self, width):
+        margins = self.actions.layout().contentsMargins()
+        buttons = self.refresh_button, self.analytics_button, self.menu_button
+        refresh, analytics, menu = (button.sizeHint().width() for button in buttons)
+        padding = margins.left() + margins.right() + 3
+        needed = refresh + analytics + menu + padding
+        self.actions.setMinimumWidth(max(refresh, analytics) + menu + padding)
+        direction = QBoxLayout.Direction.LeftToRight if needed <= width else QBoxLayout.Direction.TopToBottom
+        if self._data_commands.direction() != direction:
+            self._data_commands.setDirection(direction)
+            self.actions.layout().invalidate()
+            self.actions.layout().activate()
+            self.actions.updateGeometry()
+        return needed
+
     def _fit_to_content(self):
         before = self.geometry()
         layout = self.centralWidget().layout()
@@ -953,10 +1040,14 @@ class MonitorWindow(QMainWindow):
         if area is not None:
             target = min(target, area.width())
         frame = layout.contentsMargins()
+        needed = self._fit_commands(target - frame.left() - frame.right())
         for header in self.header_rows.values():
             card = header.parentWidget()
             border = card.contentsMargins()
-            header.fit_width(target - frame.left() - frame.right() - border.left() - border.right())
+            card_width = target - frame.left() - frame.right() - border.left() - border.right()
+            header.fit_width(card_width)
+            if isinstance(card.block, AntigravityDetails):
+                card.block.content_width = card_width
             card.layout().invalidate()
             card.layout().activate()
             card.updateGeometry()
@@ -964,7 +1055,8 @@ class MonitorWindow(QMainWindow):
         layout.invalidate()
         layout.activate()
         minimum = max(COMPACT_MIN_WIDTH, layout.totalMinimumSize().width())
-        preferred = DEFAULT_LIST_WIDTH if self.cache_blocks else min(DEFAULT_LIST_WIDTH, layout.totalSizeHint().width())
+        panel_width = needed + frame.left() + frame.right()
+        preferred = DEFAULT_LIST_WIDTH if self.cache_blocks else min(DEFAULT_LIST_WIDTH, max(panel_width, layout.totalSizeHint().width()))
         width = max(minimum, self.user_width or preferred)
         if area is not None:
             width = min(width, max(minimum, area.width()))
@@ -1174,7 +1266,17 @@ class MonitorWindow(QMainWindow):
     def open_detail(self):
         # The unified application overrides this method and owns the analytics window.
         return None
+
+    def open_help(self):
+        if self._help_dialog is None:
+            from .help_dialog import HelpDialog
+            self._help_dialog = HelpDialog(self)
+        self._help_dialog.showNormal()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
+
     def _build_tray(self):
+        self._help_dialog = None
         self.tray = QSystemTrayIcon(QIcon(str(ensure_icon())), self)
         menu = QMenu(self)
         menu.addAction('Настроить вид', self.toggle_drawer)
@@ -1193,6 +1295,9 @@ class MonitorWindow(QMainWindow):
         menu.addAction('Claude · проверить источник...', self.show_claude_connection)
         menu.addAction('Claude · сбросы вручную...', self.configure_claude_manual_resets)
         menu.addSeparator()
+        help_action = menu.addAction("Справка", self.open_help)
+        help_action.setShortcut("F1")
+        self.addAction(help_action)
         menu.addAction('Выход', self.quit_monitor)
         self.tray.setContextMenu(menu)
         self.menu_button.setMenu(menu)
@@ -1226,18 +1331,23 @@ STYLE=f'''
 QLabel#WidgetTitle{{font-family:"Segoe UI";font-size:10.5pt;font-weight:700;color:{COLORS['text']};}}
 QLabel#UpdatedLabel,QLabel#WidgetFooter{{color:{COLORS['faint']};font-size:7.5pt;}}
 QLabel#WidgetFooter{{padding-left:6px;}}
+QFrame#WidgetActions{{background:#141D27;border:none;border-radius:7px;}}
 QPushButton#WidgetCommand,QPushButton#HideWidget,QToolButton#CardDisclosure{{
-    background:{COLORS['panel_alt']};color:{COLORS['text']};border:1px solid {COLORS['border']};border-radius:5px;
+    background:transparent;color:#DBE4ED;border:1px solid transparent;border-radius:4px;
 }}
-QPushButton#WidgetCommand{{min-height:26px;padding:0;font-size:9pt;}}
-QPushButton#WidgetCommand::menu-indicator{{width:8px;height:8px;}}
-QPushButton#HideWidget{{min-height:22px;padding:0 6px;font-size:8.5pt;color:{COLORS['muted']};}}
+QPushButton#WidgetCommand{{min-height:26px;padding:0 3px;font-size:9pt;}}
+QPushButton#WidgetCommand::menu-indicator{{image:none;width:0;height:0;}}
+QPushButton#HideWidget{{min-height:22px;padding:0 3px;font-size:8.5pt;color:{COLORS['muted']};}}
 QToolButton#CardDisclosure{{padding:0;}}
-QPushButton#WidgetCommand:hover,QPushButton#HideWidget:hover,QToolButton#CardDisclosure:hover,QPushButton#CacheLink:hover{{
-    background:{COLORS['elevated']};color:{COLORS['text']};border-color:{COLORS['accent_hover']};
+QToolButton#CardDisclosure:checked{{background:#25384B;}}
+QPushButton#WidgetCommand:hover,QPushButton#HideWidget:hover,QToolButton#CardDisclosure:hover{{
+    background:#2B3B4D;color:#FFFFFF;
 }}
-QPushButton#WidgetCommand:pressed,QPushButton#HideWidget:pressed,QToolButton#CardDisclosure:pressed,
-QToolButton#CardDisclosure:checked,QPushButton#CacheLink:pressed{{background:{COLORS['selection']};}}
+QPushButton#WidgetCommand:pressed,QPushButton#HideWidget:pressed,QToolButton#CardDisclosure:pressed{{
+    background:#324C65;
+}}
+QPushButton#CacheLink:hover{{background:{COLORS['elevated']};color:{COLORS['text']};border-color:{COLORS['accent_hover']};}}
+QPushButton#CacheLink:pressed{{background:{COLORS['selection']};}}
 QPushButton#WidgetCommand:focus,QPushButton#HideWidget:focus,QToolButton#CardDisclosure:focus,QPushButton#CacheLink:focus{{
     border-color:#91BDF0;
 }}
@@ -1250,6 +1360,9 @@ QLabel#ResetNotice{{background:rgba(224,176,74,40);color:#E0B04A;font-size:8.5pt
 QLabel#ResetNotice[critical="true"]{{background:rgba(229,103,94,48);color:#E5675E;}}
 QFrame#QuotaColumns{{background:rgba(100,132,163,24);border:none;border-radius:6px;}}
 QFrame#QuotaColumns QLabel{{background:transparent;}}
+QLabel#QuotaLegend{{background:transparent;color:{COLORS['faint']};font-size:8pt;}}
+QLabel#QuotaGroup{{background:transparent;color:#A9C9EC;font-size:9.5pt;font-weight:600;padding-top:3px;}}
+QLabel#QuotaDetail,QLabel#QuotaEmpty{{background:transparent;color:{COLORS['text']};font-size:9pt;}}
 QFrame#Forecast{{background:transparent;border:none;}}
 QFrame#Forecast[divider="true"]{{border-bottom:1px solid rgba(70,88,106,120);}}
 QLabel#ForecastAxis{{background:transparent;color:{COLORS['faint']};font-size:8.25pt;}}
@@ -1311,14 +1424,6 @@ def scaled_style(delta):
     '''Стиль окна со сдвигом всех размеров шрифта на `delta` пунктов (настройка «Размер шрифта»).'''
     if not delta:return STYLE
     return _FONT_SIZE.sub(lambda match:f'font-size:{max(6.0,float(match.group(1))+delta):g}pt',STYLE)
-
-def _mutex():
-    if sys.platform!='win32':return True
-    k=ctypes.windll.kernel32;k.CreateMutexW.restype=ctypes.c_void_p;h=k.CreateMutexW(None,False,_MUTEX_NAME)
-    if k.GetLastError()==_ALREADY_EXISTS:
-        if h:k.CloseHandle(h)
-        return None
-    return h
 
 def run_monitor():
     setup_logging(logging.INFO);dpi_mode=enable_per_monitor_dpi_awareness();m=_mutex()

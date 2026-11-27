@@ -201,7 +201,7 @@ def test_claude_project_and_environment_labels(dirs):
     write_lines(claude_file(dirs, "sess-1.jsonl", "p1"), [
         asst(-10, "m1", one_hour=10, cwd=r"C:\Users\x\AppData\Local\Claude-Data\scratch-workspaces\abc\scratch-2026"),
     ])
-    other = asst(-10, "m2", one_hour=10, cwd="C:/Workspace/sample-tools")
+    other = asst(-10, "m2", one_hour=10, cwd="C:/Workspace/scratch-workspaces/sample-tools")
     other["entrypoint"] = "cli"
     other["sessionId"] = "sess-2"
     write_lines(claude_file(dirs, "sess-2.jsonl", "p2"), [other])

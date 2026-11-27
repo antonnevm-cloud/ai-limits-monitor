@@ -234,10 +234,10 @@ def test_invalid_cli_args_and_unrelated_payload_do_not_create_file(tmp_path, mon
     ("agy", False), ("agy", True), ("claude", False), ("claude", True), ("git-bash", False), ("git-bash", True),
 ])
 def test_shared_statusline_command_preserves_arguments_in_client_shell(tmp_path, monkeypatch, client, special):
-    script = tmp_path / "read argv.py"
+    script = tmp_path / "Проверка аргументов.py"
     script.write_text("import sys, json\nprint(json.dumps([sys.argv[1:], sys.stdin.read()]))\n", encoding="utf-8")
     monkeypatch.setattr(commands, "_monitor_program", lambda: [Path(sys.executable).as_posix(), script.as_posix()])
-    arg = "folder %TEMP% ! $ 'case' &" if special else "folder (one) & two"
+    arg = "Папка %TEMP% ! $ 'case' &" if special else "Папка (одна) & две"
     flag = "--antigravity-statusline" if client == "agy" else "--claude-statusline"
     if client == "git-bash":
         git = shutil.which("git.exe") if os.name == "nt" else None
@@ -254,6 +254,8 @@ def test_shared_statusline_command_preserves_arguments_in_client_shell(tmp_path,
         cmd = commands.statusline_command(flag, arg)
     else:
         cmd = ["sh", "-c", commands.statusline_command(flag, arg)]
+    if os.name == "nt":
+        monkeypatch.setenv("PATH", "")
     result = subprocess.run(cmd, shell=isinstance(cmd, str), input=b"stdin-check", capture_output=True, timeout=5)
     assert result.returncode == 0
     assert json.loads(result.stdout) == [[flag, arg], "stdin-check"]

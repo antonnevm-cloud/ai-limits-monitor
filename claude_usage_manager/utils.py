@@ -22,10 +22,7 @@ SKIP_PREFIXES = (
     "caveat:",
     "base directory for this skill:",
     "this session is being continued",
-    "you have ",
     "stop hook feedback:",
-    "reply attach_session_ready only",
-    "read github issue ",
 )
 
 MONTHS_RU = (
@@ -196,13 +193,6 @@ def human_project(cwd: str | None, project_path: str) -> str:
     parts = [p for p in source.split("\\") if p and not re.match(r"^[A-Za-z]:$", p)]
     if not parts:
         return project_path
-    lower = [p.casefold() for p in parts]
-    if "clients" in lower:
-        tail = parts[lower.index("clients") + 1:]
-        if len(tail) >= 2:
-            return f"{tail[0]} / {tail[-1]}"
-        if tail:
-            return tail[0]
     return parts[-1]
 
 

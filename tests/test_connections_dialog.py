@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from itertools import combinations
 from pathlib import Path
 
@@ -162,9 +163,23 @@ def test_check_discards_all_client_output_and_uses_exit_status(dialog, tmp_path,
     process = page.pending
     assert process.program() == str(program)
     assert process.arguments() == ["login", "status"]
-    assert len(called) == 3 and set(called.values()) == {os.devnull}
+    assert len(called) == 3 and set(called.values()) == {QProcess.nullDevice()}
     process.finished.emit(0, QProcess.ExitStatus.NormalExit)
     assert page.result.text() == "Клиент подтвердил вход."
+
+
+@pytest.mark.parametrize("code, expected", [(0, "Клиент подтвердил вход."), (1, "Клиент не подтвердил вход.")])
+def test_check_starts_a_process_and_discards_both_streams(dialog, monkeypatch, code, expected):
+    page = dialog.pages["codex"]
+    monkeypatch.setattr(settings, "provider_executable", lambda *_: Path(sys.executable))
+    script = ("import sys; assert sys.stdin.read() == ''; print('private out'); "
+              f"print('private err', file=sys.stderr); sys.exit({code})")
+    monkeypatch.setitem(ui._CHECK_ARGS, "codex", ("-I", "-c", script))
+    page.check.click()
+    if page.pending is not None:
+        assert page.pending.waitForFinished(5000)
+    assert page.result.text() == expected
+    assert page.check.isEnabled()
 
 
 def test_antigravity_statusline_receives_both_unsaved_roots(dialog, tmp_path, monkeypatch):

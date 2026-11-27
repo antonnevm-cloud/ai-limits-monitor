@@ -403,6 +403,7 @@ def test_command_bar_is_stable_and_works_with_mouse_and_keyboard(tmp_path, monke
     app.processEvents()
     buttons = (w.refresh_button, w.analytics_button, w.menu_button)
     assert [b.text() for b in buttons] == ['Обновить', 'Аналитика', 'Меню']
+    assert all(b.isFlat() and not b.icon().isNull() for b in (*buttons, w.hide_button))
     before = [b.geometry() for b in buttons]
     for pos in (QPoint(-4, -4), w.rect().center(), w.rect().bottomRight() + QPoint(5, 5)):
         QTest.mouseMove(w.windowHandle(), pos)
@@ -524,8 +525,9 @@ def test_compact_ui_shows_agent_cards_by_name_like_the_mockup(tmp_path):
     assert by_provider["claude"].summary_text=="5 ч 97% · нед 56%"
     assert by_provider["codex"].summary_text=="нед 8%/2"
     assert by_provider["grok"].summary_text=="нед 49%"
-    # у Antigravity названия моделей не пишутся: основная модель и прочие, только проценты (названия в подсказке)
-    assert by_provider["antigravity"].summary_text=="100% · 80%"
+    assert by_provider["antigravity"].summary_text=="Gemini 100% · Claude/GPT 80%"
+    assert "Gemini" in by_provider["antigravity"].quota_columns.headlines[0].text()
+    assert "Claude/GPT" in by_provider["antigravity"].quota_columns.headlines[1].text()
     assert "Gemini Models" in by_provider["antigravity"].quota_columns.toolTip()
     assert all(row.icon.pixmap() is not None and row.icon.width()==18 for row in rows)
     assert by_provider["grok"].row.long.window_id=="grok:weekly"
@@ -740,7 +742,7 @@ def test_header_countdown_follows_font_delta_suffix_and_groups(tmp_path):
     compact,_=build_compact_rows(db,{"antigravity":ag_state})
     ag_row=CompactRow(compact[0],ag_state,now=now)
     columns = ag_row.quota_columns
-    assert ag_row.summary_text=="100% · 80%"
+    assert ag_row.summary_text=="Gemini 100% · Claude/GPT 80%"
     assert [label.text() for label in columns.countdowns] == ["1д 0ч", "6д 23ч"]
     db.close()
 
@@ -790,6 +792,81 @@ def _four_agents(now,claude_short_reset):
             QuotaWindow("ag-group:claude-gpt:weekly","Claude and GPT models",20,window_minutes=10080,role="group"),
         ]),True),
     }
+
+
+@pytest.mark.parametrize('font_delta', [0, 2])
+def test_antigravity_quota_details_follow_refresh_in_the_316_widget(tmp_path, font_delta):
+    from claude_usage_manager.quota_monitor_model import MonitorData
+
+    app = qapp()
+    db = Database(tmp_path / 'antigravity-details.db')
+    db.set_setting('monitor_width', '316')
+    db.set_setting('monitor_thread_view', json.dumps({'font': f'+{font_delta}' if font_delta else '0'}))
+    db.set_setting('monitor_ag_mode', 'most_consumed')
+    now = dt.datetime.now(dt.timezone.utc)
+    states = _four_agents(now, now + dt.timedelta(hours=2))
+    reset = now + dt.timedelta(hours=3)
+    windows = states['antigravity'].snapshot.windows
+    windows[0].resets_at = now + dt.timedelta(days=3)
+    windows.append(QuotaWindow('ag-group:gemini:5h', 'Gemini Models', 28, reset, 300, 'group'))
+    w = _countdown_window(app, db, states)
+    try:
+        button = w.header_rows['antigravity'].disclosure
+        button.setFocus()
+        QTest.keyClick(button, Qt.Key.Key_Return)
+        QTest.qWait(80)
+        panel = w.header_rows['antigravity'].parentWidget().block
+
+        def contents():
+            return [label.text() for label in panel.findChildren(QLabel) if label.isVisible()]
+
+        assert [label.text() for label in panel.findChildren(QLabel, 'QuotaGroup')] == ['Gemini', 'Claude и GPT']
+        assert {'5 ч', 'Неделя', '72%', '100%', '80%', short_reset(reset), 'нет даты'} <= set(contents())
+        assert w.width() == 316
+        for command in (w.refresh_button, w.analytics_button, w.menu_button):
+            assert command.width() >= command.sizeHint().width()
+        if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
+            assert w.grab().save(str(pathlib.Path(out) / f'antigravity-{font_delta}.png'))
+
+        def refresh():
+            compact, selected = build_compact_rows(db, states)
+            w._done(MonitorData(states, build_rows(states), compact, selected))
+            app.processEvents()
+            assert w.header_rows['antigravity'].parentWidget().block is panel and button.hasFocus()
+
+        windows[-1].used_percent = 100
+        refresh()
+        assert '0%' in contents() and '72%' not in contents()
+        windows[:] = [QuotaWindow('ag-group:custom:weekly', 'Новая группа', 24, window_minutes=10080, role='group')]
+        refresh()
+        assert {'Новая группа', '76%'} <= set(contents())
+        assert w.header_rows['antigravity'].summary_text == '76%'
+        windows[:] = [QuotaWindow('model-a', 'Gemini Pro', 17, role='model'),
+                      QuotaWindow('model-b', 'Gemini Flash', 2, role='model')]
+        refresh()
+        assert {'Gemini Pro', 'Gemini Flash', '83%', '98%'} <= set(contents())
+        assert 'Claude и GPT' not in contents()
+        windows[:] = [QuotaWindow(f'model-{i}', f'Модель {i}', i, role='model') for i in range(50)]
+        refresh()
+        QTest.qWait(80)
+        assert 0 < panel.verticalScrollBar().maximum() and w.height() <= w.screen().availableGeometry().height()
+        panel.setFocus()
+        QTest.keyClick(panel, Qt.Key.Key_PageDown)
+        assert panel.verticalScrollBar().value() > 0
+        button.setFocus()
+        windows[:] = [QuotaWindow('console', 'Лимит консоли', 67, window_minutes=10080)]
+        refresh()
+        assert {'Лимит консоли', '33%'} <= set(contents())
+        windows.clear()
+        refresh()
+        assert panel.findChild(QLabel, 'QuotaEmpty').isVisible()
+        assert short_reset(reset) not in contents()
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        assert not button.isChecked() and w.header_rows['antigravity'].parentWidget().block is None
+    finally:
+        w.quit_monitor()
+        app.processEvents()
+        db.close()
 
 
 @pytest.mark.parametrize('font_delta', [0, 2])

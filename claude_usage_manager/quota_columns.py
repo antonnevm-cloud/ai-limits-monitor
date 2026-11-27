@@ -10,6 +10,7 @@ from .qt_theme import COLORS
 
 REMAINING_COLORS = ((20, '#E07A70'), (50, '#D9B36A'))
 TIME_LABELS = {'5 ч': '5 ч', 'День': 'день', 'Неделя': 'нед'}
+GROUP_LABELS = {'ag-group:gemini': 'Gemini', 'ag-group:claude-gpt': 'Claude/GPT'}
 
 
 def percent_text(value):
@@ -29,7 +30,7 @@ def primary_cell(row):
 
 
 def cell_label(cell):
-    return TIME_LABELS.get(cell.label, '')
+    return TIME_LABELS.get(cell.label) or GROUP_LABELS.get(cell.window_id.rpartition(':')[0], '')
 
 
 def limit_suffix(row, cell, credits):
@@ -71,6 +72,7 @@ class QuotaColumns(QFrame):
         for column in range(2):
             headline = QLabel()
             headline.setTextFormat(Qt.TextFormat.RichText)
+            headline.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             countdown = QLabel()
             countdown.setObjectName('QuotaCountdown')
             countdown.setStyleSheet(f"color:{COLORS['muted']};font-size:{8 + delta:g}pt;")
@@ -100,7 +102,8 @@ class QuotaColumns(QFrame):
                 suffix = limit_suffix(row, cell, credits)
                 prefix = cell_label(cell)
                 if prefix:
-                    text = f'<span style="color:{COLORS["muted"]};font-size:{9 + self.delta:g}pt">{prefix}</span> '
+                    separator = '<br>' if cell.window_id.startswith('ag-group:') else ' '
+                    text = f'<span style="color:{COLORS["muted"]};font-size:{9 + self.delta:g}pt">{prefix}</span>{separator}'
                 text += (f'<span style="color:{remaining_color(cell.remaining)};'
                          f'font-size:{10.5 + self.delta:g}pt;font-weight:600">'
                          f'{percent_text(cell.remaining)}{suffix}</span>')

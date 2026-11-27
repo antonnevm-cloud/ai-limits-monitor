@@ -270,12 +270,14 @@ def run_ccusage(temp_config: pathlib.Path) -> dict[str, Any]:
 
     executable = find_ccusage()
     arguments = ["claude", "session", "--json", "--order", "desc", "--offline"]
+    environment = os.environ.copy()
+    environment["CLAUDE_CONFIG_DIR"] = str(temp_config)
     suffix = executable.suffix.casefold()
     if suffix in {".cmd", ".bat"}:
-        command = [
-            os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
-            f'"{executable}" ' + " ".join(arguments),
-        ]
+        # cmd разбирает текст после /c сам. Путь подставляется из окружения один раз.
+        environment["AI_LIMITS_CCUSAGE_CMD"] = str(executable)
+        shell = subprocess.list2cmdline([environment.get("COMSPEC", "cmd.exe")])
+        command = shell + ' /d /v:off /s /c ""%AI_LIMITS_CCUSAGE_CMD%" ' + " ".join(arguments) + '"'
     elif suffix == ".ps1":
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:
@@ -284,8 +286,6 @@ def run_ccusage(temp_config: pathlib.Path) -> dict[str, Any]:
     else:
         command = [str(executable), *arguments]
 
-    environment = os.environ.copy()
-    environment["CLAUDE_CONFIG_DIR"] = str(temp_config)
     result = run_hidden(
         command, capture_output=True, text=True, encoding="utf-8", errors="replace",
         env=environment, timeout=240, check=False,

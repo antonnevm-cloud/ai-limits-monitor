@@ -224,10 +224,13 @@ def _loads(line: str) -> dict[str, Any] | None:
 def _project_label(cwd: str | None) -> str:
     if not cwd:
         return "—"
-    if "scratch-workspaces" in cwd.casefold():
+    parts = cwd.replace("\\", "/").rstrip("/").split("/")
+    folders = [part.casefold() for part in parts[:-1]]
+    if "scratch-workspaces" in folders and {"claude", "claude-data"}.intersection(
+        folders[:folders.index("scratch-workspaces")]
+    ):
         return "без папки"
-    name = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    return name or cwd
+    return parts[-1] or cwd
 
 
 # --------------------------------------------------------------------------- #

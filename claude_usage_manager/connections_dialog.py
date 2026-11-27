@@ -1,7 +1,6 @@
 """Окно настройки источников. Вход всегда выполняет официальный клиент."""
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
@@ -297,9 +296,10 @@ class _ProviderPage(QWidget):
             env.insert(key, value)
         process.setProcessEnvironment(env)
         # Для проверки достаточно кода выхода. Клиенты могут печатать сведения учетной записи.
-        process.setStandardInputFile(os.devnull)
-        process.setStandardOutputFile(os.devnull)
-        process.setStandardErrorFile(os.devnull)
+        null_device = QProcess.nullDevice()
+        process.setStandardInputFile(null_device)
+        process.setStandardOutputFile(null_device)
+        process.setStandardErrorFile(null_device)
         process.finished.connect(lambda code, state: self._checked(process, code, state))
         process.errorOccurred.connect(lambda error: self._check_error(process, error))
         timer = QTimer(process)

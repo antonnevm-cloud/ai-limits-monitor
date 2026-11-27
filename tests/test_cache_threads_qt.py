@@ -258,7 +258,7 @@ def test_every_agent_shows_its_threads_or_the_empty_note(tmp_path):
     close(app, db, w)
 
 
-def test_antigravity_row_is_not_a_cache_toggle(tmp_path):
+def test_antigravity_opens_quota_with_cache_timers_disabled(tmp_path):
     app, db, w = window(tmp_path)
     w.show()
     app.processEvents()
@@ -267,11 +267,26 @@ def test_antigravity_row_is_not_a_cache_toggle(tmp_path):
     app.processEvents()
     assert "antigravity" not in w.cache_blocks and not w.cache_expanded
     assert row.cursor().shape() != Qt.CursorShape.PointingHandCursor
-    assert row.disclosure is None
-    assert provider_row(w, "grok").disclosure.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert all(h.disclosure.cursor().shape() == Qt.CursorShape.PointingHandCursor for h in w.header_rows.values())
     assert len({h.name_label.mapTo(w, QPoint()).x() for h in w.header_rows.values()}) == 1
-    assert len({h.disclosure.mapTo(w, QPoint()).x() for h in w.header_rows.values() if h.disclosure}) == 1
+    assert len({h.disclosure.mapTo(w, QPoint()).x() for h in w.header_rows.values()}) == 1
+    w.set_cache_enabled(False)
+    button = row.disclosure
+    assert button.isVisible() and button.accessibleName() == "Развернуть лимиты Antigravity"
+    assert provider_row(w, "grok").disclosure.isHidden()
+    button.setFocus()
+    QTest.keyClick(button, Qt.Key.Key_Right)
+    assert button.isChecked() and not w.cache_blocks
+    assert row.parentWidget().block.findChild(QLabel, "QuotaEmpty").text()
+    QTest.keyClick(button, Qt.Key.Key_Left)
+    assert not button.isChecked() and row.parentWidget().block is None
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert db.get_setting("monitor_ag_quota_expanded") == "1"
     close(app, db, w)
+    app, db, reopened = window(tmp_path)
+    assert provider_row(reopened, "antigravity").disclosure.isChecked()
+    assert not reopened.cache_blocks
+    close(app, db, reopened)
 
 
 def test_stored_antigravity_expansion_is_ignored(tmp_path):

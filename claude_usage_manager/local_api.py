@@ -10,10 +10,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .models import ManualResetCredits, QuotaSnapshot
+from .provider_settings import collection_profile_id
 
 API_SCHEMA_VERSION = 1
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 28765
+
+
+def profile_api_path(path: str) -> str:
+    return f"/profiles/{collection_profile_id()}{path}"
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -184,8 +189,13 @@ class LocalApiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            def _path(self) -> str:
                 path = urlsplit(self.path).path
+                # Старый адрес сохранен для интеграций. Виджет использует адрес своего профиля.
+                return path.removeprefix(profile_api_path("")) if path.startswith("/profiles/") else path
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                path = self._path()
                 if path == "/health":
                     self._send(200, {
                         "schema_version": API_SCHEMA_VERSION,
@@ -200,7 +210,7 @@ class LocalApiServer:
                 self._send(404, {"error": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                path = urlsplit(self.path).path
+                path = self._path()
                 if path != "/v1/refresh":
                     self._send(404, {"error": "not_found"})
                     return

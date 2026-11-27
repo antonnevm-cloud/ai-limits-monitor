@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from dataclasses import replace
 
-from .local_api import DEFAULT_PORT
+from .local_api import DEFAULT_PORT, profile_api_path
 from .models import QuotaWindow
 from .quota_monitor_model import MonitorData, build_compact_rows, build_rows, cached_states
 from .utils import parse_iso
@@ -16,7 +16,7 @@ from .utils import parse_iso
 
 def request_backend_refresh(*, base_url=f"http://127.0.0.1:{DEFAULT_PORT}"):
     try:
-        request = urllib.request.Request(f"{base_url}/v1/refresh", data=b"", method="POST")
+        request = urllib.request.Request(base_url + profile_api_path("/v1/refresh"), data=b"", method="POST")
         with urllib.request.urlopen(request, timeout=2) as response:
             return response.status == 202
     except (OSError, ValueError, urllib.error.URLError):
@@ -31,15 +31,14 @@ def existing_backend_available() -> bool:
     if not read_control(root / "backend-control.json")["desired_running"]:
         return False
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_PORT}/health", timeout=0.6) as response:
+        url = f"http://127.0.0.1:{DEFAULT_PORT}" + profile_api_path("/health")
+        with urllib.request.urlopen(url, timeout=0.6) as response:
             health = json.loads(response.read(4096))
         if not (isinstance(health, dict) and health.get("service") == "ai-limits-monitor"
                 and health.get("schema_version") == 1 and health.get("mode") == "backend"
                 and health.get("status") == "ok"):
             return False
-        if "connections_schema" in health:
-            return health["connections_schema"] == 1 and health.get("data_store") == data_store_id()
-        return not (root / "connections.json").exists()
+        return health.get("connections_schema") == 1 and health.get("data_store") == data_store_id()
     except (OSError, ValueError):
         return False
 
@@ -77,9 +76,9 @@ def read_monitor_data(db, *, base_url=f"http://127.0.0.1:{DEFAULT_PORT}"):
     connected = False
     providers = {}
     try:
-        with urllib.request.urlopen(f"{base_url}/v1/snapshot", timeout=2) as response:
+        with urllib.request.urlopen(base_url + profile_api_path("/v1/snapshot"), timeout=2) as response:
             payload = json.load(response)
-        if payload.get("schema_version") == 1 and isinstance(payload.get("providers"), dict):
+        if isinstance(payload, dict) and payload.get("schema_version") == 1 and isinstance(payload.get("providers"), dict):
             providers = payload["providers"]
             connected = True
     except (OSError, ValueError, urllib.error.URLError):
@@ -87,6 +86,8 @@ def read_monitor_data(db, *, base_url=f"http://127.0.0.1:{DEFAULT_PORT}"):
     states = cached_states(db)
     for provider, state in states.items():
         provider_data = providers.get(provider, {})
+        if not isinstance(provider_data, dict):
+            continue
         if provider == "grok":
             _grok_from_backend(state, provider_data)
         source = provider_data.get("source_state")

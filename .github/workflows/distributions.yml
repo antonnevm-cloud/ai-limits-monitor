@@ -2,6 +2,11 @@ name: Сборка AI Limits Monitor
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_release:
+        description: Метка готового выпуска для проверки установщика Windows
+        type: string
+        required: false
   push:
     tags: ['v*']
 
@@ -9,7 +14,47 @@ permissions:
   contents: read
 
 jobs:
+  verify-windows-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_release != ''
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12.10'
+      - name: Скачать готовый установщик и сверить контрольную сумму
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.windows_release }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = python -c "from claude_usage_manager import APP_VERSION; print(APP_VERSION)"
+          if ($env:RELEASE_TAG -notin @("preview-$version", "v$version")) { throw 'Метка выпуска не соответствует версии исходников' }
+          $commit = gh api "repos/$env:GITHUB_REPOSITORY/commits/$env:RELEASE_TAG" --jq '.sha'
+          if ($commit -ne $env:GITHUB_SHA) { throw 'Метка выпуска и проверяемые исходники указывают на разные коммиты' }
+          $file = "AI-Limits-Monitor-$version-windows-x64-setup.exe"
+          $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
+          $asset = @($release.assets | Where-Object name -eq $file)
+          if ($asset.Count -ne 1) { throw 'Установщик отсутствует в выпуске' }
+          gh release download $env:RELEASE_TAG --pattern $file --dir $env:RUNNER_TEMP
+          $path = Join-Path $env:RUNNER_TEMP $file
+          $digest = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+          if ("sha256:$digest" -ne $asset[0].digest) { throw 'Контрольная сумма установщика не совпадает' }
+          Write-Output "$file SHA256 $digest"
+          "AI_LIMITS_TEST_INSTALLER=$path" >> $env:GITHUB_ENV
+      - name: Проверить переносимую и обычную установку без клиентов и Python в пути поиска
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          python -m pip install --disable-pip-version-check --only-binary=:all: PyInstaller==6.22.3
+          python -X utf8 packaging/check_distribution.py $env:AI_LIMITS_TEST_INSTALLER --standard-windows-install --work-dir $env:RUNNER_TEMP
+
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_release == ''
     strategy:
       fail-fast: false
       matrix:

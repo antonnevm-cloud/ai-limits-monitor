@@ -166,6 +166,16 @@ def antigravity_cli_profile(connection: Connection | None = None) -> Path:
     return _absolute(selected.cli_profile) or provider_profile("antigravity", selected).parent / "antigravity-cli"
 
 
+def collection_profile_id() -> str:
+    """Сборщик и виджет могут получить разные каталоги клиентов из своего окружения."""
+    connections = load_connections()
+    paths = [utils.data_dir()]
+    paths.extend(provider_profile(key, connection) for key, connection in connections.items())
+    paths.append(antigravity_cli_profile(connections["antigravity"]))
+    normalized = [os.path.normcase(os.path.normpath(path)) for path in paths]
+    return hashlib.sha256(json.dumps(normalized, ensure_ascii=True).encode("ascii")).hexdigest()
+
+
 def provider_environment(provider: str, connection: Connection | None = None) -> dict[str, str]:
     selected = _selection(provider, connection)
     env = os.environ.copy()
@@ -200,6 +210,31 @@ def _can_run(path: Path) -> bool:
     return path.is_absolute() and path.is_file() and (sys.platform == "win32" or os.access(path, os.X_OK))
 
 
+def _windows_npm_binaries(provider: str, name: str) -> Iterator[Path]:
+    # npm кладет файлы запуска в свой prefix, а программы под ним в node_modules.
+    # Файл .cmd только указывает расположение пакета. Запускается его штатный .exe.
+    prefixes = []
+    preset = _absolute(os.environ.get("NPM_CONFIG_PREFIX", ""))
+    if preset:
+        prefixes.append(preset)
+    for entry in os.get_exec_path():
+        directory = _absolute(entry)
+        if directory is not None and (directory / f"{provider}.cmd").is_file():
+            prefixes.append(directory)
+    roaming = _absolute(os.environ.get("APPDATA", "")) or Path.home() / "AppData/Roaming"
+    prefixes.append(roaming / "npm")
+    for prefix in dict.fromkeys(prefixes):
+        modules = prefix / "node_modules"
+        if provider == "claude":
+            yield modules / "@anthropic-ai/claude-code/bin" / name
+        else:
+            package = modules / "@openai/codex"
+            native = package / "node_modules/@openai/codex-win32-x64"
+            for root in (native, package, package.parent / "codex-win32-x64"):
+                for layout in ("bin", "vendor/x86_64-pc-windows-msvc/bin", "vendor/x86_64-pc-windows-msvc/codex"):
+                    yield root / layout / name
+
+
 def _binary_candidates(provider: str) -> Iterator[Path]:
     home = Path.home()
     name = binary_name(provider)
@@ -229,15 +264,7 @@ def _binary_candidates(provider: str) -> Iterator[Path]:
             for root in (home / "Applications", Path("/Applications")):
                 yield root / "Codex.app/Contents/Resources" / name
     if sys.platform == "win32" and provider in {"claude", "codex"}:
-        roaming = _absolute(os.environ.get("APPDATA", "")) or home / "AppData/Roaming"
-        if provider == "claude":
-            yield roaming / "npm/node_modules/@anthropic-ai/claude-code/bin" / name
-            return
-        package = roaming / "npm/node_modules/@openai/codex"
-        native = package / "node_modules/@openai/codex-win32-x64"
-        for root in (native, package, package.parent / "codex-win32-x64"):
-            for layout in ("bin", "vendor/x86_64-pc-windows-msvc/bin", "vendor/x86_64-pc-windows-msvc/codex"):
-                yield root / layout / name
+        yield from _windows_npm_binaries(provider, name)
 
 
 def provider_executable(provider: str, connection: Connection | None = None) -> Path | None:

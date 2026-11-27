@@ -96,6 +96,30 @@ def test_tray_has_separate_limits_and_usage_actions(tmp_path):
     db.close()
 
 
+def test_help_from_shared_menu_and_keyboard_reuses_one_window(tmp_path):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    try:
+        window.show()
+        menu = window.menu_button.menu()
+        assert menu is window.tray.contextMenu()
+        action, = [item for item in menu.actions() if item.text() == "Справка"]
+        assert action.shortcut().toString() == "F1"
+        action.trigger()
+        dialog = window._help_dialog
+        assert dialog.isVisible() and not dialog.isModal()
+        dialog.close()
+        window.activateWindow()
+        app.processEvents()
+        QTest.keyClick(window, Qt.Key.Key_F1)
+        app.processEvents()
+        assert window._help_dialog is dialog and dialog.isVisible()
+    finally:
+        stop_window(window)
+        db.close()
+
+
 def test_unified_monitor_reuses_one_limits_window(tmp_path, monkeypatch):
     app = qapp()
     db = Database(tmp_path / "ui.sqlite")
