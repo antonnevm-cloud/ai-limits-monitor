@@ -91,6 +91,7 @@ GROK_LOG_TAIL_BYTES = 2 * 1024 * 1024
 COOLED_GRACE_SECONDS = 600
 COLLAPSED_THREADS = 3  # тредов до ссылки «ещё N» (решение владельца 12.11.2026)
 TITLE_LIMIT = 60
+CODEX_META_HORIZON_SECONDS = 6 * 3600
 HEAD_BYTES = 256 * 1024
 TAIL_BYTES = 256 * 1024
 TAIL_MAX_BYTES = 4 * 1024 * 1024
@@ -322,6 +323,40 @@ def _claude_head_meta(path: pathlib.Path) -> dict[str, Any]:
             if meaningful_prompt(prompt):
                 meta["first_prompt"] = prompt
     return meta
+
+
+_TITLE_CHUNK = 1024 * 1024
+
+
+def _scan_custom_titles(path: pathlib.Path, offset: int, latest: str) -> tuple[int, str]:
+    """Последнее название (customTitle) в дописанной с `offset` части журнала; читаются только целые строки."""
+    size = path.stat().st_size
+    if offset > size:
+        offset, latest = 0, ""
+    if offset == size:
+        return offset, latest
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        rest = b""
+        while True:
+            chunk = stream.read(_TITLE_CHUNK)
+            if not chunk:
+                break
+            data = rest + chunk
+            end = data.rfind(b"\n")
+            if end < 0:
+                rest = data
+                continue
+            for line in data[:end].split(b"\n"):
+                if b'"customTitle"' not in line:
+                    continue
+                item = _loads(line.decode("utf-8", errors="replace"))
+                title = item.get("customTitle") if item else None
+                if isinstance(title, str) and title.strip():
+                    latest = title.strip()
+            offset += len(data[:end + 1])
+            rest = data[end + 1:]
+    return offset, latest
 
 
 def _parse_claude_file(path: pathlib.Path, head_meta: dict[str, Any]) -> CacheThread | None:
@@ -853,6 +888,7 @@ class ThreadScanner:
         self._desktop: DesktopSessionIndex | None = None
         self._parsed: dict[str, tuple[tuple[int, int, int, int], CacheThread | None]] = {}
         self._head_meta: dict[str, dict[str, Any]] = {}
+        self._custom_titles: dict[str, tuple[int, str]] = {}
         self._codex_models: dict[str, tuple[int, str]] = {}
         self._grok_log: tuple[tuple[int, int], dict[str, dt.datetime]] | None = None
         self._grok_meta: dict[str, tuple[int, int, GrokSession | None]] = {}
@@ -910,6 +946,8 @@ class ThreadScanner:
             del self._parsed[key]
         for key in [k for k in self._head_meta if f"claude:{k}" not in seen]:
             del self._head_meta[key]
+        for key in [k for k in self._custom_titles if f"claude:{k}" not in seen]:
+            del self._custom_titles[key]
         for key in [k for k in self._codex_models if f"codex:{k}" not in seen]:
             del self._codex_models[key]
         return result
@@ -965,6 +1003,16 @@ class ThreadScanner:
             # при следующей записи в файл оно читается заново, и название появляется.
             if meta["first_prompt"] or meta["titles"]:
                 self._head_meta[str(path)] = meta
+        # Название, заданное владельцем в середине длинного журнала, ищется по дописанной части файла:
+        # иначе оно пропадало, когда уходило из начала и хвоста журнала.
+        offset, latest = self._custom_titles.get(str(path), (0, ""))
+        try:
+            offset, latest = _scan_custom_titles(path, offset, latest)
+        except OSError:
+            pass
+        self._custom_titles[str(path)] = (offset, latest)
+        if latest:
+            meta = {**meta, "titles": [*meta["titles"], latest]}
         return _parse_claude_file(path, meta)
 
     def _scan_codex(self, now: dt.datetime, seen: set[str]) -> list[CacheThread]:
@@ -978,6 +1026,10 @@ class ThreadScanner:
             )
             if thread:
                 threads.append(thread)
+        # Названия и состояние из баз Codex нужны только недавним тредам: давно остывшие в список
+        # не попадут, а запросы по всем сессиям за 60 дней занимали почти весь интервал скана.
+        threads = [thread for thread in threads
+                   if (now - thread.expires_at).total_seconds() <= CODEX_META_HORIZON_SECONDS]
         return self._apply_codex_meta(threads, root)
 
     def _codex_model_of(self, path: pathlib.Path) -> str:
