@@ -18,7 +18,17 @@ from types import CodeType
 ROOT = Path(__file__).resolve().parents[1]
 APP = runpy.run_path(str(ROOT / 'claude_usage_manager' / '__init__.py'))
 # Путь в профиле конкретного пользователя любой машины (подстановки вида <имя> и %USERNAME% допустимы).
-PRIVATE_PATH = re.compile(r'(?i)(?:\b[a-z]:[\\/]users[\\/]|/users/|/home/)(?!<|%|\{|public\b|default\b)[\w.-]+')
+PRIVATE_PATH = re.compile(r'(?i)(?:\b[a-z]:[\\/]users[\\/]|/users/|/home/)(?!<|%|\{)([\w.-]+)')
+# Имена из тестов и документации заведомо вымышлены.
+FICTIONAL_USERS = {'public', 'default', 'test', 'demo', 'user', 'example', 'name', 'me'}
+
+
+def private_path(text: str) -> str | None:
+    for found in PRIVATE_PATH.finditer(text):
+        name = found.group(1).casefold()
+        if len(name) > 1 and name not in FICTIONAL_USERS:
+            return found.group(0)
+    return None
 FOREIGN_BINARY = re.compile(r'(?i)^(?:ucrtbase\.dll|api-ms-win-.*\.dll|lib(?:ssl|crypto)-3-x64\.dll|qtvirtualkeyboard.*)$')
 PROFILE_VARIABLES = (
     'PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'CONDA_PREFIX', 'QT_QPA_PLATFORM',
@@ -77,7 +87,7 @@ def check_contents(target: Path, executable: Path, resources: Path) -> None:
                 text = item.decode('utf-8', 'replace') if isinstance(item, bytes) else item
                 normalized = text.replace('\\', '/').casefold()
                 if (any(path in normalized or normalized == path.rstrip('/') for path in build_paths)
-                        or PRIVATE_PATH.search(text)):
+                        or private_path(text)):
                     raise ValueError(f'В модуле {filename} сохранен личный путь: {text[:80]!r}')
 
     native_platform = 'qwindows.dll' if sys.platform == 'win32' else 'libqcocoa.dylib'
@@ -141,9 +151,12 @@ def check(package: Path, stage: Path) -> None:
         if not (target / 'portable.txt').is_file():
             raise FileNotFoundError('Переносимая установка без признака portable.txt')
         portable_env = {key: value for key, value in env.items() if key != 'AI_LIMITS_DATA_DIR'}
-        subprocess.run([str(executable), '--smoke-test'], stdout=subprocess.PIPE, cwd=stage, env=portable_env,
-                       timeout=40, check=True)
-        if not (target / 'data' / 'usage.db').is_file() or any((profile / 'Local').glob('*/usage.db')):
+        # Обработчик строки состояния записывает замер в каталог данных (--smoke-test подменяет каталог сам).
+        subprocess.run([str(executable), '--claude-statusline'], stdout=subprocess.PIPE, cwd=stage,
+                       env=portable_env, timeout=40, check=True,
+                       input=json.dumps({'rate_limits': {'five_hour': {'used_percentage': 23}}}), text=True)
+        stored = list((target / 'data').rglob('*.json'))
+        if not stored or any((profile / 'Local').rglob('*.json')):
             raise ValueError('Переносимая копия хранит данные не рядом с программой')
         print('portable data', target / 'data')
 
@@ -238,9 +251,9 @@ def check_source_archive(archive: Path, forbidden: list[str]) -> None:
             if PurePosixPath(name).suffix.lower() not in TEXT_SUFFIXES or name.endswith('/'):
                 continue
             text = bundle.read(name).decode('utf-8', 'replace')
-            found = PRIVATE_PATH.search(text)
+            found = private_path(text)
             if found:
-                raise ValueError(f'{name}: личный путь {found.group(0)!r}')
+                raise ValueError(f'{name}: личный путь {found!r}')
             lowered = text.casefold()
             for word in words:
                 if word in lowered:

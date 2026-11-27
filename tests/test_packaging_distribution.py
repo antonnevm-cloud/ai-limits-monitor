@@ -71,6 +71,24 @@ def test_portable_installer_skips_registration_and_all_shortcuts():
     assert "{app}\\portable.txt" in source
 
 
+def test_source_archive_check_finds_private_paths_and_forbidden_words(tmp_path):
+    import zipfile
+
+    check = runpy.run_path(str(PACKAGING / 'check_distribution.py'))
+    archive = tmp_path / 'source.zip'
+
+    def pack(text):
+        with zipfile.ZipFile(archive, 'w') as bundle:
+            bundle.writestr('project/tests/sample.py', text)
+
+    pack('path = "C:/Users/test/x" + "/home/demo" + r"C:\\Users\\<имя>"')
+    check['check_source_archive'](archive, ['secret_client'])
+    for text, word in (('p = r"C:\\Users\\ivanov\\AppData"', None), ('project = "secret_client_db"', 'secret_client')):
+        pack(text)
+        with pytest.raises(ValueError):
+            check['check_source_archive'](archive, [word] if word else [])
+
+
 def test_portable_marker_moves_data_next_to_program(tmp_path, monkeypatch):
     from claude_usage_manager import utils
 
