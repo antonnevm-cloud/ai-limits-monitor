@@ -339,6 +339,7 @@
 | <img src="docs/images/elements/widget/menu-view.png" width="138" alt="Настроить вид"> | Открывает панель вида виджета. |
 | <img src="docs/images/elements/widget/menu-settings.png" width="137" alt="Все настройки"> | Открывает общие настройки окна, агентов и платежей. |
 | <img src="docs/images/elements/widget/menu-connections.png" width="184" alt="Подключения и вход"> | Открывает настройки источников и штатного входа в клиенты. |
+| <img src="docs/images/elements/widget/menu-autostart.png" width="281" alt="Запускать при входе в Windows, флажок установлен"> | **Запускать при входе в Windows** включает или выключает автозапуск виджета. Галочка показывает, что он включен для этой копии программы. При входе виджет появляется, оставляя фокус в открытой программе. |
 | <img src="docs/images/elements/widget/menu-timers.png" width="211" alt="Таймеры кэша тредов"> | Включает или выключает отображение диалогов с таймерами кэша. |
 | <img src="docs/images/elements/widget/menu-show.png" width="119" alt="Показать"> | Возвращает скрытый виджет на экран. |
 | <img src="docs/images/elements/widget/menu-refresh.png" width="127" alt="Обновить"> | Запрашивает обновление квот, как верхняя кнопка виджета. |
