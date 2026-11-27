@@ -1,0 +1,14 @@
+# Python 3.12, сборка приложения и установщика
+Pillow==11.3.0
+openpyxl==3.1.5
+et-xmlfile==2.0.0
+PySide6-Essentials==6.11.1
+shiboken6==6.11.1
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+altgraph==0.17.5
+packaging==26.4
+setuptools==84.2.1
+macholib==1.16.4; sys_platform == "darwin"
+pefile==2024.8.26; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"

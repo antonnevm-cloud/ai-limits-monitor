@@ -1,0 +1,19 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.ico binary
+
+# Публичный снимок содержит рабочее приложение и его проверки.
+/AGENTS.md export-ignore
+/CLAUDE.md export-ignore
+/CHANGELOG.md export-ignore
+/claude_usage_manager/cursor_provider.py export-ignore
+/claude_usage_manager/windows_credential.py export-ignore
+/tests/test_cursor_provider.py export-ignore
+/assets/providers/cursor.png export-ignore
+/packaging/install-package.ps1 export-ignore
+/integrations export-ignore
