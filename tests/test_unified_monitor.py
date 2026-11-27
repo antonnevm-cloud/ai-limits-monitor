@@ -3,6 +3,8 @@ import pathlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from claude_usage_manager.database import Database
@@ -59,10 +61,12 @@ def test_unified_monitor_reuses_one_analytics_window(tmp_path, monkeypatch):
     monkeypatch.setattr(unified_monitor, "IntegratedAnalyticsWindow", FakeAnalytics)
     window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
     window.timer.stop()
+    window.show()
+    app.processEvents()
 
-    window.open_detail()
+    QTest.mouseClick(window.analytics_button, Qt.MouseButton.LeftButton)
     first = window._analytics_window
-    window.open_detail()
+    QTest.keyClick(window.analytics_button, Qt.Key.Key_Space)
     assert window._analytics_window is first
     assert calls["created"] == 1
     assert calls["opened"] == 2
@@ -81,7 +85,9 @@ def test_tray_has_separate_limits_and_usage_actions(tmp_path):
     db = Database(tmp_path / "ui.sqlite")
     window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
     window.timer.stop()
-    texts = [action.text() for action in window.tray.contextMenu().actions()]
+    assert window.menu_button.menu() is window.tray.contextMenu()
+    texts = [action.text() for action in window.menu_button.menu().actions()]
+    assert texts.count("Настроить вид") == 1
     assert "Подробно по лимитам" in texts
     assert "Детальная аналитика" in texts
     assert texts.index("Подробно по лимитам") < texts.index("Детальная аналитика")

@@ -5,17 +5,18 @@ from PySide6.QtCore import QEvent, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter
 from PySide6.QtWidgets import QWidget
 
-GRIP_WIDTH = 5
-HANDLE_WIDTH = 3.0
+from .qt_theme import COLORS
+
+GRIP_WIDTH = 12
+HANDLE_WIDTH = 4.0
 HANDLE_HEIGHT = 36.0
-HANDLE_ALPHA = 80
 
 
 class EdgeGrip(QWidget):
-    """Невидимая полоса на левом или правом краю окна; при наведении показывает короткую ручку.
+    """Боковая ручка изменения ширины окна.
 
-    Сама размеры не меняет: сообщает смещение курсора по горизонтали (в пикселях экрана)
-    от точки нажатия, а окно решает, какой ширины быть.
+    Пока кнопка мыши нажата, Qt направляет сюда и события за пределами ручки.
+    Смещение от нажатия передается окну в логических пикселях.
     """
 
     drag_started = Signal()
@@ -30,7 +31,8 @@ class EdgeGrip(QWidget):
         self._origin: int | None = None
         self.setFixedWidth(GRIP_WIDTH)
         self.setCursor(Qt.CursorShape.SizeHorCursor)
-        self.setToolTip("Потяните, чтобы изменить ширину")
+        self.setAccessibleName("Левый край окна" if edge == "left" else "Правый край окна")
+        self.setToolTip("Зажми левую кнопку мыши и потяни край влево или вправо, чтобы изменить ширину окна.")
 
     @property
     def dragging(self) -> bool:
@@ -70,12 +72,14 @@ class EdgeGrip(QWidget):
         super().leaveEvent(event)
 
     def paintEvent(self, event) -> None:
-        if not (self.underMouse() or self.dragging):
-            return
         painter = QPainter(self)
+        # Windows пропускает мышь сквозь полностью прозрачные пиксели окна.
+        # Тонкая подложка сохраняет захват даже на скругленных углах окна.
+        painter.fillRect(self.rect(), QColor(9, 12, 16, 16))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, HANDLE_ALPHA))
+        color = COLORS["text"] if self.underMouse() or self.dragging else COLORS["faint"]
+        painter.setBrush(QColor(color))
         height = min(HANDLE_HEIGHT, float(self.height()))
         painter.drawRoundedRect(
             QRectF((self.width() - HANDLE_WIDTH) / 2.0, (self.height() - height) / 2.0, HANDLE_WIDTH, height),

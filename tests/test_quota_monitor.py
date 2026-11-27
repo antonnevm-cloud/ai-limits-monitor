@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 
 from PySide6.QtCore import QPoint,QRect,Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QDialog,QDialogButtonBox,QLabel,QMessageBox
+from PySide6.QtWidgets import QApplication,QDialog,QDialogButtonBox,QLabel,QMessageBox,QSystemTrayIcon
 from claude_usage_manager.database import Database
 from claude_usage_manager.models import ManualResetCredits,ManualResetItem,QuotaSnapshot,QuotaWindow
 from claude_usage_manager.qt_theme import build_stylesheet
@@ -386,18 +386,43 @@ def test_compact_window_defaults_and_settings(tmp_path):
     assert w.visibility["compact:claude"] is False
     assert bool(w.windowFlags() & Qt.WindowType.FramelessWindowHint)
     assert bool(w.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
-    assert w.actions.isVisible() is False
+    w.show()
+    assert w.actions.isVisible()
     w.quit_monitor();app.processEvents();db.close()
 
-def test_compact_actions_remain_visible_over_header_and_hide_outside(tmp_path):
-    app=qapp();db=Database(tmp_path/"ui-hover.db")
-    w=MonitorWindow(db,auto_refresh=False);w.timer.stop();w.show();app.processEvents()
-    w._update_actions_visibility(w.frameGeometry().topLeft())
-    assert w.actions.isVisible()
-    outside=w.frameGeometry().bottomRight()+QPoint(20,20)
-    w._update_actions_visibility(outside)
-    assert not w.actions.isVisible()
-    w.quit_monitor();app.processEvents();db.close()
+def test_command_bar_is_stable_and_works_with_mouse_and_keyboard(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / 'commands.db')
+    calls = []
+    monkeypatch.setattr(MonitorWindow, 'refresh_now', lambda self: calls.append('refresh'))
+    monkeypatch.setattr(MonitorWindow, 'open_detail', lambda self: calls.append('analytics'))
+    w = MonitorWindow(db, auto_refresh=False)
+    w.timer.stop()
+    w.show()
+    w.activateWindow()
+    app.processEvents()
+    buttons = (w.refresh_button, w.analytics_button, w.menu_button)
+    assert [b.text() for b in buttons] == ['Обновить', 'Аналитика', 'Меню']
+    before = [b.geometry() for b in buttons]
+    for pos in (QPoint(-4, -4), w.rect().center(), w.rect().bottomRight() + QPoint(5, 5)):
+        QTest.mouseMove(w.windowHandle(), pos)
+        assert all(b.isVisible() and b.toolTip() and b.accessibleName() for b in buttons)
+        assert [b.geometry() for b in buttons] == before
+    pos = w.refresh_button.mapTo(w, w.refresh_button.rect().center())
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
+    w.refresh_button.setFocus()
+    QTest.keyClick(w.refresh_button, Qt.Key.Key_Tab)
+    app.processEvents()
+    assert w.analytics_button.hasFocus()
+    QTest.keyClick(w.analytics_button, Qt.Key.Key_Return)
+    assert calls == ['refresh', 'analytics']
+    QTest.mouseClick(w.hide_button, Qt.MouseButton.LeftButton)
+    assert not w.isVisible()
+    w.tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+    assert w.isVisible()
+    w.quit_monitor()
+    app.processEvents()
+    db.close()
 
 def test_compact_window_reapplies_transparency_surface(tmp_path):
     app=qapp();db=Database(tmp_path/"ui-opacity.db");db.set_setting("monitor_opacity","20")
@@ -556,7 +581,9 @@ with tempfile.TemporaryDirectory() as temp:
             no_clip=no_clip and row_rect.contains(QRect(label.mapTo(w,QPoint(0,0)),label.size())) and label.sizeHint().width()<=label.width()
         no_clip=no_clip and row.payment_label.text()=='09.01 · 20 $'
         no_clip=no_clip and row.name_label.mapTo(w,QPoint(0,row.name_label.height())).y()<=row.payment_label.mapTo(w,QPoint(0,0)).y()
-        no_clip=no_clip and row.payment_label.mapTo(w,QPoint(row.payment_label.width(),0)).x()<=row.quota_columns.mapTo(w,QPoint(0,0)).x()
+        payment_rect = QRect(row.payment_label.mapTo(w,QPoint()), row.payment_label.size())
+        quota_rect = QRect(row.quota_columns.mapTo(w,QPoint()), row.quota_columns.size())
+        no_clip = no_clip and not payment_rect.intersects(quota_rect)
     print(json.dumps({'screen_dpr':app.primaryScreen().devicePixelRatio(),'rows':len(rows),'no_overlap':all(left.bottom()<right.top() for left,right in zip(row_rects,row_rects[1:])),'no_clip':no_clip,'width':w.width(),'height':w.height()}))
     w.quit_monitor();app.processEvents();db.close()
 """
@@ -775,32 +802,45 @@ def test_payments_reset_notice_and_forecast_have_room_in_both_states(tmp_path, f
     now = dt.datetime.now(dt.timezone.utc)
     states = _four_agents(now, now + dt.timedelta(hours=4))
     states['claude'] = _claude_state(now, now + dt.timedelta(hours=4), now + dt.timedelta(days=2))
+    states['grok'] = ProviderState('grok', states['grok'].snapshot, False)
+    states['antigravity'].snapshot.fallback_source = 'Локальная история'
+    states['antigravity'] = ProviderState('antigravity', states['antigravity'].snapshot, False)
     codex = states['codex'].snapshot
     codex.windows[0].resets_at = now + dt.timedelta(days=4)
     codex.manual_resets = ManualResetCredits(provider='codex', state='available', available_count=2,
         items=[ManualResetItem('credit', 'codex', now + dt.timedelta(days=6))])
     db.set_setting(PAYMENTS_SETTING, json.dumps({p: {'date': '2026-12-01', 'amount': '20 $'} for p in states}))
     db.set_setting('monitor_thread_view', json.dumps({'font': f'+{font_delta}' if font_delta else '0'}))
-    db.set_setting('monitor_width', '310')
+    db.set_setting('monitor_width', '316')
     w = _countdown_window(app, db, states)
-    w.cache_threads['claude'] = [CacheThread('claude', 'test', 'Пример задачи', 'Проект',
-                                             'Desktop', now, 3600)]
+    w._cache_scanned({'claude': [CacheThread('claude', 'test', 'Пример задачи', 'Проект',
+                                             'Desktop', now, 3600)], 'codex': [], 'grok': []})
     original_headers = dict(w.header_rows)
     try:
         assert w.font_delta() == font_delta
         for stage in ('collapsed', 'expanded', 'collapsed-again'):
             if stage != 'collapsed':
-                header = w.header_rows['claude']
-                QTest.mouseClick(w, Qt.MouseButton.LeftButton, pos=header.mapTo(w, header.rect().center()))
+                QTest.mouseClick(w.header_rows['claude'].disclosure, Qt.MouseButton.LeftButton)
             QTest.qWait(160)
             assert w.header_rows == original_headers
+            if font_delta == 0 or app.platformName() == 'windows':
+                assert w.width() == 316
+            before = w.geometry()
+            w._render()
+            app.processEvents()
+            assert w.geometry() == before
             for header in w.header_rows.values():
+                quota_rect = QRect(header.quota_columns.mapTo(header, QPoint()), header.quota_columns.size())
+                for label in (header.name_label, header.payment_label):
+                    assert not quota_rect.intersects(QRect(label.mapTo(header, QPoint()), label.size()))
                 assert header.quota_columns.height() >= header.quota_columns.sizeHint().height()
                 for label in header.quota_columns.headlines + header.quota_columns.countdowns:
                     if label.isVisible():
                         assert label.height() >= label.sizeHint().height()
-                        assert label.width() >= label.sizeHint().width()
-                assert header.payment_label.height() >= header.payment_label.sizeHint().height()
+                        assert label.width() >= label.sizeHint().width(), (stage, header.agent_name, label.text(),
+                            label.geometry(), header.quota_columns.size(), header.quota_columns.sizeHint(), w.width())
+                assert header.payment_label.height() >= header.payment_label.sizeHint().height(), (stage,
+                    header.agent_name, header.size(), header.heightForWidth(header.width()), w.size())
             notice = w.header_rows['codex'].reset_notice
             assert notice.height() >= notice.heightForWidth(notice.width())
             if stage == 'expanded':
@@ -811,15 +851,19 @@ def test_payments_reset_notice_and_forecast_have_room_in_both_states(tmp_path, f
             if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
                 assert w.grab().save(str(pathlib.Path(out) / f'{stage}-{font_delta}.png'))
             initial_width = w.width()
+            w.move(w.screen().availableGeometry().center().x() - initial_width // 2, w.y())
+            edge = 'left' if stage == 'expanded' else 'right'
             w._grip_started()
-            w._grip_dragged('right', 120)
+            w._grip_dragged(edge, -64 if edge == 'left' else 64)
             app.processEvents()
-            assert w.width() > initial_width
+            assert w.width() == initial_width + 64
             assert notice.height() >= notice.heightForWidth(notice.width())
-            w._grip_dragged('right', 0)
+            if out:
+                assert w.grab().save(str(pathlib.Path(out) / f'{stage}-{font_delta}-wide.png'))
+            w._grip_dragged(edge, 0)
             w._grip_finished()
             app.processEvents()
-            assert w.width() == initial_width
+            assert w.width() == initial_width, (stage, w.minimumWidth(), w.user_width, w.geometry())
             assert notice.height() >= notice.heightForWidth(notice.width())
     finally:
         w.quit_monitor()

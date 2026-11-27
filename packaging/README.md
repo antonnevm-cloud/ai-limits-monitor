@@ -1,8 +1,8 @@
 # Сборка AI Limits Monitor
 
-Windows 10 версии 1809 и новее и Windows 11 используют установщик x64. Запусти `AI-Limits-Monitor-2.0.0-windows-x64-setup.exe`. Он устанавливает программу в `%LOCALAPPDATA%\Programs\AI Limits Monitor` и создает ярлык в меню "Пуск". Ярлык на рабочем столе и запуск при входе в Windows включаются по желанию. Удалить программу можно в разделе установленных приложений.
+Windows 10 версии 1809 и новее и Windows 11 используют установщик x64. Запусти `AI-Limits-Monitor-2.0.1-windows-x64-setup.exe`. Он устанавливает программу в `%LOCALAPPDATA%\Programs\AI Limits Monitor` и создает ярлык в меню "Пуск". Ярлык на рабочем столе и запуск при входе в Windows включаются по желанию. Удалить программу можно в разделе установленных приложений.
 
-На macOS 27 с процессором Apple Silicon распакуй `AI-Limits-Monitor-2.0.0-macos-arm64.zip` и перенеси `AI Limits Monitor.app` в "Программы". Сборка использует локальную подпись. При первом запуске macOS может попросить подтвердить открытие приложения. [Открытие приложений на macOS](https://support.apple.com/ru-ru/102445).
+На macOS 27 с процессором Apple Silicon распакуй `AI-Limits-Monitor-<версия>-macos-arm64.zip` и перенеси `AI Limits Monitor.app` в "Программы". Сборка использует локальную подпись. При первом запуске macOS может попросить подтвердить открытие приложения. [Открытие приложений на macOS](https://support.apple.com/ru-ru/102445).
 
 Python, Qt и нужные библиотеки входят в дистрибутив. Лицензии находятся в `_internal/licenses` на Windows и в `Contents/Resources/licenses` внутри приложения на macOS.
 
@@ -22,7 +22,7 @@ $setup = Get-ChildItem -LiteralPath release -Filter '*-windows-x64-setup.exe' | 
 & $python packaging/check_distribution.py $setup.FullName
 ```
 
-Параметр `-Compiler` задает путь к `ISCC.exe`, если Inno Setup лежит отдельно. `-OutputDirectory` задает каталог готовых файлов, `-WorkDirectory` задает рабочий каталог. Проверка запускает настоящий установщик с `/PORTABLE=1` в отдельном временном каталоге. Целевой файл можно установить в переносимом режиме командой `AI-Limits-Monitor-2.0.0-windows-x64-setup.exe /PORTABLE=1 /DIR="D:\Programs\AI Limits Monitor"`.
+Параметр `-Compiler` задает путь к `ISCC.exe`, если Inno Setup лежит отдельно. `-OutputDirectory` задает каталог готовых файлов, `-WorkDirectory` задает рабочий каталог. Проверка запускает настоящий установщик с `/PORTABLE=1` в отдельном временном каталоге. Целевой файл можно установить в переносимом режиме командой `AI-Limits-Monitor-2.0.1-windows-x64-setup.exe /PORTABLE=1 /DIR="D:\Programs\AI Limits Monitor"`.
 
 ### macOS
 

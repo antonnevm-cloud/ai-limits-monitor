@@ -4,9 +4,9 @@ import ctypes, datetime as dt, json, logging, re, sys, time, traceback
 from html import escape
 from pathlib import Path
 from PySide6.QtCore import QByteArray,QObject,QPoint,QRect,QRectF,QRunnable,Qt,QThreadPool,QTimer,Signal,Slot
-from PySide6.QtGui import QAction,QCloseEvent,QColor,QCursor,QFont,QIcon,QPainter,QPen,QPixmap
+from PySide6.QtGui import QCloseEvent,QColor,QFont,QIcon,QPainter,QPen,QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QApplication,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
+from PySide6.QtWidgets import QApplication,QBoxLayout,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLayout,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
 from .database import Database
 from .subscription_payments import next_monthly_payment, parse_last_payment
 from .icon import ensure_icon
@@ -14,12 +14,12 @@ from .models import QuotaSnapshot
 from . import APP_VERSION
 from .provider_settings import load_connections, provider_enabled
 from .cache_threads import CODEX_TTL_DEFAULT,GROK_TTL_DEFAULT,ThreadScanner,is_claude_terminal,select_threads
-from .cache_threads_qt import AGENT_NAMES, MIN_VISIBLE_ROWS, ROW_HEIGHT, CacheThreadsBlock, ElidedLabel, LinkLabel, distribute_height_caps
+from .cache_threads_qt import AGENT_NAMES, MIN_VISIBLE_ROWS, ROW_HEIGHT, CacheThreadsBlock, ElidedLabel, LinkButton, distribute_height_caps
 from .forecast_qt import ForecastBar, ForecastPopup
 from .thread_activity import ACTIVITY_WORKING
 from .thread_usage import EMPTY_REPORT, UsageScanner
 from .week_forecast import WEEK, build_chart, build_forecast, weekly_window
-from .edge_grip import EdgeGrip
+from .edge_grip import GRIP_WIDTH, EdgeGrip
 from .thread_view import FIELDS as THREAD_VIEW_FIELDS, SETTING_KEY as THREAD_VIEW_KEY, ThreadView
 from .toggle_switch import ToggleSwitch
 from .claude_local import bridge_command, install_statusline_command, manual_resets_edit_text, save_manual_resets
@@ -31,12 +31,12 @@ from .quota_monitor_model import PROVIDERS,PROVIDER_LABELS,MonitorData,ProviderS
 from .utils import get_logger,now_local,setup_logging
 from .windows_ui import enable_per_monitor_dpi_awareness,set_window_always_on_top
 
-MONITOR_NAME='AI Limits Monitor'; MONITOR_VERSION=APP_VERSION; DEFAULT_REFRESH=60; CACHE_SCAN_MS=10000; USAGE_SCAN_MS=30000; FORECAST_REFRESH_TICKS=30; FORECAST_SAMPLES_TTL=60; DEFAULT_LIST_WIDTH=380; CACHE_PROVIDERS=('claude','codex','grok'); CACHE_TTL_CHOICES={300,600,900,1800,3600}; CLICK_SLOP=5
+MONITOR_NAME='AI Limits Monitor'; MONITOR_VERSION=APP_VERSION; DEFAULT_REFRESH=60; CACHE_SCAN_MS=10000; USAGE_SCAN_MS=30000; FORECAST_REFRESH_TICKS=30; FORECAST_SAMPLES_TTL=60; DEFAULT_LIST_WIDTH=380; CACHE_PROVIDERS=('claude','codex','grok'); CACHE_TTL_CHOICES={300,600,900,1800,3600}
 _MUTEX_NAME='AIUsageMonitor_SingleInstance_v1'; _ALREADY_EXISTS=183
 BADGES={'claude':'C','codex':'X','grok':'G','antigravity':'A'}
 BADGE_COLORS={'claude':'#A86F58','codex':'#426D72','grok':'#6A6F76','antigravity':'#5D4A87'}
 COMPACT_WIDTH=180; COMPACT_MIN_WIDTH=180; COMPACT_MIN_HEIGHT=150; FIT_SETTLE_MS=60; CACHE_SCREEN_MARGIN=24; MAX_USER_WIDTH=3000; DRAWER_WIDTH=300
-HOVER_POLL_MS=80; ICON_LOGICAL_SIZE=18; ICON_BOX_SIZE=18; RESET_NOTICE_DAYS=14; RESET_CRITICAL_DAYS=3
+ICON_LOGICAL_SIZE=18; ICON_BOX_SIZE=18; RESET_NOTICE_DAYS=14; RESET_CRITICAL_DAYS=3
 PAYMENTS_SETTING = 'monitor_subscription_payments'
 PAYMENT_AMOUNT_LENGTH = 24
 Payment = tuple[dt.date, str]
@@ -171,11 +171,66 @@ class ProviderIcon(QLabel):
             mono=QPixmap(pix.size());mono.setDevicePixelRatio(dpr);mono.fill(Qt.GlobalColor.transparent);painter=QPainter(mono);painter.drawPixmap(0,0,pix);painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn);painter.fillRect(QRectF(0,0,ICON_LOGICAL_SIZE,ICON_LOGICAL_SIZE),QColor('#F0F3F7'));painter.end();self.setPixmap(mono)
         else:self.setText('•')
 
+class DisclosureButton(QToolButton):
+    SIDE = 26
+
+    def __init__(self, agent_name):
+        super().__init__()
+        self.agent_name = agent_name
+        self.setObjectName('CardDisclosure')
+        self.setCheckable(True)
+        self.setFixedSize(self.SIDE, self.SIDE)
+        policy = self.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.setSizePolicy(policy)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.set_expanded(False)
+
+    def set_expanded(self, expanded):
+        arrow = Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        if self.isChecked() == expanded and self.arrowType() == arrow:
+            return
+        self.setChecked(expanded)
+        self.setArrowType(arrow)
+        verb = 'Свернуть' if expanded else 'Развернуть'
+        label = f'{verb} треды {self.agent_name}'
+        self.setAccessibleName(label)
+        self.setToolTip(label)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not event.isAutoRepeat():
+                self.click()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class CompactRow(QFrame):
     '''Заголовок карточки агента по макету: имя слева, справа остатки лимитов и точка состояния данных.'''
     def __init__(self,row,state,parent=None,running=None,font_delta=0.0,now=None,*,payment=None):
         super().__init__(parent);self.row=row;self.state=state;self.font_delta=font_delta;self.setObjectName('CompactRow');self.setMouseTracking(True);self.agent_name=AGENT_NAMES.get(row.provider,row.name);self.running=None
-        outer=QVBoxLayout(self);self._outer=outer;outer.setContentsMargins(12,9,12,9);outer.setSpacing(4);h=QHBoxLayout();h.setContentsMargins(0,0,0,0);h.setSpacing(7);outer.addLayout(h)
+        outer = QVBoxLayout(self)
+        self._outer = outer
+        outer.setContentsMargins(6, 7, 6, 7)
+        outer.setSpacing(4)
+        self._heading = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._heading.setSpacing(4)
+        outer.addLayout(self._heading)
+        self._identity = QWidget()
+        h = QHBoxLayout(self._identity)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        self.disclosure = None
+        if row.provider in CACHE_PROVIDERS:
+            self.disclosure = DisclosureButton(self.agent_name)
+            h.addWidget(self.disclosure, 0, Qt.AlignmentFlag.AlignVCenter)
+        else:
+            spacer = QWidget()
+            spacer.setFixedSize(DisclosureButton.SIDE, 1)
+            spacer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            h.addWidget(spacer)
         self.icon = ProviderIcon(row.provider)
         h.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignVCenter)
         identity = QVBoxLayout()
@@ -184,7 +239,7 @@ class CompactRow(QFrame):
         self.name_label = QLabel(self.agent_name)
         self.name_label.setObjectName('AgentName')
         title = QHBoxLayout()
-        title.setSpacing(4)
+        title.setSpacing(3)
         title.addWidget(self.name_label)
         self.dot = QLabel('●')
         self.dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -200,11 +255,28 @@ class CompactRow(QFrame):
         self.payment = None
         self._payment_as_of = None
         self.quota_columns = QuotaColumns(font_delta)
-        h.addWidget(self.quota_columns, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.quota_columns.layout().setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        self._heading.addWidget(self._identity, 1)
+        self._heading.addWidget(self.quota_columns, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.reset_notice = None
         self.set_running(running)
         self.set_data(row,state,running,now)
         self.set_payment(payment)
+
+    def fit_width(self, card_width):
+        self._identity.layout().activate()
+        self.quota_columns.layout().activate()
+        margins = self._outer.contentsMargins()
+        width = (margins.left() + self._identity.layout().minimumSize().width() + self._heading.spacing()
+                 + self.quota_columns.sizeHint().width() + margins.right())
+        side_by_side = width <= card_width
+        direction = QBoxLayout.Direction.LeftToRight if side_by_side else QBoxLayout.Direction.TopToBottom
+        if self._heading.direction() != direction:
+            self._heading.setDirection(direction)
+            self._heading.setStretch(0, int(side_by_side))
+        self._outer.invalidate()
+        self._outer.activate()
+        self.updateGeometry()
 
     def set_payment(self, payment: Payment | None, today: dt.date | None = None) -> bool:
         today = today or now_local().date()
@@ -402,19 +474,75 @@ class SettingsDialog(QDialog):
 
 class MonitorWindow(QMainWindow):
     def __init__(self,db,*,auto_refresh=True,cache_scan=None):
-        super().__init__();self.db=db;self.pool=QThreadPool.globalInstance();self.worker=None;self._drag=None;self._press_point=None;self._quit=False;self._auto_refresh=auto_refresh;self.states=cached_states(db);self.rows=build_rows(self.states);compact,selected=build_compact_rows(db,self.states);self.data=MonitorData(self.states,self.rows,compact,selected);self.seconds=self._load_int('monitor_refresh_seconds',DEFAULT_REFRESH,{15,30,60,120,300});self.opacity=self._load_int('monitor_opacity',90,{20,30,40,50,60,70,80,90,100});self.topmost=db.get_setting('monitor_always_on_top','1')!='0';self.visibility=self._load_json('monitor_compact_visibility');self.user_width=self._load_width();self._resize_origin=None;self.grips={};self.thread_view=ThreadView.from_json(db.get_setting(THREAD_VIEW_KEY));self.thread_rules=db.thread_rules();self.view_switches={};self._init_cache_threads(auto_refresh if cache_scan is None else cache_scan)
+        super().__init__();self.db=db;self.pool=QThreadPool.globalInstance();self.worker=None;self._drag=None;self._quit=False;self._auto_refresh=auto_refresh;self.states=cached_states(db);self.rows=build_rows(self.states);compact,selected=build_compact_rows(db,self.states);self.data=MonitorData(self.states,self.rows,compact,selected);self.seconds=self._load_int('monitor_refresh_seconds',DEFAULT_REFRESH,{15,30,60,120,300});self.opacity=self._load_int('monitor_opacity',90,{20,30,40,50,60,70,80,90,100});self.topmost=db.get_setting('monitor_always_on_top','1')!='0';self.visibility=self._load_json('monitor_compact_visibility');self.user_width=self._load_width();self._resize_origin=None;self.grips={};self.thread_view=ThreadView.from_json(db.get_setting(THREAD_VIEW_KEY));self.thread_rules=db.thread_rules();self.view_switches={};self._init_cache_threads(auto_refresh if cache_scan is None else cache_scan)
         self.payments = self._load_payments()
-        self.setWindowTitle(f'{MONITOR_NAME} {MONITOR_VERSION}');self.setWindowIcon(QIcon(str(ensure_icon())));self._enable_transparency(self);self.setMinimumSize(COMPACT_MIN_WIDTH,COMPACT_MIN_HEIGHT);self.resize(COMPACT_WIDTH,COMPACT_MIN_HEIGHT);self._build();self._apply_font();self._restore_geometry();self._apply_window_flags();self._apply_opacity();self._render();self._build_tray();self.timer=QTimer(self);self.timer.timeout.connect(self.refresh);self.timer.start(self.seconds*1000);self.clock_timer=QTimer(self);self.clock_timer.timeout.connect(self._update_clock);self.clock_timer.start(1000);self._hover_timer=QTimer(self);self._hover_timer.setInterval(HOVER_POLL_MS);self._hover_timer.timeout.connect(self._update_actions_visibility);self._hover_timer.start();self._update_clock()
+        self.setWindowTitle(f'{MONITOR_NAME} {MONITOR_VERSION}');self.setWindowIcon(QIcon(str(ensure_icon())));self._enable_transparency(self);self.setMinimumSize(COMPACT_MIN_WIDTH,COMPACT_MIN_HEIGHT);self.resize(COMPACT_WIDTH,COMPACT_MIN_HEIGHT);self._build();self._apply_font();self._restore_geometry();self._apply_window_flags();self._apply_opacity();self._render();self._build_tray();self.timer=QTimer(self);self.timer.timeout.connect(self.refresh);self.timer.start(self.seconds*1000);self.clock_timer=QTimer(self);self.clock_timer.timeout.connect(self._update_clock);self.clock_timer.start(1000);self._update_clock()
         if auto_refresh:
             QTimer.singleShot(250,self.refresh)
             QTimer.singleShot(5000,self.refresh)
     def _build(self):
-        shell=ShellFrame();shell.setObjectName('WidgetShell');self._enable_transparency(shell);self.setCentralWidget(shell);v=QVBoxLayout(shell);v.setContentsMargins(5,6,5,7);v.setSpacing(3);header=QFrame();h=QHBoxLayout(header);h.setContentsMargins(4,1,3,1);title=QLabel('AI Limits');title.setObjectName('WidgetTitle');h.addWidget(title);h.addStretch();self.updated=QLabel('—');self.updated.setObjectName('UpdatedLabel');h.addWidget(self.updated);self.actions=QWidget();ah=QHBoxLayout(self.actions);ah.setContentsMargins(0,0,0,0);ah.setSpacing(2)
-        for text,tip,slot in (('↻','Обновить',self.refresh_now),('▤','Детальная аналитика',self.open_detail),('×','Скрыть в трей',self.hide_to_tray)):
-            b=QPushButton(text);b.setObjectName('HoverButton');b.setFixedSize(22,20);b.setToolTip(tip);b.clicked.connect(slot);ah.addWidget(b)
-        policy=self.actions.sizePolicy();policy.setRetainSizeWhenHidden(True);self.actions.setSizePolicy(policy)
-        self.actions.setVisible(False);h.addWidget(self.actions);self.gear_button=QPushButton('⚙');self.gear_button.setObjectName('HoverButton');self.gear_button.setFixedSize(22,20);self.gear_button.setToolTip('Вид тредов и настройки');self.gear_button.clicked.connect(self.toggle_drawer);h.addWidget(self.gear_button)
-        v.addWidget(header);self.drawer=self._make_drawer();self.rows_box=QVBoxLayout();self.rows_box.setContentsMargins(0,0,0,0);self.rows_box.setSpacing(2);v.addLayout(self.rows_box);self.footer=QLabel();self.footer.setObjectName('WidgetFooter');self.footer.setToolTip('ОНЛАЙН — свежие данные. ЛОКАЛЬНЫЕ — использована локальная история. КЭШ — последний сохранённый снимок. НЕТ ДАННЫХ — источник и снимок отсутствуют.');v.addWidget(self.footer);shell.setMouseTracking(True);header.setMouseTracking(True);self._build_grips()
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+        shell = ShellFrame()
+        shell.setObjectName('WidgetShell')
+        self._enable_transparency(shell)
+        self.setCentralWidget(shell)
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(GRIP_WIDTH + 1, 6, GRIP_WIDTH + 1, 7)
+        layout.setSpacing(3)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(2, 0, 0, 0)
+        title = QLabel('AI Limits')
+        title.setObjectName('WidgetTitle')
+        title.setToolTip('Потяни за заголовок, чтобы переместить виджет')
+        header.addWidget(title)
+        header.addStretch()
+        self.updated = QLabel()
+        self.updated.setObjectName('UpdatedLabel')
+        header.addWidget(self.updated)
+        self.hide_button = self._command_button('Скрыть', 'Скрыть виджет в области уведомлений')
+        self.hide_button.setObjectName('HideWidget')
+        self.hide_button.clicked.connect(self.hide_to_tray)
+        header.addWidget(self.hide_button)
+        layout.addLayout(header)
+
+        self.actions = QWidget()
+        commands = QHBoxLayout(self.actions)
+        commands.setContentsMargins(0, 0, 0, 0)
+        commands.setSpacing(2)
+        self.refresh_button = self._command_button('Обновить', 'Обновить данные о лимитах')
+        self.refresh_button.clicked.connect(self.refresh_now)
+        self.analytics_button = self._command_button('Аналитика', 'Открыть подробную аналитику расхода')
+        self.analytics_button.clicked.connect(self.open_detail)
+        self.menu_button = self._command_button('Меню', 'Настройки вида, подключения и другие команды')
+        for button in (self.refresh_button, self.analytics_button, self.menu_button):
+            commands.addWidget(button, 1)
+        layout.addWidget(self.actions)
+
+        self.drawer = self._make_drawer()
+        self.rows_box = QVBoxLayout()
+        self.rows_box.setContentsMargins(0, 0, 0, 0)
+        self.rows_box.setSpacing(2)
+        layout.addLayout(self.rows_box)
+        self.footer = QLabel()
+        self.footer.setObjectName('WidgetFooter')
+        self.footer.setWordWrap(True)
+        self.footer.setToolTip('Онлайн: свежие данные. Локальные: данные из истории. Кэш: последний сохраненный снимок. Нет данных: источник и снимок недоступны.')
+        layout.addWidget(self.footer)
+        self._build_grips()
+
+    @staticmethod
+    def _command_button(text, tip):
+        button = QPushButton(text)
+        button.setObjectName('WidgetCommand')
+        button.setAccessibleName(text)
+        button.setToolTip(tip)
+        button.setAccessibleDescription(tip)
+        button.setAutoDefault(True)
+        button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        return button
+
     def _build_grips(self):
         for edge in ('left','right'):
             grip=EdgeGrip(edge,self);grip.drag_started.connect(self._grip_started);grip.dragged.connect(lambda dx,e=edge:self._grip_dragged(e,dx));grip.drag_finished.connect(self._grip_finished);self.grips[edge]=grip
@@ -432,36 +560,26 @@ class MonitorWindow(QMainWindow):
         screen=self.screen() or QApplication.primaryScreen();return screen.availableGeometry() if screen else None
     def _grip_started(self):self._resize_origin=self.geometry()
     def _grip_dragged(self,edge,dx):
-        '''Ширину меняет владелец: левый край тянется при неподвижном правом, правый при неподвижном левом; выше высота не меняется.'''
+        """При изменении ширины противоположный край остается на месте."""
         origin=self._resize_origin
         if origin is None:return
         area=self._screen_area();limit=MAX_USER_WIDTH
         if area is not None:limit=min(limit,(origin.right()+1-area.left()) if edge=='left' else (area.right()+1-origin.left()))
-        min_w=self.minimumWidth();width=max(min_w,min(max(min_w,limit),origin.width()+(dx if edge=='right' else -dx)))
-        left=origin.left() if edge=='right' else origin.right()+1-width
-        self.user_width = width
+        requested = origin.width() + (dx if edge == 'right' else -dx)
+        self.user_width = max(COMPACT_MIN_WIDTH, min(limit, requested))
         self._fit_to_content()
-        self.move(left, self.y())
+        self.user_width = self.width()
+        self.move(origin.left() if edge == 'right' else origin.right() + 1 - self.width(), self.y())
     def _grip_finished(self):
         self._resize_origin=None;self.db.set_setting('monitor_width',str(self.user_width))
-    def _set_actions_visible(self,visible):
-        if self.actions.isVisible()!=visible:self.actions.setVisible(visible)
-    def _cursor_inside_frame(self,position=None):
-        position=position if position is not None else QCursor.pos()
-        return self.isVisible() and self.frameGeometry().contains(position)
-    def _update_actions_visibility(self,position=None):
-        self._set_actions_visible(self._cursor_inside_frame(position))
-    def enterEvent(self,e):self._set_actions_visible(True);super().enterEvent(e)
-    def leaveEvent(self,e):self._update_actions_visibility();super().leaveEvent(e)
     def mousePressEvent(self,e):
-        if e.button()==Qt.MouseButton.LeftButton:self._drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft();self._press_point=e.globalPosition().toPoint()
+        if e.button()==Qt.MouseButton.LeftButton:self._drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft()
         super().mousePressEvent(e)
     def mouseMoveEvent(self,e):
         if self._drag is not None and e.buttons()&Qt.MouseButton.LeftButton:self.move(e.globalPosition().toPoint()-self._drag)
         super().mouseMoveEvent(e)
     def mouseReleaseEvent(self,e):
-        if e.button()==Qt.MouseButton.LeftButton and self._press_point is not None and (e.globalPosition().toPoint()-self._press_point).manhattanLength()<CLICK_SLOP:self._click_at(e.position().toPoint())
-        self._drag=None;self._press_point=None;super().mouseReleaseEvent(e)
+        self._drag=None;super().mouseReleaseEvent(e)
     def _load_int(self,key,default,allowed):
         try:value=int(self.db.get_setting(key,str(default)) or default)
         except ValueError:value=default
@@ -494,9 +612,8 @@ class MonitorWindow(QMainWindow):
         self._connection_generation = 0
         self.cache_scanner=ThreadScanner(codex_ttl=self._load_int('monitor_cache_codex_ttl',CODEX_TTL_DEFAULT,CACHE_TTL_CHOICES),grok_ttl=self._load_int('monitor_cache_grok_ttl',GROK_TTL_DEFAULT,CACHE_TTL_CHOICES));self.cache_enabled=self.db.get_setting('monitor_cache_threads','1')!='0'
         self.cache_expanded={p:True for p,v in self._load_json('monitor_cache_expanded').items() if p in CACHE_PROVIDERS and v is True};self.cache_show_all={}
-        self.cache_threads={};self.cache_blocks={};self._cache_worker=None;self._cache_scan=scan;self.forecast_bars={};self.header_rows={};self.forecast_popup=None;self._popup_provider=None;self._popup_pinned=False;self._clock_ticks=0;self._forecast_samples={}
+        self.cache_threads={};self.cache_blocks={};self._cache_worker=None;self._cache_scan=scan;self.forecast_bars={};self.header_rows={};self.forecast_popup=None;self._popup_provider=None;self._clock_ticks=0;self._forecast_samples={}
         self.usage_report=EMPTY_REPORT;self._spend={};self._usage_worker=None;self.usage_scanner=UsageScanner() if scan else None
-        self._popup_timer=QTimer(self);self._popup_timer.setSingleShot(True);self._popup_timer.setInterval(300);self._popup_timer.timeout.connect(self._popup_check_close)
         self.usage_timer=QTimer(self);self.usage_timer.setInterval(USAGE_SCAN_MS);self.usage_timer.timeout.connect(self._start_usage_scan)
         self.cache_timer=QTimer(self);self.cache_timer.setInterval(CACHE_SCAN_MS);self.cache_timer.timeout.connect(self._start_cache_scan)
         if scan:self.cache_timer.start();QTimer.singleShot(400,self._start_cache_scan);self.usage_timer.start();QTimer.singleShot(1500,self._start_usage_scan)
@@ -511,9 +628,15 @@ class MonitorWindow(QMainWindow):
         threads=self.cache_threads.get(provider,[])
         return threads if self.thread_view.terminal else [t for t in threads if not is_claude_terminal(t)]
     def _update_running(self):
+        changed = False
         for provider,header in self.header_rows.items():
             count=self.running_count(provider)
-            if count!=header.running:header.set_running(count)
+            if count != header.running:
+                header.set_running(count)
+                changed = True
+        if changed:
+            self._fit_to_content()
+            QTimer.singleShot(0, self, self._fit_to_content)
     def _make_cache_block(self,provider):
         if not self.cache_enabled or not self.cache_expanded.get(provider):return None
         block=CacheThreadsBlock();block.more_clicked.connect(lambda p=provider:self.set_cache_show_all(p,True));block.less_clicked.connect(lambda p=provider:self.set_cache_show_all(p,False));block.restore_clicked.connect(lambda p=provider:self._restore_hidden(p));block.content_changed.connect(lambda:QTimer.singleShot(0,self,self._fit_to_content));self._fill_cache_block(provider,block);self.cache_blocks[provider]=block;return block
@@ -539,11 +662,11 @@ class MonitorWindow(QMainWindow):
             if self.thread_rules.get(thread.session_id,{}).get('hidden'):self.db.set_hidden(thread.session_id,False)
         self._reload_thread_rules()
     def _make_drawer(self):
-        '''Выезжающая панель настроек списка: переключатели и выбор из списка по макету; шестеренка в заголовке открывает и закрывает ее.'''
+        """Панель вида тредов рядом с виджетом."""
         # Окно без фона со скругленной рамкой внутри: фон из стиля у прозрачного окна верхнего уровня не рисуется.
         drawer=QWidget(None,Qt.WindowType.Tool|Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint);drawer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground,True);drawer.setFixedWidth(DRAWER_WIDTH);outer=QVBoxLayout(drawer);outer.setContentsMargins(0,0,0,0)
         body=QFrame();body.setObjectName('ThreadDrawer');outer.addWidget(body);box=QVBoxLayout(body);box.setContentsMargins(14,10,14,12);box.setSpacing(6);self.view_combos={}
-        head=QHBoxLayout();head.setContentsMargins(0,0,0,2);heading=QLabel('Вид тредов');heading.setObjectName('DrawerHeading');close=QToolButton();close.setObjectName('PopupClose');close.setText('×');close.setToolTip('Закрыть');close.setCursor(Qt.CursorShape.PointingHandCursor);close.clicked.connect(drawer.hide);head.addWidget(heading,1);head.addWidget(close);box.addLayout(head)
+        head=QHBoxLayout();head.setContentsMargins(0,0,0,2);heading=QLabel('Вид тредов');heading.setObjectName('DrawerHeading');close=QToolButton();close.setObjectName('PopupClose');close.setText('×');close.setAccessibleName('Закрыть настройки вида');close.setToolTip('Закрыть настройки вида');close.setCursor(Qt.CursorShape.PointingHandCursor);close.clicked.connect(drawer.hide);head.addWidget(heading,1);head.addWidget(close);box.addLayout(head)
         for spec in THREAD_VIEW_FIELDS:
             row=QHBoxLayout();row.setContentsMargins(14 if spec.indent else 0,0,0,0);text=QLabel(spec.label);text.setObjectName('DrawerSub' if spec.indent else 'DrawerLabel')
             if spec.choices:
@@ -556,7 +679,7 @@ class MonitorWindow(QMainWindow):
         row=QHBoxLayout();row.setContentsMargins(0,4,0,0);text=QLabel('Прозрачность окна');text.setObjectName('DrawerLabel');self.opacity_slider=QSlider(Qt.Orientation.Horizontal);self.opacity_slider.setObjectName('OpacitySlider');self.opacity_slider.setRange(2,10);self.opacity_slider.setPageStep(1);self.opacity_slider.setValue(max(2,min(10,self.opacity//10)));self.opacity_slider.setFixedWidth(96);self.opacity_slider.setAccessibleName('Прозрачность фона')
         self.opacity_value=QLabel(f'{self.opacity}%');self.opacity_value.setObjectName('DrawerSub');self.opacity_value.setFixedWidth(34);self.opacity_value.setAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter);self.opacity_slider.valueChanged.connect(self._set_opacity_step)
         row.addWidget(text,1);row.addWidget(self.opacity_slider);row.addWidget(self.opacity_value);box.addLayout(row)
-        more=LinkLabel('Все настройки…');more.clicked.connect(self.open_settings);box.addWidget(more,0,Qt.AlignmentFlag.AlignLeft)
+        more=LinkButton('Все настройки');more.clicked.connect(self.open_settings);box.addWidget(more,0,Qt.AlignmentFlag.AlignLeft)
         drawer.setVisible(False);return drawer
     def font_delta(self):
         try:return float(self.thread_view.font)
@@ -580,7 +703,7 @@ class MonitorWindow(QMainWindow):
         if area is not None and left<area.left():left=frame.right()+8
         top=frame.top()
         if area is not None:top=max(area.top(),min(top,area.bottom()+1-self.drawer.height()))
-        self.drawer.move(left,top);self.drawer.show();self.drawer.raise_()
+        self.drawer.move(left,top);self.drawer.show();self.drawer.raise_();self.drawer.activateWindow()
     def _set_thread_view(self,name,value):
         view=self.thread_view.with_value(name,value)
         if view==self.thread_view:return
@@ -596,14 +719,6 @@ class MonitorWindow(QMainWindow):
         self._render()
     def set_cache_show_all(self,provider,show_all):
         self.cache_show_all[provider]=bool(show_all);self._render()
-    def _click_at(self,pos):
-        if not self.cache_enabled:return
-        widget=self.childAt(pos)
-        while widget is not None and widget is not self:
-            if isinstance(widget,CompactRow):
-                if widget.row.provider in CACHE_PROVIDERS:self.toggle_cache_provider(widget.row.provider)
-                return
-            widget=widget.parentWidget()
     def _tick_cache(self):
         if self.cache_blocks:
             now=dt.datetime.now(dt.timezone.utc)
@@ -652,46 +767,64 @@ class MonitorWindow(QMainWindow):
         forecast=self._forecast_for(provider)
         if forecast is None:return None
         bar=ForecastBar();bar.set_forecast(forecast)
-        if self.thread_view.chart=='off':bar.setCursor(Qt.CursorShape.ArrowCursor)
-        bar.entered.connect(lambda p=provider:self._forecast_entered(p));bar.left.connect(lambda:self._popup_timer.start());bar.clicked.connect(lambda p=provider:self._forecast_clicked(p));bar.context_requested.connect(lambda p=provider:self._forecast_context(p))
+        bar.clicked.connect(lambda: self._forecast_clicked(provider))
         self.forecast_bars[provider]=bar;return bar
     def _refresh_forecasts(self):
         for provider,bar in self.forecast_bars.items():
             forecast=self._forecast_for(provider)
             if forecast is not None:bar.set_forecast(forecast)
-    def _forecast_entered(self,provider):
-        self._popup_timer.stop()
-        if self.thread_view.chart=='hover' and not self._popup_pinned:self._show_forecast_popup(provider)
-    def _forecast_clicked(self,provider):
-        if self.thread_view.chart!='hover':return
-        self._popup_pinned=not self._popup_pinned
-        if self._popup_pinned:self._show_forecast_popup(provider)
-        elif self.forecast_popup is not None:self.forecast_popup.set_pinned(False)
-    def _forecast_context(self,provider):
-        if self.thread_view.chart!='rclick':return
-        if self.forecast_popup is not None and self.forecast_popup.isVisible() and self._popup_provider==provider:self._close_popup()
-        else:self._popup_pinned=True;self._show_forecast_popup(provider)
-    def _popup_check_close(self):
-        popup=self.forecast_popup
-        if popup is None or self._popup_pinned:return
-        if popup.underMouse() or any(bar.underMouse() for bar in self.forecast_bars.values()):return
-        popup.hide()
-    def _close_popup(self):
-        self._popup_pinned=False;self._popup_timer.stop()
-        if self.forecast_popup is not None:self.forecast_popup.set_pinned(False);self.forecast_popup.hide()
-    def _show_forecast_popup(self,provider):
-        forecast=self._forecast_for(provider);bar=self.forecast_bars.get(provider)
-        if forecast is None or bar is None:return
+    def _forecast_clicked(self, provider):
+        bar = self.forecast_bars.get(provider)
+        if self.thread_view.chart != 'click' or bar is None:
+            return
+        if self._popup_provider == provider:
+            self._close_popup(restore_focus=True)
+            return
+        forecast = self._forecast_for(provider)
+        if forecast is None:
+            bar.set_chart_open(False)
+            return
+        previous = self.forecast_bars.get(self._popup_provider)
+        if previous is not None:
+            previous.set_chart_open(False)
         if self.forecast_popup is None:
-            self.forecast_popup=ForecastPopup();self.forecast_popup.setStyleSheet(scaled_style(self.font_delta()));self.forecast_popup.closed.connect(self._close_popup);self.forecast_popup.entered.connect(self._popup_timer.stop);self.forecast_popup.left.connect(lambda:self._popup_timer.start())
-        popup=self.forecast_popup;self._popup_provider=provider
-        samples=self._week_samples(provider,self.weekly_of(provider))
-        popup.set_data(forecast,build_chart(forecast,samples,self.usage_report.daily.get(provider,{})));popup.set_pinned(self._popup_pinned);popup.adjustSize()
-        area=self._screen_area();frame=self.frameGeometry();left=frame.left()-popup.width()-8
-        if area is not None and left<area.left():left=frame.right()+8
-        top=bar.mapToGlobal(QPoint(0,0)).y()
-        if area is not None:top=max(area.top(),min(top,area.bottom()+1-popup.height()))
-        popup.move(left,top);popup.show()
+            self.forecast_popup = ForecastPopup(self)
+            self.forecast_popup.setStyleSheet(scaled_style(self.font_delta()))
+            self.forecast_popup.closed.connect(lambda: self._close_popup(restore_focus=True))
+        self._popup_provider = provider
+        self._update_forecast_popup(provider, bar, forecast)
+        self.forecast_popup.show()
+        self.forecast_popup.raise_()
+        self.forecast_popup.activateWindow()
+        self.forecast_popup.close_button.setFocus()
+
+    def _update_forecast_popup(self, provider, bar, forecast):
+        bar.set_chart_open(True)
+        samples = self._week_samples(provider, self.weekly_of(provider))
+        popup = self.forecast_popup
+        popup.set_data(forecast, build_chart(forecast, samples, self.usage_report.daily.get(provider, {})))
+        popup.adjustSize()
+        area = self._screen_area()
+        frame = self.frameGeometry()
+        left = frame.left() - popup.width() - 8
+        top = bar.mapToGlobal(QPoint(0, 0)).y()
+        if area is not None:
+            if left < area.left():
+                left = min(frame.right() + 8, area.right() + 1 - popup.width())
+            left = max(area.left(), left)
+            top = max(area.top(), min(top, area.bottom() + 1 - popup.height()))
+        popup.move(left, top)
+
+    def _close_popup(self, *, restore_focus=False):
+        bar = self.forecast_bars.get(self._popup_provider)
+        self._popup_provider = None
+        if self.forecast_popup is not None:
+            self.forecast_popup.hide()
+        if bar is not None:
+            bar.set_chart_open(False)
+            if restore_focus:
+                self.activateWindow()
+                bar.chart_button.setFocus()
     @Slot()
     def _start_cache_scan(self):
         if not self._cache_wanted() or self._cache_worker or self._quit:return
@@ -737,13 +870,16 @@ class MonitorWindow(QMainWindow):
                 header = CompactRow(row, state, running=running, font_delta=delta, payment=payment)
                 self.header_rows[provider] = header
                 self.rows_box.addWidget(AgentCard(header))
+                if header.disclosure is not None:
+                    header.disclosure.clicked.connect(lambda checked, p=provider: self.toggle_cache_provider(p))
             else:
                 header = self.header_rows[provider]
                 changed |= header.set_data(row, state, running)
                 changed |= header.set_payment(payment)
-            clickable = self.cache_enabled and provider in CACHE_PROVIDERS
-            header.setCursor(Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor)
-            expanded = clickable and self.cache_expanded.get(provider)
+            expanded = self.cache_enabled and header.disclosure is not None and bool(self.cache_expanded.get(provider))
+            if header.disclosure is not None:
+                header.disclosure.setVisible(self.cache_enabled)
+                header.disclosure.set_expanded(expanded)
             block = self.cache_blocks.get(provider)
             if expanded and block is None:
                 block = self._make_cache_block(provider)
@@ -762,12 +898,13 @@ class MonitorWindow(QMainWindow):
             self._refill_cache_blocks()
             self._refresh_forecasts()
         for bar in self.forecast_bars.values():
-            bar.setCursor(Qt.CursorShape.ArrowCursor if self.thread_view.chart == 'off' else Qt.CursorShape.PointingHandCursor)
-        if (rebuilt or details_changed) and self.forecast_popup is not None and self.forecast_popup.isVisible():
-            if self._popup_pinned and self._popup_provider in self.forecast_bars:
-                self._show_forecast_popup(self._popup_provider)
-            else:
+            bar.set_chart_enabled(self.thread_view.chart == 'click')
+        if self._popup_provider is not None:
+            provider = self._popup_provider
+            if self.thread_view.chart != 'click' or provider not in self.forecast_bars:
                 self._close_popup()
+            elif rebuilt or details_changed:
+                self._update_forecast_popup(provider, self.forecast_bars[provider], self._forecast_for(provider))
         live=sum(s.live for s in self.data.states.values());local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in self.data.states.values());cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in self.data.states.values());self.footer.setText(f'{live}/4 онлайн'+(f' · {local} локальные' if local else '')+(f' · {cached} кэш' if cached else '')+f' · Codex/AG {refresh_label(self.seconds)}');self._update_tray_tooltip()
         if changed or details_changed:
             for header in self.header_rows.values():
@@ -811,11 +948,24 @@ class MonitorWindow(QMainWindow):
     def _fit_to_content(self):
         before = self.geometry()
         layout = self.centralWidget().layout()
+        target = self.user_width or DEFAULT_LIST_WIDTH
+        area = self._screen_area()
+        if area is not None:
+            target = min(target, area.width())
+        frame = layout.contentsMargins()
+        for header in self.header_rows.values():
+            card = header.parentWidget()
+            border = card.contentsMargins()
+            header.fit_width(target - frame.left() - frame.right() - border.left() - border.right())
+            card.layout().invalidate()
+            card.layout().activate()
+            card.updateGeometry()
+        self.rows_box.invalidate()
+        layout.invalidate()
         layout.activate()
         minimum = max(COMPACT_MIN_WIDTH, layout.totalMinimumSize().width())
-        preferred = DEFAULT_LIST_WIDTH if self.cache_blocks else minimum
+        preferred = DEFAULT_LIST_WIDTH if self.cache_blocks else min(DEFAULT_LIST_WIDTH, layout.totalSizeHint().width())
         width = max(minimum, self.user_width or preferred)
-        area = self._screen_area()
         if area is not None:
             width = min(width, max(minimum, area.width()))
         self._cap_cache_blocks(layout, width, area)
@@ -1025,15 +1175,30 @@ class MonitorWindow(QMainWindow):
         # The unified application overrides this method and owns the analytics window.
         return None
     def _build_tray(self):
-        self.tray=QSystemTrayIcon(QIcon(str(ensure_icon())),self);menu=QMenu()
-        menu.addAction("Подключения и вход", self.open_connections)
-        for text,slot in (('Показать',self.show_normal),('Обновить',self.refresh_now),('Настройки',self.open_settings),('Детальная аналитика',self.open_detail)):
-            a=QAction(text,self);a.triggered.connect(slot);menu.addAction(a)
-        claude_setup_action=QAction('Claude · подключить локальные лимиты...',self);claude_setup_action.triggered.connect(self.configure_claude_statusline);menu.addAction(claude_setup_action)
-        claude_check_action=QAction('Claude · проверить источник...',self);claude_check_action.triggered.connect(self.show_claude_connection);menu.addAction(claude_check_action)
-        claude_resets_action=QAction('Claude · сбросы вручную...',self);claude_resets_action.triggered.connect(self.configure_claude_manual_resets);menu.addAction(claude_resets_action)
-        self.cache_action=QAction('Таймеры кэша тредов',self);self.cache_action.setCheckable(True);self.cache_action.setChecked(self.cache_enabled);self.cache_action.toggled.connect(self.set_cache_enabled);menu.addAction(self.cache_action)
-        menu.addSeparator();quit_action=QAction('Выход',self);quit_action.triggered.connect(self.quit_monitor);menu.addAction(quit_action);self.tray.setContextMenu(menu);self.tray.activated.connect(lambda reason:self.show_normal() if reason==QSystemTrayIcon.ActivationReason.Trigger else None);self.tray.show();self._update_tray_tooltip()
+        self.tray = QSystemTrayIcon(QIcon(str(ensure_icon())), self)
+        menu = QMenu(self)
+        menu.addAction('Настроить вид', self.toggle_drawer)
+        menu.addAction('Все настройки', self.open_settings)
+        menu.addAction('Подключения и вход', self.open_connections)
+        self.cache_action = menu.addAction('Таймеры кэша тредов')
+        self.cache_action.setCheckable(True)
+        self.cache_action.setChecked(self.cache_enabled)
+        self.cache_action.toggled.connect(self.set_cache_enabled)
+        menu.addSeparator()
+        menu.addAction('Показать', self.show_normal)
+        menu.addAction('Обновить', self.refresh_now)
+        menu.addAction('Детальная аналитика', self.open_detail)
+        menu.addSeparator()
+        menu.addAction('Claude · подключить локальные лимиты...', self.configure_claude_statusline)
+        menu.addAction('Claude · проверить источник...', self.show_claude_connection)
+        menu.addAction('Claude · сбросы вручную...', self.configure_claude_manual_resets)
+        menu.addSeparator()
+        menu.addAction('Выход', self.quit_monitor)
+        self.tray.setContextMenu(menu)
+        self.menu_button.setMenu(menu)
+        self.tray.activated.connect(lambda reason: self.show_normal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.show()
+        self._update_tray_tooltip()
     def _update_tray_tooltip(self):
         if not hasattr(self,'tray'):return
         parts=[]
@@ -1043,7 +1208,7 @@ class MonitorWindow(QMainWindow):
         self.tray.setToolTip('AI Limits · осталось\n'+' · '.join(parts[:4]))
     def show_normal(self):self.show();self._enforce_topmost();self.raise_();self.activateWindow();QTimer.singleShot(0,self._enforce_topmost)
     def quit_monitor(self):
-        self._quit=True;self.tray.hide();self.timer.stop();self.clock_timer.stop();self._hover_timer.stop();self.cache_timer.stop();self.usage_timer.stop();self._close_popup();self.drawer.hide();self.drawer.deleteLater()
+        self._quit=True;self.tray.hide();self.timer.stop();self.clock_timer.stop();self.cache_timer.stop();self.usage_timer.stop();self._close_popup();self.drawer.hide();self.drawer.deleteLater()
         if self.forecast_popup is not None:self.forecast_popup.deleteLater();self.forecast_popup=None
         if self.worker is None:self._finish_quit()
     def _restore_geometry(self):
@@ -1061,7 +1226,21 @@ STYLE=f'''
 QLabel#WidgetTitle{{font-family:"Segoe UI";font-size:10.5pt;font-weight:700;color:{COLORS['text']};}}
 QLabel#UpdatedLabel,QLabel#WidgetFooter{{color:{COLORS['faint']};font-size:7.5pt;}}
 QLabel#WidgetFooter{{padding-left:6px;}}
-QPushButton#HoverButton{{min-height:18px;max-height:18px;min-width:20px;max-width:20px;padding:0;background:{COLORS['panel_alt']};border:1px solid {COLORS['border_soft']};border-radius:5px;font-size:8pt;}}
+QPushButton#WidgetCommand,QPushButton#HideWidget,QToolButton#CardDisclosure{{
+    background:{COLORS['panel_alt']};color:{COLORS['text']};border:1px solid {COLORS['border']};border-radius:5px;
+}}
+QPushButton#WidgetCommand{{min-height:26px;padding:0;font-size:9pt;}}
+QPushButton#WidgetCommand::menu-indicator{{width:8px;height:8px;}}
+QPushButton#HideWidget{{min-height:22px;padding:0 6px;font-size:8.5pt;color:{COLORS['muted']};}}
+QToolButton#CardDisclosure{{padding:0;}}
+QPushButton#WidgetCommand:hover,QPushButton#HideWidget:hover,QToolButton#CardDisclosure:hover,QPushButton#CacheLink:hover{{
+    background:{COLORS['elevated']};color:{COLORS['text']};border-color:{COLORS['accent_hover']};
+}}
+QPushButton#WidgetCommand:pressed,QPushButton#HideWidget:pressed,QToolButton#CardDisclosure:pressed,
+QToolButton#CardDisclosure:checked,QPushButton#CacheLink:pressed{{background:{COLORS['selection']};}}
+QPushButton#WidgetCommand:focus,QPushButton#HideWidget:focus,QToolButton#CardDisclosure:focus,QPushButton#CacheLink:focus{{
+    border-color:#91BDF0;
+}}
 QFrame#AgentCard{{background:rgba(255,255,255,10);border:1px solid rgba(120,140,160,70);border-radius:12px;}}
 QFrame#CompactRow{{background:transparent;border:none;border-radius:0;}}
 QFrame#CompactRow[divider="true"]{{border-bottom:1px solid rgba(70,88,106,120);}}
@@ -1080,9 +1259,9 @@ QFrame#ChipDanger{{background:rgba(229,103,94,48);border:none;border-radius:5px;
 QLabel#ChipTextDanger{{background:transparent;color:#E5675E;font-size:8.25pt;}}
 QFrame#ForecastPopup{{background:{COLORS['panel']};border:1px solid {COLORS['border']};border-radius:12px;}}
 QLabel#PopupHeading{{background:transparent;color:{COLORS['text']};font-size:10.5pt;font-weight:600;}}
-QLabel#PopupPinned{{background:rgba(120,140,160,38);color:{COLORS['muted']};font-size:8.25pt;border-radius:5px;padding:1px 7px;}}
-QToolButton#PopupClose{{background:transparent;border:none;color:{COLORS['muted']};font-size:13pt;padding:0 4px;}}
-QToolButton#PopupClose:hover{{color:{COLORS['text']};}}
+QToolButton#PopupClose{{background:{COLORS['panel_alt']};border:1px solid {COLORS['border']};border-radius:5px;color:{COLORS['text']};font-size:13pt;padding:0 4px;min-width:20px;min-height:24px;}}
+QToolButton#PopupClose:hover{{background:{COLORS['elevated']};}}
+QToolButton#PopupClose:focus{{border-color:#91BDF0;}}
 QFrame#PopupTile{{background:{COLORS['panel_alt']};border:none;border-radius:8px;}}
 QLabel#TileCaption{{background:transparent;color:{COLORS['muted']};font-size:8.25pt;}}
 QLabel#TileValue{{background:transparent;color:{COLORS['text']};font-size:10.5pt;font-weight:600;}}
@@ -1116,7 +1295,7 @@ QLabel#CacheWarn{{background:transparent;color:#E0B04A;font-size:9pt;}}
 QFrame#CacheRow[warn="true"]{{background:rgba(224,176,74,34);}}
 QLabel#CacheEnv{{background:{COLORS['elevated']};color:{COLORS['muted']};font-size:7pt;border-radius:4px;padding:0px 5px;}}
 QLabel#CacheMore{{background:transparent;color:{COLORS['faint']};font-size:7.5pt;}}
-QLabel#CacheLink{{background:transparent;color:{COLORS['accent_hover']};font-size:7.5pt;text-decoration:underline;}}
+QPushButton#CacheLink{{background:{COLORS['panel_alt']};color:#C5D9ED;border:1px solid {COLORS['border']};border-radius:5px;min-height:22px;padding:0 7px;font-size:9pt;}}
 QFrame#ThreadDrawer{{background:{COLORS['panel']};border:1px solid {COLORS['border']};border-radius:12px;}}
 QLabel#DrawerHeading{{background:transparent;color:{COLORS['text']};font-size:10pt;font-weight:600;}}
 QSlider#OpacitySlider::groove:horizontal{{height:4px;background:#3A4656;border-radius:2px;}}

@@ -8,7 +8,7 @@ from typing import Any
 SETTING_KEY = "monitor_thread_view"
 
 USAGE_MODES = (("off", "нет"), ("pct", "% недели"), ("usd", "доллары"), ("both", "оба"))
-CHART_MODES = (("hover", "при наведении"), ("rclick", "правая кнопка"), ("off", "выключен"))
+CHART_MODES = (("click", "по щелчку"), ("off", "выключен"))
 FONT_SIZES = (("-1", "мельче"), ("0", "как было"), ("+0.5", "крупнее на 0,5"), ("+1", "крупнее на 1"), ("+1.5", "крупнее на 1,5"), ("+2", "крупнее на 2"))
 
 
@@ -27,7 +27,7 @@ class ThreadView:
     pin_hide: bool = True  # учитывать сохраненные правила тредов
     terminal: bool = False  # треды Claude Code из терминала (по умолчанию скрыты, решение владельца 12.11.2026)
     forecast: bool = True  # прогноз недели
-    chart: str = "hover"  # график прогноза: hover, rclick, off
+    chart: str = "click"  # график расхода по щелчку, off скрывает команду
     font: str = "0"  # сдвиг размера шрифта окна в пунктах (названия тредов уже на полпункта крупнее)
 
     @classmethod
@@ -95,6 +95,6 @@ FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("pin_hide", "Учитывать правила тредов"),
     FieldSpec("terminal", "Claude Code из терминала"),
     FieldSpec("forecast", "Прогноз недели"),
-    FieldSpec("chart", "График прогноза", indent=True),
+    FieldSpec("chart", "График расхода", indent=True),
     FieldSpec("font", "Размер шрифта"),
 )

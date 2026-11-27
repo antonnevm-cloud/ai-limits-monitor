@@ -8,18 +8,27 @@ from claude_usage_manager.thread_view import CHART_MODES, FIELDS, USAGE_MODES, T
 def test_defaults_enable_everything():
     view = ThreadView()
     assert (view.compact, view.timer, view.title, view.project, view.rewrite, view.warning, view.glutton, view.pin_hide, view.forecast) == (True,) * 9
-    assert (view.usage, view.chart) == ("both", "hover")
+    assert (view.usage, view.chart) == ("both", "click")
     assert ThreadView.from_json(None) == view and ThreadView.from_json("") == view
 
 
 def test_json_roundtrip_and_partial_values():
-    view = ThreadView(timer=False, project=False, usage="pct", chart="rclick")
+    view = ThreadView(timer=False, project=False, usage="pct", chart="off")
     assert ThreadView.from_json(view.to_json()) == view
     assert json.loads(view.to_json()) == {
-        "chart": "rclick", "compact": True, "font": "0", "forecast": True, "glutton": True, "pin_hide": True, "project": False, "rewrite": True,
+        "chart": "off", "compact": True, "font": "0", "forecast": True, "glutton": True, "pin_hide": True, "project": False, "rewrite": True,
         "terminal": False, "timer": False, "title": True, "usage": "pct", "warning": True,
     }
     assert ThreadView.from_json('{"timer": false}') == ThreadView(timer=False)
+
+
+@pytest.mark.parametrize("old_mode", ["hover", "rclick"])
+def test_old_chart_modes_open_on_click_and_save_as_click(old_mode):
+    view = ThreadView.from_json(json.dumps({"chart": old_mode, "timer": False, "usage": "pct"}))
+    assert view == ThreadView(chart="click", timer=False, usage="pct")
+    assert json.loads(view.to_json())["chart"] == "click"
+    with pytest.raises(ValueError):
+        view.with_value("chart", old_mode)
 
 
 def test_claude_terminal_threads_are_hidden_by_default():
@@ -53,8 +62,9 @@ def test_panel_rows_follow_the_mockup_order():
     ]
     assert [spec.label for spec in FIELDS][:5] == ["Компактно", "Время жизни кэша", "Название треда", "Проект и среда", "Расход треда"]
     assert next(spec.label for spec in FIELDS if spec.name == "pin_hide") == "Учитывать правила тредов"
+    assert next(spec.label for spec in FIELDS if spec.name == "chart") == "График расхода"
     assert all(hasattr(ThreadView(), spec.name) for spec in FIELDS)
     assert [spec.name for spec in FIELDS if spec.choices] == ["usage", "chart", "font"]
     assert [spec.name for spec in FIELDS if spec.indent] == ["chart"]
     assert [label for _value, label in USAGE_MODES] == ["нет", "% недели", "доллары", "оба"]
-    assert [label for _value, label in CHART_MODES] == ["при наведении", "правая кнопка", "выключен"]
+    assert CHART_MODES == (("click", "по щелчку"), ("off", "выключен"))

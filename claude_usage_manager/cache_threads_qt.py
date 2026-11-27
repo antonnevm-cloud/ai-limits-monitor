@@ -6,8 +6,8 @@ import time
 import weakref
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QResizeEvent
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPainterPath, QPen, QResizeEvent
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from .cache_threads import COLLAPSED_THREADS, CacheThread, cache_hue, format_remaining
 from .qt_theme import COLORS
@@ -19,7 +19,6 @@ from .thread_view import ThreadView
 CACHE_BLOCK_MIN_WIDTH = 250
 RING_SIZE = 46
 RING_WIDTH = 4.0
-LINK_INDENT = 12
 SCROLLBAR_WIDTH = 6  # ширина полосы прокрутки из стиля #CacheScroll
 CHIP_FILL = QColor(120, 140, 160, 38)
 GLUTTON_COLOR = "#E5675E"
@@ -106,26 +105,27 @@ class ElidedLabel(QLabel):
             self.setText(shown)
 
 
-class LinkLabel(QLabel):
-    """Подчёркнутая ссылка: по щелчку левой кнопкой подаёт сигнал clicked."""
-
-    clicked = Signal()
+class LinkButton(QPushButton):
+    """Компактная кнопка с названием действия для списка и панели вида."""
 
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setObjectName("CacheLink")
+        self.setAccessibleName(text)
+        self.setAutoDefault(False)
+        self.setFlat(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(24)
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            if not event.isAutoRepeat():
+                self.click()
             event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
+            return
+        super().keyPressEvent(event)
 
 
 class CacheRing(QWidget):
@@ -706,8 +706,8 @@ class CacheThreadsBlock(QFrame):
         self._scroll.setWidget(self._body)
         self._outer.addWidget(self._scroll)
         self.rows: list[CacheThreadRow] = []
-        self.link: LinkLabel | None = None
-        self.restore: LinkLabel | None = None
+        self.link: LinkButton | None = None
+        self.restore: LinkButton | None = None
         self.note: QLabel | None = None
         self._state: tuple | None = None
         self._cap: int | None = None
@@ -762,8 +762,8 @@ class CacheThreadsBlock(QFrame):
     ) -> bool:
         """Обновляет список. Возвращает True, если состав строк изменился (нужна подгонка высоты).
 
-        `view` задает, что показывать в строках; `pinned` - ранее закрепленные треды;
-        `hidden_count` - сколько тредов владелец скрыл: под списком ссылка «скрыто N · вернуть».
+        Параметр view управляет составом строки. В pinned передаются закрепленные треды.
+        При ненулевом hidden_count под списком доступна кнопка возврата скрытых тредов.
         """
         view = view or ThreadView()
         spend = spend or {}
@@ -782,6 +782,8 @@ class CacheThreadsBlock(QFrame):
             ]
             self._align_chips()
             return self._fit_width() or any(changed)
+        link_focused = self.link is not None and self.link.hasFocus()
+        restore_focused = self.restore is not None and self.restore.hasFocus()
         self._clear()
         for index, thread in enumerate(visible):
             row = CacheThreadRow(
@@ -797,20 +799,21 @@ class CacheThreadsBlock(QFrame):
             self.note.setWordWrap(True)
             self._box.addWidget(self.note)
         elif hidden > 0:
-            self.link = LinkLabel(f"ещё {hidden}")
-            self.link.setIndent(LINK_INDENT)
+            self.link = LinkButton(f"Показать еще {hidden}")
             self.link.clicked.connect(self.more_clicked)
             self._outer.addWidget(self.link, 0, Qt.AlignmentFlag.AlignLeft)
         elif can_collapse:
-            self.link = LinkLabel("свернуть")
-            self.link.setIndent(LINK_INDENT)
+            self.link = LinkButton("Свернуть список")
             self.link.clicked.connect(self.less_clicked)
             self._outer.addWidget(self.link, 0, Qt.AlignmentFlag.AlignLeft)
         if restorable > 0:
-            self.restore = LinkLabel(f"скрыто {restorable} · вернуть")
-            self.restore.setIndent(LINK_INDENT)
+            self.restore = LinkButton(f"Вернуть скрытые ({restorable})")
             self.restore.clicked.connect(self.restore_clicked)
             self._outer.addWidget(self.restore, 0, Qt.AlignmentFlag.AlignLeft)
+        if link_focused or restore_focused:
+            action = self.restore if restore_focused and self.restore is not None else self.link
+            if action is not None:
+                action.setFocus(Qt.FocusReason.OtherFocusReason)
         self._state = state
         self._align_chips()
         self._fit_width()
