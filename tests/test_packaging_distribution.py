@@ -66,6 +66,10 @@ def test_portable_installer_skips_registration_and_all_shortcuts():
     assert sections['InstallDelete'] == ['Type: filesandordirs; Name: "{app}\\_internal"',
                                          'Type: files; Name: "{app}\\portable.txt"; Check: not PortableInstall']
     assert any('--uninstall' in line for line in sections['UninstallRun'])
+    # Запуск после установки идет через Проводник: наследник установщика получил бы RedirectionGuard.
+    run = [line for line in sections['Run'] if not line.startswith(';')]
+    assert len(run) == 2 and all(line.startswith('Filename: "{win}\\explorer.exe"; Parameters: """{app}\\{#AppExe}"""')
+                                 for line in run)
     # Переносимая копия требует своей папки и получает признак хранения данных рядом с программой.
     assert "ExpandConstant('{param:dir|}') = ''" in source
     assert "{app}\\portable.txt" in source

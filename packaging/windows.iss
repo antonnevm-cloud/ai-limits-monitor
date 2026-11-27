@@ -67,8 +67,10 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 Root: HKCU; Subkey: "{#RunKey}"; ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExe}"" --autostart"; Tasks: autostart; Check: not PortableInstall
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent; Check: not PortableInstall
-Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RestartAfterSilentUpdate
+; Программу запускает Проводник, а не сам установщик: установщик включает защиту RedirectionGuard,
+; ее наследник не проходит через пользовательские точки подключения (например, bin у Codex, WinError 448).
+Filename: "{win}\explorer.exe"; Parameters: """{app}\{#AppExe}"""; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent; Check: not PortableInstall
+Filename: "{win}\explorer.exe"; Parameters: """{app}\{#AppExe}"""; Flags: nowait; Check: RestartAfterSilentUpdate
 
 [UninstallRun]
 ; Убирает команды строки состояния монитора из настроек Claude Code и Antigravity, пока программа на месте.
