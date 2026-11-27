@@ -1,6 +1,6 @@
 # Сборка AI Limits Monitor
 
-Windows 10 версии 1809 и новее и Windows 11 используют установщик x64. Запусти `AI-Limits-Monitor-2.0.3-windows-x64-setup.exe`. Он устанавливает программу в `%LOCALAPPDATA%\Programs\AI Limits Monitor` и создает ярлык в меню "Пуск". Ярлык на рабочем столе и запуск при входе в Windows включаются по желанию. Удалить программу можно в разделе установленных приложений.
+Windows 10 версии 1809 и новее и Windows 11 используют установщик x64. Запусти файл с окончанием `windows-x64-setup.exe` из [раздела выпусков](https://github.com/antonnevm-cloud/ai-limits-monitor/releases). Он устанавливает программу в `%LOCALAPPDATA%\Programs\AI Limits Monitor` и создает ярлык в меню "Пуск". Ярлык на рабочем столе и запуск при входе в Windows включаются по желанию. Удалить программу можно в разделе установленных приложений.
 
 На macOS 27 с процессором Apple Silicon распакуй `AI-Limits-Monitor-<версия>-macos-arm64.zip` и перенеси `AI Limits Monitor.app` в "Программы". Сборка использует локальную подпись. При первом запуске macOS может попросить подтвердить открытие приложения. [Открытие приложений на macOS](https://support.apple.com/ru-ru/102445).
 

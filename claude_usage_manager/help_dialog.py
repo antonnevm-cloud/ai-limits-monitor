@@ -1,7 +1,11 @@
 """Встроенная справка AI Limits Monitor."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTabWidget, QTextBrowser, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+)
 
 from .qt_theme import COLORS
 
@@ -139,6 +143,13 @@ class HelpDialog(QDialog):
                 border: none; font-size: 11pt;
                 selection-background-color: {COLORS['selection']};
             }}
+            QLabel#HelpAuthor, QPushButton#HelpCredit {{ color: {COLORS['muted']}; font-size: 9pt; }}
+            QPushButton#HelpCredit {{
+                background: transparent; text-decoration: underline;
+                border: 1px solid transparent; border-radius: 3px; padding: 1px 3px; min-height: 18px;
+            }}
+            QPushButton#HelpCredit:hover {{ color: {COLORS['text']}; }}
+            QPushButton#HelpCredit:focus {{ border-color: {COLORS['muted']}; }}
         """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
@@ -159,7 +170,27 @@ class HelpDialog(QDialog):
             """)
             page.setHtml(content)
             self.tabs.addTab(page, title)
+        footer = QHBoxLayout()
+        footer.setSpacing(3)
+        author = QLabel("Разработчик Антон ·")
+        author.setObjectName("HelpAuthor")
+        footer.addWidget(author)
+        credit = QPushButton("by onetone remont1c.ru")
+        credit.setObjectName("HelpCredit")
+        credit.setAutoDefault(False)
+        credit.setFlat(True)
+        credit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        credit.setCursor(Qt.CursorShape.PointingHandCursor)
+        credit.setToolTip("Открыть сайт разработчика в браузере")
+        credit.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://remont1c.ru")))
+        shortcut = QShortcut(credit)
+        shortcut.setKeys([QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)])
+        shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        shortcut.setAutoRepeat(False)
+        shortcut.activated.connect(credit.click)
+        footer.addWidget(credit, 0, Qt.AlignmentFlag.AlignLeft)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        footer.addWidget(buttons, 1)
+        layout.addLayout(footer)

@@ -2,10 +2,13 @@
 *.py text eol=lf
 *.md text eol=lf
 *.txt text eol=lf
+/LICENSE text eol=lf
+/NOTICE text eol=lf
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
 *.png binary
 *.ico binary
+/assets/r1.svg text eol=lf
 
 # Публичный снимок содержит рабочее приложение и его проверки.
 /AGENTS.md export-ignore

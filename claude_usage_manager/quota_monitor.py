@@ -7,11 +7,12 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray,QObject,QPoint,QPointF,QRect,QRectF,QRunnable,QSize,Qt,QThreadPool,QTimer,Signal,Slot
 from PySide6.QtGui import QCloseEvent,QColor,QFont,QIcon,QPainter,QPen,QPixmap,QPolygonF
 from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import QApplication,QBoxLayout,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLayout,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QStyle,QStyleOptionToolButton,QStylePainter,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
 from .antigravity_details_qt import AntigravityDetails
 from .database import Database
 from .subscription_payments import next_monthly_payment, parse_last_payment
-from .icon import ensure_icon
+from .icon import brand_svg, ensure_icon
 from .models import QuotaSnapshot, QuotaWindow
 from . import APP_VERSION
 from .provider_settings import load_connections, provider_enabled
@@ -613,6 +614,11 @@ class MonitorWindow(QMainWindow):
         header = QHBoxLayout()
         header.setContentsMargins(4, 0, 1, 0)
         header.setSpacing(7)
+        brand = QSvgWidget(str(brand_svg()))
+        brand.setObjectName('WidgetBrand')
+        brand.setFixedSize(18, 18)
+        brand.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        header.addWidget(brand, 0, Qt.AlignmentFlag.AlignVCenter)
         title = ElidedLabel('AI Limits')
         title.setObjectName('WidgetTitle')
         title.setAccessibleName('AI Limits')

@@ -25,6 +25,8 @@ WHEELS = ('Pillow', 'openpyxl', 'et-xmlfile', 'packaging', 'PySide6-Essentials',
 
 def write_licenses(directory: Path, compiler: Path | None) -> None:
     shutil.copytree(PACKAGING / 'licenses', directory)
+    shutil.copyfile(ROOT / 'LICENSE', directory / 'AI-Limits-Monitor-LICENSE.txt')
+    shutil.copyfile(ROOT / 'NOTICE', directory / 'AI-Limits-Monitor-NOTICE.txt')
     python_license = next((p for p in (Path(sys.base_prefix) / 'LICENSE.txt',
                                        Path(sysconfig.get_path('stdlib')) / 'LICENSE.txt')
                            if p.is_file()), None)

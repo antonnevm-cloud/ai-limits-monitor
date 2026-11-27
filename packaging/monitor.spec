@@ -8,7 +8,8 @@ metadata = runpy.run_path(str(root / 'claude_usage_manager' / '__init__.py'))
 name = metadata['APP_NAME']
 version = metadata['APP_VERSION']
 icon = str(root / 'assets' / 'icon.ico')
-assets = [(icon, 'assets'), (os.environ['AI_LIMITS_BUILD_LICENSES'], 'licenses')]
+assets = [(icon, 'assets'), (str(root / 'assets' / 'r1.svg'), 'assets'),
+          (os.environ['AI_LIMITS_BUILD_LICENSES'], 'licenses')]
 for filename in ('claude.svg', 'claude.png', 'codex.svg', 'codex.png',
                  'grok.png', 'antigravity.svg', 'antigravity.png'):
     assets.append((str(root / 'assets' / 'providers' / filename), 'assets/providers'))

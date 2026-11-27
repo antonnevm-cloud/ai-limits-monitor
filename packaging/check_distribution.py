@@ -26,12 +26,19 @@ PROFILE_VARIABLES = (
 def check_contents(target: Path, executable: Path, resources: Path) -> None:
     from PyInstaller.archive.readers import CArchiveReader
 
+    brand = Path('assets/r1.svg')
+    if (resources / brand).read_bytes() != (ROOT / brand).read_bytes():
+        raise ValueError('Знак R1 в поставке отличается от ресурса в исходниках')
     icons = {f.stem for f in (resources / 'assets' / 'providers').iterdir()}
     if icons != {'claude', 'codex', 'grok', 'antigravity'}:
         raise ValueError(f'Неверный состав значков в дистрибутиве: {icons}')
     for filename in ('LGPL-3.0-only.txt', 'GPL-3.0-only.txt', 'Qt-third-party.txt', 'Python.txt', 'README.md'):
         if not (resources / 'licenses' / filename).is_file():
             raise FileNotFoundError(filename)
+    for filename in ('LICENSE', 'NOTICE'):
+        packaged = resources / 'licenses' / f'AI-Limits-Monitor-{filename}.txt'
+        if packaged.read_bytes() != (ROOT / filename).read_bytes():
+            raise ValueError(f'Файл {filename} в поставке отличается от файла в исходниках')
     for member in target.rglob('*'):
         if member.suffix.lower() in ('.db', '.sqlite', '.sqlite3', '.jsonl', '.log') or (
             member.name.lower() in {'auth.json', 'credentials.json', 'settings.json', '.env', '.git'}

@@ -3,8 +3,9 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QAccessible, QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QWidget
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLabel, QPushButton, QWidget
 
 from claude_usage_manager.help_dialog import HelpDialog
 from claude_usage_manager.provider_settings import PROVIDER_NAMES
@@ -63,3 +64,41 @@ def test_help_sections_and_scroll_work_from_keyboard():
     assert not dialog.isVisible()
     dialog.showNormal()
     assert dialog.isVisible()
+
+
+def test_help_credit_opens_developer_site_only_when_activated(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    opened_urls = []
+
+    def open_url(url):
+        opened_urls.append(url.toString())
+        return True
+
+    monkeypatch.setattr(QDesktopServices, "openUrl", open_url)
+    dialog = HelpDialog()
+    dialog.show()
+    app.processEvents()
+
+    author = dialog.findChild(QLabel, "HelpAuthor")
+    credit = dialog.findChild(QPushButton, "HelpCredit")
+    assert "Разработчик Антон" in author.text()
+    accessible = QAccessible.queryAccessibleInterface(credit)
+    assert accessible.role() == QAccessible.Role.Button
+    assert accessible.text(QAccessible.Text.Name) == "by onetone remont1c.ru"
+    QTest.mouseClick(author, Qt.MouseButton.LeftButton)
+    assert opened_urls == []
+
+    page = dialog.tabs.currentWidget()
+    page.setFocus()
+    QTest.keyClick(page, Qt.Key.Key_Tab)
+    assert app.focusWidget() is credit
+    assert opened_urls == []
+    QTest.keyClick(credit, Qt.Key.Key_Return)
+    QTest.keyClick(credit, Qt.Key.Key_Enter)
+    QTest.mouseClick(credit, Qt.MouseButton.LeftButton)
+    assert opened_urls == ["https://remont1c.ru"] * 3
+
+    page.setFocus()
+    QTest.keyClick(page, Qt.Key.Key_Return)
+    assert opened_urls == ["https://remont1c.ru"] * 3
+    assert not dialog.isVisible()

@@ -115,7 +115,9 @@ def test_qt_renders_project_hierarchy_and_pp(tmp_path):
             last_activity=result.threads[0].last_activity, member_ids=["s2"],
         ),
     ]
+    assert not window.export_button.isEnabled()
     window._analysis_finished(result)
+    assert window.export_button.isEnabled()
     assert window.overview_tree.topLevelItemCount() == 1
     project = window.overview_tree.topLevelItem(0)
     assert project.text(0) == "demo"

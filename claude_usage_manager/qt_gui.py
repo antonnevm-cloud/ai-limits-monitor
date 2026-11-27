@@ -862,10 +862,11 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _analysis_finished(self, result: AnalysisResult) -> None:
-        self._finish_busy()
         if self._quit_requested:
+            self._finish_busy()
             return
         self.result = result
+        self._finish_busy()
         self._apply_quota_to_result(result)
         source_rows = result.all_threads or result.threads
         self._thread_by_id = {row.session_id: row for row in source_rows}
