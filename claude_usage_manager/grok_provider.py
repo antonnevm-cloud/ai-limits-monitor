@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import QuotaSnapshot, QuotaWindow
+from .process_utils import forget_child, kill_process_tree, track_child
 from .provider_settings import provider_config_key, provider_environment, provider_executable, provider_profile
 
 SOURCE = "grok:local-billing-log"
@@ -203,6 +204,7 @@ def read_billing_from_cli(init_timeout: float = CLI_INIT_TIMEOUT, billing_timeou
             creationflags=creationflags,
             env=provider_environment("grok"),
         )
+        track_child(process)
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("Не удалось связаться с запущенным Grok Build")
         messages: "queue.Queue[dict[str, Any] | None]" = queue.Queue()
@@ -223,15 +225,14 @@ def read_billing_from_cli(init_timeout: float = CLI_INIT_TIMEOUT, billing_timeou
             raise RuntimeError("Grok CLI не вернул данные биллинга")
         return result
     finally:
+        if process is not None:
+            forget_child(process)
         if process is not None and process.poll() is None:
             try:
                 process.terminate()
                 process.wait(timeout=2)
             except (OSError, subprocess.SubprocessError, TimeoutError):
-                try:
-                    process.kill()
-                except OSError:
-                    pass
+                kill_process_tree(process)
 
 
 def _billing_cached(now: dt.datetime) -> tuple[dict[str, Any], dt.datetime]:

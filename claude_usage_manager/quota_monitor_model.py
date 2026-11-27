@@ -151,6 +151,9 @@ def main_windows(snapshot: QuotaSnapshot) -> tuple[QuotaWindow | None, QuotaWind
     if snapshot.provider == "grok":
         main=snapshot.main_window() or (windows[0] if windows else None)
         short=None; long=main
+    elif short is None and long is None:
+        # Окно без длительности в ответе клиента тоже показывается, а не теряется.
+        long=next((w for w in windows if w.role != "extra"),None)
     return short,long
 
 
@@ -163,10 +166,15 @@ def build_rows(states: dict[str,ProviderState]) -> dict[str,list[MonitorRow]]:
         name=snap.login_method or PROVIDER_LABELS[provider]
         out[provider].append(MonitorRow(f"{provider}:main",provider,PROVIDER_LABELS[provider],name,cell(short),cell(long),True))
         main_ids={w.id for w in (short,long) if w}
+        pools: dict[str, list[QuotaWindow]] = {}
         for w in snap.windows:
             if w.id in main_ids or w.used_percent is None or w.informational or w.role != "extra": continue
-            c=cell(w)
-            out[provider].append(MonitorRow(f"{provider}:{w.id}",provider,w.title,"Дополнительный пул",c if w.window_minutes and w.window_minutes <= 1440 else None,c if not w.window_minutes or w.window_minutes > 1440 else None,False))
+            pools.setdefault(w.title, []).append(w)
+        # Окна одного дополнительного пула (5 ч и неделя) - одна строка с двумя ячейками.
+        for title, pool in pools.items():
+            brief=next((w for w in pool if w.window_minutes and w.window_minutes <= 1440),None)
+            wide=next((w for w in pool if not w.window_minutes or w.window_minutes > 1440),None)
+            out[provider].append(MonitorRow(f"{provider}:{pool[0].id}",provider,title,"Дополнительный пул",cell(brief),cell(wide),False))
     state=states.get("grok")
     if state:
         snap=state.snapshot

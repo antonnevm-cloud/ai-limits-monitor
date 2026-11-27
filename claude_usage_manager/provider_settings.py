@@ -233,7 +233,8 @@ def binary_name(provider: str) -> str:
 def _valid_binary_name(provider: str, path: Path) -> bool:
     name = path.name.lower() if sys.platform == "win32" else path.name
     if provider == "codex":
-        if sys.platform == "win32" and name == "codex-x86_64-pc-windows-msvc.exe":
+        if sys.platform == "win32" and name in {"codex-x86_64-pc-windows-msvc.exe",
+                                                 "codex-aarch64-pc-windows-msvc.exe"}:
             return True
         if sys.platform == "darwin" and name in {"codex-x86_64-apple-darwin", "codex-aarch64-apple-darwin"}:
             return True
@@ -255,18 +256,42 @@ def _windows_npm_binaries(provider: str, name: str) -> Iterator[Path]:
         directory = _absolute(entry)
         if directory is not None and (directory / f"{provider}.cmd").is_file():
             prefixes.append(directory)
+    configured = _npmrc_prefix()
+    if configured is not None:
+        prefixes.append(configured)
     roaming = _absolute(os.environ.get("APPDATA", "")) or Path.home() / "AppData/Roaming"
     prefixes.append(roaming / "npm")
-    for prefix in dict.fromkeys(prefixes):
-        modules = prefix / "node_modules"
+    module_roots = [prefix / "node_modules" for prefix in dict.fromkeys(prefixes)]
+    # pnpm хранит глобальные пакеты в PNPM_HOME\global\<версия>\node_modules.
+    local = _absolute(os.environ.get("LOCALAPPDATA", "")) or Path.home() / "AppData/Local"
+    pnpm = _absolute(os.environ.get("PNPM_HOME", "")) or local / "pnpm"
+    try:
+        module_roots.extend(sorted((pnpm / "global").glob("*/node_modules"), reverse=True))
+    except OSError:
+        pass
+    for modules in dict.fromkeys(module_roots):
         if provider == "claude":
             yield modules / "@anthropic-ai/claude-code/bin" / name
         else:
             package = modules / "@openai/codex"
-            native = package / "node_modules/@openai/codex-win32-x64"
-            for root in (native, package, package.parent / "codex-win32-x64"):
-                for layout in ("bin", "vendor/x86_64-pc-windows-msvc/bin", "vendor/x86_64-pc-windows-msvc/codex"):
-                    yield root / layout / name
+            for arch, triple in (("x64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
+                native = package / f"node_modules/@openai/codex-win32-{arch}"
+                for root in (native, package, package.parent / f"codex-win32-{arch}"):
+                    for layout in ("bin", f"vendor/{triple}/bin", f"vendor/{triple}/codex"):
+                        yield root / layout / name
+
+
+def _npmrc_prefix() -> Path | None:
+    """prefix из пользовательского .npmrc: npm ставит туда глобальные пакеты вместо %APPDATA%\\npm."""
+    try:
+        with (Path.home() / ".npmrc").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                key, _, value = line.partition("=")
+                if key.strip().casefold() == "prefix":
+                    return _absolute(os.path.expandvars(value.strip().strip('"')))
+    except OSError:
+        pass
+    return None
 
 
 def _binary_candidates(provider: str) -> Iterator[Path]:

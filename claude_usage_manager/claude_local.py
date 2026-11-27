@@ -183,18 +183,19 @@ def read_statusline_quota(*, path: pathlib.Path | None = None,
         return result
 
 
-def _manual_date(value: str, now: dt.datetime) -> dt.datetime:
+def _manual_date(value: str) -> dt.datetime:
+    # Наивное местное время переводится по правилам часового пояса на саму дату,
+    # а не по смещению текущего момента: срок после перевода часов не сдвигается на час.
     parsed = dt.datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
-    local_zone = now.astimezone().tzinfo or dt.timezone.utc
-    parsed = parsed.replace(tzinfo=local_zone).astimezone(dt.timezone.utc)
-    if parsed <= now.astimezone(dt.timezone.utc):
-        raise ValueError("Срок сброса уже истёк: " + value)
-    return parsed
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def parse_manual_resets(text: str, *, now: dt.datetime | None = None) -> list[dt.datetime | None]:
-    """One offer per line, ISO local time or '-' when the offer has no expiry."""
-    moment = now or dt.datetime.now(dt.timezone.utc)
+    """One offer per line, ISO local time or '-' when the offer has no expiry.
+
+    Срок, истекший, пока окно было открыто, просто не сохраняется: остальной список не теряется.
+    """
+    moment = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     values: list[dt.datetime | None] = []
     for line in text.splitlines():
         line = line.strip()
@@ -204,11 +205,13 @@ def parse_manual_resets(text: str, *, now: dt.datetime | None = None) -> list[dt
             raise ValueError("Можно учесть не более 30 сбросов.")
         if line in ("-", "—", "без срока"):
             values.append(None)
-        else:
-            try:
-                values.append(_manual_date(line, moment))
-            except (ValueError, OverflowError) as error:
-                raise ValueError("Неверный срок (нужен YYYY-MM-DD HH:MM): " + line) from error
+            continue
+        try:
+            stamp = _manual_date(line)
+        except (ValueError, OverflowError, OSError) as error:
+            raise ValueError("Неверный срок (нужен YYYY-MM-DD HH:MM): " + line) from error
+        if stamp > moment:
+            values.append(stamp)
     return values
 
 

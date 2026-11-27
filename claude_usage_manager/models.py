@@ -172,6 +172,9 @@ class ManualResetCredits:
         """Ближайший срок еще действующего кредита: истекший первый не скрывает следующий."""
         current = now or dt.datetime.now(dt.timezone.utc)
         for item in self.sorted_items():
+            # Использованный или отозванный кредит не считается доступным.
+            if item.status.casefold() not in {"available", "unknown", ""}:
+                continue
             if item.expires_at is not None and item.remaining_seconds(current):
                 return item.expires_at
         hint = self.nearest_expiry_hint

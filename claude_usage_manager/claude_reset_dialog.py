@@ -138,9 +138,12 @@ class ClaudeManualResetsDialog(QDialog):
     def _date_value(self) -> str | None:
         value = self.expiry.dateTime().toString("yyyy-MM-dd HH:mm")
         try:
-            parse_manual_resets(value)
+            accepted = parse_manual_resets(value)
         except ValueError as error:
             QMessageBox.warning(self, "Claude · срок сброса", str(error))
+            return None
+        if not accepted:
+            QMessageBox.warning(self, "Claude · срок сброса", "Этот срок уже прошел. Укажи будущую дату.")
             return None
         return value
 

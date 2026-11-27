@@ -153,6 +153,24 @@ def test_manual_offers_keep_each_expiry_and_expire_without_network(tmp_path):
         db.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Форма PowerShell строится только в Windows")
+def test_powershell_command_escapes_typographic_apostrophe(monkeypatch):
+    import base64
+    import re
+
+    from claude_usage_manager import claude_local, statusline_command as commands
+
+    program = "C:/Users/O\u2019Neil/AI Limits Monitor/AI Limits Monitor.exe"
+    monkeypatch.setattr(commands, "_monitor_program", lambda: [program])
+    monkeypatch.setattr(commands, "_git_bash_installed", lambda: False)
+    command = commands.statusline_command("--claude-statusline")
+    encoded = re.search(r"-EncodedCommand\s+(\S+)", command).group(1)
+    script = base64.b64decode(encoded).decode("utf-16-le")
+    # В PowerShell типографский апостроф закрывает строку, поэтому он удваивается (security#5).
+    assert "O\u2019\u2019Neil" in script
+    assert claude_local._owned_command(command)
+
+
 def test_manual_offers_unknown_until_user_enters_data_and_input_errors(tmp_path):
     db = Database(tmp_path / "usage.db")
     try:
@@ -160,8 +178,8 @@ def test_manual_offers_unknown_until_user_enters_data_and_input_errors(tmp_path)
         assert cached_snapshot(db, "claude").manual_resets.available_count is None
         with pytest.raises(ValueError):
             parse_manual_resets("bad-date")
-        with pytest.raises(ValueError):
-            parse_manual_resets("2001-01-01 00:00")
+        # Срок, истекший при открытом окне, не срывает сохранение остального списка (claude#9).
+        assert parse_manual_resets("2001-01-01 00:00\n-") == [None]
         with pytest.raises(ValueError):
             parse_manual_resets("-\n" * 31)
         assert read_manual_resets(db).state == "unknown"

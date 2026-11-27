@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -27,7 +28,7 @@ def kill_process_tree(process: subprocess.Popen) -> None:
     """Завершить процесс вместе с дочерними: иначе внук держит каналы вывода и срок не работает."""
     if process.poll() is not None:
         return
-    if os.name == "nt":
+    if os.name == "nt" and getattr(process, "pid", None):
         taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
         try:
             subprocess.run([str(taskkill), "/T", "/F", "/PID", str(process.pid)],
@@ -76,6 +77,30 @@ def run_hidden(command: Sequence[str] | str, **kwargs: Any) -> subprocess.Comple
     if check:
         result.check_returncode()
     return result
+
+
+_CHILDREN: set[subprocess.Popen] = set()
+_CHILDREN_LOCK = threading.Lock()
+
+
+def track_child(process: subprocess.Popen) -> None:
+    """Запомнить долгоживущий процесс клиента (app-server Codex, agent Grok), чтобы снять его при выходе."""
+    with _CHILDREN_LOCK:
+        _CHILDREN.add(process)
+
+
+def forget_child(process: subprocess.Popen) -> None:
+    with _CHILDREN_LOCK:
+        _CHILDREN.discard(process)
+
+
+def stop_children() -> None:
+    """Выход программы: клиенты, которые еще ждут ответа, завершаются вместе с ней."""
+    with _CHILDREN_LOCK:
+        children = list(_CHILDREN)
+        _CHILDREN.clear()
+    for process in children:
+        kill_process_tree(process)
 
 
 def reset_inherited_dll_directory() -> None:

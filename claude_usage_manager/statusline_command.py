@@ -52,6 +52,11 @@ def _system_powershell() -> str:
     return program.as_posix()
 
 
+def _powershell_literal(value: str) -> str:
+    # В PowerShell типографские апострофы тоже закрывают строку в одинарных кавычках.
+    return "'" + re.sub("(['‘’‚‛])", r"\1\1", value) + "'"
+
+
 def statusline_command(flag: str, *arguments: str) -> str:
     program = _monitor_program()
     args = [flag, *arguments]
@@ -66,7 +71,7 @@ def statusline_command(flag: str, *arguments: str) -> str:
     uses_bash = not uses_cmd and _git_bash_installed()
     special = any(c in value for value in command_line for c in ('%', '!', '"', '$', '^', '\\', chr(96), '\r', '\n'))
     if special or not (uses_cmd or uses_bash):
-        literals = ["'" + value.replace("'", "''") + "'" for value in command_line]
+        literals = [_powershell_literal(value) for value in command_line]
         # Программу без консоли PowerShell не ждет, если она последняя в конвейере:
         # вывод приходит после выхода оболочки, код завершения теряется. ForEach-Object возвращает ожидание
         # и входит в ядро PowerShell, поэтому не пишет в stderr сообщение о подготовке модулей.
@@ -79,7 +84,7 @@ def statusline_command(flag: str, *arguments: str) -> str:
             elif uses_bash:
                 shell = shlex.quote(shell)
             else:
-                shell = "& '" + shell.replace("'", "''") + "'"
+                shell = "& " + _powershell_literal(shell)
         return shell + " -NoProfile -NonInteractive -EncodedCommand " + encoded
     words = [f'"{path}"' for path in program]
     words.extend(arg if re.fullmatch(r"[A-Za-z0-9_-]+", arg) else f'"{arg}"' for arg in args)

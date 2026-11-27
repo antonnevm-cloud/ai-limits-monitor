@@ -155,6 +155,10 @@ class BackendService:
             self._wake_provider(pending)
         if self.api is not None:
             self.api.stop()
+        # Клиент, который не отвечает, не держит выход: его процесс снимается сразу.
+        from .process_utils import stop_children
+
+        stop_children()
         # Общий срок на все потоки: поток, ждущий ответа клиента, не должен задерживать выход на 5 с каждый.
         deadline = time.monotonic() + 3
         for thread in [self._thread, *self._provider_threads]:

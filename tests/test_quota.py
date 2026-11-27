@@ -392,7 +392,24 @@ def test_codex_app_server_windows_map_weekly_and_extra():
     assert [(w.id, w.used_percent, w.window_minutes, w.role) for w in windows] == [
         ("primary", 24.0, 10080, "primary"),
         ("gpt-5-3-codex-spark", 5.0, 10080, "extra"),
+        # Пятичасовое окно дополнительного лимита тоже показывается (codex#11).
+        ("gpt-5-3-codex-spark:300", 3.0, 300, "extra"),
     ]
+
+
+def test_codex_main_window_is_weekly_even_when_primary_is_five_hours(monkeypatch):
+    payload = {"result": {"rateLimits": {
+        "limitId": "codex", "planType": "plus",
+        "primary": {"usedPercent": 70, "windowDurationMins": 300, "resetsAt": 1_900_000_000},
+        "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 1_900_500_000},
+    }}}
+    _fake_app_server(monkeypatch, payload)
+    snap = quota.fetch_quota("codex")
+    # Основное окно выбирается по длительности, а не по месту primary в ответе (codex#3).
+    assert snap.main_window_id == "secondary"
+    assert snap.weekly == 20.0
+    assert snap.main_label == "Недельная квота"
+    assert [w.title for w in snap.windows] == ["Лимит 5 часов", "Недельная квота"]
 
 
 def test_codex_app_server_snapshot_is_live_and_real(monkeypatch):

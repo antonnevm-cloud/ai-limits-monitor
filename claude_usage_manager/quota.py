@@ -22,6 +22,7 @@ from .claude_desktop import SOURCE as CLAUDE_DESKTOP_SOURCE, read_best_local_cla
 from .claude_mod_bridge import SOURCE as CLAUDE_MOD_SOURCE
 from .antigravity_quota import fetch_antigravity_quota
 from .provider_settings import provider_config_key, provider_enabled, provider_environment, provider_executable
+from .process_utils import forget_child, kill_process_tree, track_child
 from .utils import parse_iso
 
 _CLAUDE_LOCAL_HISTORY_MAX_AGE = dt.timedelta(minutes=30)
@@ -358,6 +359,7 @@ def _read_codex_rate_limits_uncached(timeout: float = _CODEX_APP_SERVER_TIMEOUT)
             creationflags=creationflags,
             env=provider_environment("codex"),
         )
+        track_child(process)
         if process.stdin is None or process.stdout is None:
             raise RuntimeError("Не удалось связаться с запущенным Codex")
         messages: queue.Queue = queue.Queue()
@@ -390,15 +392,14 @@ def _read_codex_rate_limits_uncached(timeout: float = _CODEX_APP_SERVER_TIMEOUT)
         send({"id": 2, "method": "account/rateLimits/read", "params": {}})
         return _codex_response(messages, 2, timeout)
     finally:
+        if process is not None:
+            forget_child(process)
         if process is not None and process.poll() is None:
             try:
                 process.terminate()
                 process.wait(timeout=2)
             except (OSError, subprocess.SubprocessError, TimeoutError):
-                try:
-                    process.kill()
-                except OSError:
-                    pass
+                kill_process_tree(process)
 
 
 def fetch_codex_manual_resets(timeout: float = _CODEX_APP_SERVER_TIMEOUT) -> ManualResetCredits:
@@ -476,13 +477,15 @@ def parse_codex_app_server_windows(payload: Any) -> tuple[list[QuotaWindow], str
             continue
         title = str(entry.get("limitName") or limit_id)
         window_id = re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-") or str(limit_id)
-        # Из дополнительного лимита берём самое длинное доступное окно.
-        candidates = [entry.get("secondary"), entry.get("primary")]
-        for raw in candidates:
-            extra = _codex_app_server_window(window_id, title, raw, "extra")
-            if extra is not None:
-                windows.append(extra)
-                break
+        # Оба окна дополнительного лимита: первым идет длинное, оно же считается основным для пула.
+        found = [window for window in (_codex_app_server_window(window_id, title, raw, "extra")
+                                       for raw in (entry.get("secondary"), entry.get("primary")))
+                 if window is not None]
+        found.sort(key=lambda window: -(window.window_minutes or 0))
+        for index, extra in enumerate(found):
+            if index:
+                extra.id = f"{window_id}:{extra.window_minutes or 'short'}"
+            windows.append(extra)
     return windows, _codex_plan_label(main_limits.get("planType"))
 
 

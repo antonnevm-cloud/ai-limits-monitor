@@ -81,7 +81,11 @@ def session_metadata(profile: Path, ids: set[str]) -> dict[str, SessionMeta]:
     if path is None:
         return meta
     try:
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+        # Пока Codex закрыт, файла -wal нет: чтение без блокировок не создает в профиле -shm и -wal.
+        # Когда Codex работает, эти файлы уже есть, и обычное чтение видит его последние записи.
+        wal = path.with_name(path.name + "-wal")
+        query = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?{query}", uri=True, timeout=1)
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
             if "id" not in columns:
