@@ -17,6 +17,7 @@ from .utils import get_logger, now_local, parse_iso
 PROVIDERS = ("claude", "codex", "grok", "antigravity")
 PROVIDER_LABELS = {"claude":"Claude","codex":"Codex","grok":"Grok","antigravity":"Antigravity"}
 AG_MODES = ("auto_today", "last_used", "fixed", "most_consumed")
+AG_FIXED_GROUP_SETTING = "monitor_ag_fixed_group"
 # Codex и Grok отвечают не на каждый запрос (процесс не успел подняться, сеть моргнула):
 # короткий сбой не должен переключать точку с зеленой на желтую. Последние живые данные
 # остаются живыми это время, потом показывается кэш.
@@ -143,10 +144,6 @@ def cell(window: QuotaWindow | None) -> LimitCell | None:
     return None if window is None else LimitCell(window_label(window), remaining(window), window.resets_at, window.id)
 
 
-def labeled_cell(window: QuotaWindow | None, label: str) -> LimitCell | None:
-    return None if window is None else LimitCell(label, remaining(window), window.resets_at, window.id)
-
-
 def main_windows(snapshot: QuotaSnapshot) -> tuple[QuotaWindow | None, QuotaWindow | None]:
     windows=[w for w in snapshot.windows if w.used_percent is not None and not w.informational]
     short=next((w for w in windows if w.window_minutes and w.window_minutes <= 1440 and w.role != "extra"),None)
@@ -206,8 +203,11 @@ def build_rows(states: dict[str,ProviderState]) -> dict[str,list[MonitorRow]]:
     return out
 
 
-def _antigravity_group_rows(snapshot: QuotaSnapshot) -> list[MonitorRow]:
-    """Combine each Antigravity group's short and weekly windows into one row."""
+def _antigravity_group_id(window: QuotaWindow) -> str:
+    return window.id.rsplit(":", 1)[0] if window.id.startswith("ag-group:") else window.title
+
+
+def _antigravity_window_groups(snapshot: QuotaSnapshot) -> dict[str, list[QuotaWindow]]:
     grouped: dict[str, list[QuotaWindow]] = {}
     for window in snapshot.windows:
         if (
@@ -217,18 +217,22 @@ def _antigravity_group_rows(snapshot: QuotaSnapshot) -> list[MonitorRow]:
             or window.window_minutes not in {300, 10080}
         ):
             continue
-        group_id = window.id.rsplit(":", 1)[0] if window.id.startswith("ag-group:") else window.title
-        grouped.setdefault(group_id, []).append(window)
+        grouped.setdefault(_antigravity_group_id(window), []).append(window)
 
-    rows: list[MonitorRow] = []
-    for group_id, windows in sorted(
+    return dict(sorted(
         grouped.items(),
         key=lambda item: (
             0 if ":gemini" in item[0].casefold() else 1,
-            (item[1][0].title if item[1] else item[0]).casefold(),
+            item[1][0].title.casefold(),
             item[0],
         ),
-    ):
+    ))
+
+
+def _antigravity_group_rows(snapshot: QuotaSnapshot) -> list[MonitorRow]:
+    """Combine each Antigravity group's short and weekly windows into one row."""
+    rows: list[MonitorRow] = []
+    for group_id, windows in _antigravity_window_groups(snapshot).items():
         short_window = next((window for window in windows if window.window_minutes == 300), None)
         weekly_window = next((window for window in windows if window.window_minutes == 10080), None)
         anchor = weekly_window or short_window
@@ -252,14 +256,16 @@ def _antigravity_group_rows(snapshot: QuotaSnapshot) -> list[MonitorRow]:
     return rows
 
 
-def _antigravity_weekly_groups(snapshot: QuotaSnapshot) -> list[QuotaWindow]:
-    """Return only weekly grouped Antigravity quotas, ordered for the UI."""
-    groups = [
-        window for window in snapshot.windows
-        if window.role == "group" and window.window_minutes == 10080
-        and window.used_percent is not None and not window.informational
-    ]
-    return sorted(groups, key=lambda window: (0 if ":gemini:" in window.id else 1, window.title.casefold(), window.id))
+def antigravity_fixed_group(db: Database) -> str:
+    fixed = db.get_setting(AG_FIXED_GROUP_SETTING)
+    if fixed is not None:
+        return fixed
+    if db.get_setting("monitor_ag_mode") == "fixed":
+        legacy = db.get_setting("monitor_ag_fixed_model", "") or ""
+        group_id, _, period = legacy.rpartition(":")
+        if group_id.startswith("ag-group:") and period in {"weekly", "5h"}:
+            return group_id
+    return ""
 
 
 def _antigravity_group_title(window: QuotaWindow) -> str:
@@ -319,19 +325,14 @@ def _scan_antigravity_usage(db: Database) -> tuple[str,str]:
 
 
 def select_antigravity_window(db: Database, snapshot: QuotaSnapshot, *, force_scan: bool=False) -> QuotaWindow | None:
-    weekly_groups = _antigravity_weekly_groups(snapshot)
-    if weekly_groups:
-        mode = (db.get_setting("monitor_ag_mode", "auto_today") or "auto_today")
-        if mode == "fixed":
-            fixed = db.get_setting("monitor_ag_fixed_model", "") or ""
-            found = next((window for window in weekly_groups if window.id == fixed), None)
-            if found:
-                return found
-        if mode == "most_consumed":
-            return max(weekly_groups, key=lambda window: float(window.used_percent or 0.0))
-        # Several groups are independent in the cabinet.  Show the most
-        # constrained weekly group as a conservative one-number summary.
-        return max(weekly_groups, key=lambda window: float(window.used_percent or 0.0))
+    grouped = _antigravity_window_groups(snapshot)
+    if grouped:
+        fixed = grouped.get(antigravity_fixed_group(db))
+        if fixed:
+            return next((window for window in fixed if window.window_minutes == 10080), fixed[0])
+        windows = [window for group in grouped.values() for window in group]
+        weekly = [window for window in windows if window.window_minutes == 10080]
+        return max(weekly or windows, key=lambda window: float(window.used_percent or 0.0))
     windows=_model_windows(snapshot)
     if not windows: return _antigravity_fallback_window(snapshot)
     mode=(db.get_setting("monitor_ag_mode","auto_today") or "auto_today")
@@ -371,49 +372,23 @@ def build_compact_rows(db: Database, states: dict[str,ProviderState], *, force_a
 
     ag_state=states.get("antigravity"); selected_id=""
     if ag_state:
-        weekly_groups=_antigravity_weekly_groups(ag_state.snapshot)
-        if len(weekly_groups) >= 2:
-            first,second=weekly_groups[0],weekly_groups[1]
-            compact.append(MonitorRow(
-                "antigravity:groups","antigravity","Antigravity","Две недельные группы",
-                labeled_cell(first,_antigravity_group_title(first)),
-                labeled_cell(second,_antigravity_group_title(second)),
-                True,
-            ))
-        elif weekly_groups:
-            only=weekly_groups[0]
-            selected_id=only.id
-            compact.append(MonitorRow(
-                "antigravity:groups","antigravity","Antigravity",_antigravity_group_title(only),
-                labeled_cell(only,_antigravity_group_title(only)),None,True,
-            ))
-        else:
-            # Legacy/model-only sources expose a single factual limit.
-            selected=select_antigravity_window(db,ag_state.snapshot,force_scan=force_ag_scan)
-            if selected:
-                selected_id=selected.id
-                compact.append(MonitorRow(
-                    "antigravity:selected","antigravity","Antigravity",selected.title,
-                    labeled_cell(selected,selected.title),None,True,
-                ))
+        selected = select_antigravity_window(db, ag_state.snapshot, force_scan=force_ag_scan)
+        short, long = None, None
+        subtitle = "Лимит недоступен"
+        if selected:
+            selected_id = selected.id
+            subtitle = selected.title
+            if selected.role == "group" and selected.window_minutes in {300, 10080}:
+                group_id = _antigravity_group_id(selected)
+                group = next(row for row in detailed["antigravity"] if row.key == f"antigravity:{group_id}")
+                short, long = group.short, group.long
+                subtitle = group.name
+            elif selected.window_minutes and selected.window_minutes > 1440:
+                long = cell(selected)
             else:
-                compact.append(MonitorRow(
-                    "antigravity:unavailable","antigravity","Antigravity","Лимит недоступен",
-                    None,None,True,
-                ))
+                short = cell(selected)
+        compact.append(MonitorRow("antigravity:selected", "antigravity", "Antigravity", subtitle, short, long))
     return compact,selected_id
-
-
-def _cached_row_has_data(row: dict) -> bool:
-    windows = row.get("windows") or []
-    return any(window.used_percent is not None and not window.informational for window in windows) or any(
-        row.get(field) is not None for field in ("five_hour", "weekly", "fable_weekly")
-    )
-
-
-def _cached_row_has_manual_data(row: dict) -> bool:
-    credits = row.get("manual_resets")
-    return isinstance(credits, ManualResetCredits) and credits.state != "unknown"
 
 
 def cached_snapshot(db: Database, provider: str) -> QuotaSnapshot:
@@ -425,15 +400,10 @@ def cached_snapshot(db: Database, provider: str) -> QuotaSnapshot:
         "grok": "grok:local-billing-log",
         "antigravity": "antigravity:cli-usage",
     }.get(provider, f"unknown:{provider}")
-    rows=db.quota_samples(provider=provider)
-    if provider == "claude":
-        rows=[row for row in rows if str(row.get("source") or "").casefold() == CLAUDE_LOCAL_SOURCE]
-    if not rows:
-        result = QuotaSnapshot(provider=provider,source=default_source)
-        if provider == "claude": result.manual_resets = read_manual_resets(db)
-        return result
-    r=next((row for row in reversed(rows) if _cached_row_has_data(row)), None)
-    manual_row=next((row for row in reversed(rows) if _cached_row_has_manual_data(row)), None)
+    r, manual_row = db.latest_quota_rows(
+        provider, source=CLAUDE_LOCAL_SOURCE if provider == "claude" else None,
+        include_manual=provider != "claude",
+    )
     if r is None and manual_row is None:
         result = QuotaSnapshot(provider=provider,source=default_source)
         if provider == "claude": result.manual_resets = read_manual_resets(db)

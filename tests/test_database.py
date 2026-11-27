@@ -138,6 +138,50 @@ def test_antigravity_direct_source_retains_legacy_history(tmp_path):
     db.close()
 
 
+def test_current_quota_skips_placeholders_without_decoding_history(tmp_path, monkeypatch):
+    db = _db(tmp_path)
+    sql = ("INSERT INTO quota_samples(ts_utc,source,weekly,windows_json,manual_resets_json,profile_key) "
+           "VALUES (?,?,?,?,?,?)")
+    old = ("2026-01-01", "codexbar:codex", 15, "[]", "{}", "")
+    db._conn.executemany(sql, [old] * 5000)
+    db._conn.executemany(sql, [
+        ("2026-01-02", "codexbar:codex", 33, "[]", "{}", ""),
+        ("2026-01-03", "codex-app-server:account/ratelimits/read", 40, "[]", "{}", ""),
+        ("2026-01-04", "codexbar:codex", None, "[]", '{"state":"available","available_count":2}', ""),
+        ("2026-01-05", "codexbar:codex", None, "[]", "{bad", ""),
+        ("2026-01-06", "codexbar:codex", 90, "[]", "{}", "another-profile"),
+    ])
+    db._conn.commit()
+    decoder = db._decode_quota_row
+    decoded = []
+
+    def tracked_decoder(row, provider):
+        decoded.append(row["id"])
+        return decoder(row, provider)
+
+    monkeypatch.setattr(db, "_decode_quota_row", tracked_decoder)
+    quota, resets = db.latest_quota_rows("codex")
+    assert quota["weekly"] == 40
+    assert resets["manual_resets"].available_count == 2
+    assert len(decoded) <= 3
+    assert db._conn.execute("SELECT COUNT(*) FROM quota_samples").fetchone()[0] == 5005
+    db.close()
+
+
+def test_existing_history_survives_index_upgrade(tmp_path):
+    db = _db(tmp_path)
+    db.record_quota(QuotaSnapshot(weekly=12.0, source="codexbar:codex", provider="codex"))
+    db._conn.execute("DROP INDEX idx_quota_source_profile_ts")
+    db._conn.execute("DROP INDEX idx_quota_manual_source_profile_ts")
+    db._conn.execute("PRAGMA user_version=5")
+    db.close()
+    upgraded = _db(tmp_path)
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert upgraded.latest_quota_rows("codex")[0]["weekly"] == 12.0
+    assert len(upgraded.quota_samples(provider="codex")) == 1
+    upgraded.close()
+
+
 def test_quota_sample_timestamp_is_collection_time(tmp_path):
     import datetime as dt
 

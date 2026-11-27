@@ -4,7 +4,7 @@ import json
 import pytest
 
 from claude_usage_manager import quota
-from claude_usage_manager.models import ManualResetCredits, Period
+from claude_usage_manager.models import Period
 
 UTC = dt.timezone.utc
 
@@ -282,6 +282,34 @@ def test_quota_window_consumed_isolated_windows(monkeypatch):
             ]
     assert quota.quota_window_consumed(_period(), FakeDb(), 15.0, "antigravity", "model-a") == 5.0
     assert quota.quota_window_consumed(_period(), FakeDb(), 82.0, "antigravity", "model-b") == 32.0
+
+
+def test_quota_windows_share_one_read_without_mixing_claude_sources(monkeypatch):
+    history = [(_ms(2026, 8, 5, 9, 0), 30.0), (_ms(2026, 8, 5, 11, 0), 40.0)]
+    monkeypatch.setattr(quota, "_history_samples", lambda: history)
+    mod = quota.CLAUDE_MOD_SOURCE
+    statusline = quota.CLAUDE_STATUSLINE_SOURCE
+    calls = []
+
+    class FakeDb:
+        def quota_samples(self, provider=None):
+            calls.append(provider)
+            return [
+                {"ts_utc": "2026-08-05T09:00:00+00:00", "source": mod, "weekly": 7.0, "five_hour": 5.0},
+                {"ts_utc": "2026-08-05T09:00:00+00:00", "source": statusline,
+                 "windows": [quota.QuotaWindow("extra", "Fable", 20.0)]},
+                {"ts_utc": "2026-08-05T11:00:00+00:00", "source": mod, "weekly": 15.0, "five_hour": 13.0},
+                {"ts_utc": "2026-08-05T11:00:00+00:00", "source": statusline,
+                 "windows": [quota.QuotaWindow("extra", "Fable", 26.0)]},
+            ]
+
+    consumed = quota.quota_windows_consumed(
+        _period(), FakeDb(), {"primary": 15.0, "secondary": 18.0, "extra": 31.0},
+        "claude", current_source=mod,
+    )
+
+    assert calls == ["claude"]
+    assert consumed == {"primary": 10.0, "secondary": 10.0, "extra": 6.0}
 
 
 _APP_SERVER_RATE_LIMITS = {

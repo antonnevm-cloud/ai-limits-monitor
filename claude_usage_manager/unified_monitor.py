@@ -179,14 +179,15 @@ class UnifiedMonitorWindow(MonitorWindow):
             return
         if self._refresh_requested:
             self.refresh()
-        if self._analytics_window is not None:
+        if self._analytics_window is not None and self._analytics_window.isVisible():
             self._analytics_window.reload_cached_quotas()
         self._reload_limits_window()
         if not connected:
             self.footer.setText("Нет связи · кэш")
 
     def _has_active_workers(self) -> bool:
-        if self.worker is not None or getattr(self, "_cache_worker", None) is not None:
+        if (self.worker is not None or self._cache_worker is not None
+                or self._usage_worker is not None or self._forecast_workers):
             return True
         for window in (self._analytics_window, self._limits_window):
             if window is None:
@@ -205,12 +206,16 @@ class UnifiedMonitorWindow(MonitorWindow):
         if self._has_active_workers():
             if not self._shutdown_poll_scheduled:
                 self._shutdown_poll_scheduled = True
-                QTimer.singleShot(50, self._finish_quit)
+                QTimer.singleShot(50, self._poll_shutdown)
             return
         self._shutdown_poll_scheduled = False
         app = QApplication.instance()
         if app is not None:
             app.quit()
+
+    def _poll_shutdown(self):
+        self._shutdown_poll_scheduled = False
+        self._finish_quit()
 
     def quit_monitor(self) -> None:
         if self._limits_window is not None:

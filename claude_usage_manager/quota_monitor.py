@@ -1,6 +1,7 @@
 """Compact always-on-top PySide6 widget for AI quota monitoring."""
 from __future__ import annotations
 import ctypes, datetime as dt, json, logging, re, sys, time, traceback
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from PySide6.QtCore import QByteArray,QObject,QPoint,QPointF,QRect,QRectF,QRunnable,QSize,Qt,QThreadPool,QTimer,Signal,Slot
@@ -11,7 +12,7 @@ from .antigravity_details_qt import AntigravityDetails
 from .database import Database
 from .subscription_payments import next_monthly_payment, parse_last_payment
 from .icon import ensure_icon
-from .models import QuotaSnapshot
+from .models import QuotaSnapshot, QuotaWindow
 from . import APP_VERSION
 from .provider_settings import load_connections, provider_enabled
 from .cache_threads import CODEX_TTL_DEFAULT,GROK_TTL_DEFAULT,ThreadScanner,is_claude_terminal,select_threads
@@ -19,7 +20,7 @@ from .cache_threads_qt import AGENT_NAMES, MIN_VISIBLE_ROWS, ROW_HEIGHT, CacheTh
 from .forecast_qt import ForecastBar, ForecastPopup
 from .thread_activity import ACTIVITY_WORKING
 from .thread_usage import EMPTY_REPORT, UsageScanner
-from .week_forecast import WEEK, build_chart, build_forecast, weekly_window
+from .week_forecast import WEEK, WeekChart, WeekForecast, build_chart, build_forecast, weekly_window
 from .edge_grip import GRIP_WIDTH, EdgeGrip
 from .thread_view import FIELDS as THREAD_VIEW_FIELDS, SETTING_KEY as THREAD_VIEW_KEY, ThreadView
 from .toggle_switch import ToggleSwitch
@@ -28,7 +29,7 @@ from .claude_local import claude_root, read_statusline_quota, statusline_path
 from .claude_reset_dialog import ClaudeManualResetsDialog
 from .quota_columns import QuotaColumns, cell_label, limit_suffix, manual_reset_suffix, percent_text, primary_cell
 from .qt_theme import COLORS,build_stylesheet
-from .quota_monitor_model import PROVIDERS,PROVIDER_LABELS,MonitorData,ProviderState,build_compact_rows,build_rows,cached_states,manual_reset_tooltip,refresh_monitor_data
+from .quota_monitor_model import AG_FIXED_GROUP_SETTING,PROVIDERS,PROVIDER_LABELS,MonitorData,ProviderState,antigravity_fixed_group,build_compact_rows,build_rows,cached_states,manual_reset_tooltip,refresh_monitor_data
 from .utils import get_logger,now_local,setup_logging
 from .windows_ui import enable_per_monitor_dpi_awareness,set_window_always_on_top
 from .widget_ipc import acquire_widget_mutex as _mutex
@@ -72,6 +73,52 @@ def dot_tooltip(provider,status,state):
 
 class WorkerSignals(QObject):
     finished=Signal(object); failed=Signal(str)
+
+
+@dataclass
+class ForecastResult:
+    provider: str
+    generation: int
+    window: QuotaWindow
+    samples: tuple[dt.datetime, float, list]
+    forecast: WeekForecast | None
+    chart: WeekChart | None
+
+
+class ForecastWorker(QRunnable):
+    def __init__(self, db, provider, generation, window, cached, daily):
+        super().__init__()
+        self.db = db
+        self.provider = provider
+        self.generation = generation
+        self.window = window
+        self.cached = cached
+        self.daily = daily
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        start = self.window.resets_at.astimezone(dt.timezone.utc) - WEEK
+        cached = self.cached if self.cached is not None and self.cached[0] == start else None
+        moment = time.monotonic()
+        if cached is None or moment - cached[1] >= FORECAST_SAMPLES_TTL:
+            try:
+                samples = self.db.quota_samples(start_utc=start, end_utc=self.window.resets_at, provider=self.provider)
+            except Exception:
+                get_logger().exception('AI Limits Monitor forecast samples')
+                samples = cached[2] if cached is not None else []
+            cached = start, moment, samples
+        forecast = chart = None
+        try:
+            as_of = min(dt.datetime.now(dt.timezone.utc), self.window.resets_at)
+            forecast = build_forecast(self.window, now=as_of, samples=cached[2])
+            if forecast is not None and forecast.now >= start:
+                chart = build_chart(forecast, cached[2], self.daily)
+        except Exception:
+            get_logger().exception('AI Limits Monitor forecast calculation')
+        self.signals.finished.emit(ForecastResult(self.provider, self.generation, self.window, cached, forecast, chart))
+
+
 class RefreshWorker(QRunnable):
     def __init__(self,db):super().__init__();self.db=db;self.signals=WorkerSignals()
     @Slot()
@@ -123,6 +170,8 @@ def agent_summary(row,state):
     '''Текст справа в заголовке карточки агента («5 ч 62% · нед 30%») и подсказка с остатками, сроками сброса и кредитами ручного сброса.'''
     credits = state.snapshot.manual_resets
     parts, lines = [], []
+    if row.provider == 'antigravity' and row.subtitle and (row.short or row.long):
+        lines.append(row.subtitle)
     for cell in (row.short,row.long):
         if cell is None:continue
         suffix = limit_suffix(row, cell, credits)
@@ -426,7 +475,7 @@ class AgentCard(QFrame):
 
 class SettingsDialog(QDialog):
     connections_requested = Signal()
-    def __init__(self,data,visibility,seconds,topmost,opacity,ag_mode,fixed_id,parent=None,*,payments=None):
+    def __init__(self,data,visibility,seconds,topmost,opacity,ag_mode,fixed_id,parent=None,*,payments=None,fixed_group=''):
         super().__init__(parent);self.setWindowTitle('Настройки AI Limits Monitor');self.resize(520,470);v=QVBoxLayout(self);v.setContentsMargins(16,16,16,16);v.setSpacing(10);grid=QGridLayout();grid.addWidget(QLabel('Опрос Codex и Antigravity'),0,0);self.interval=QComboBox()
         for text,val in (('15 секунд',15),('30 секунд',30),('1 минута',60),('2 минуты',120),('5 минут',300)):self.interval.addItem(text,val)
         self.interval.setCurrentIndex(max(0,self.interval.findData(seconds)));grid.addWidget(self.interval,0,1);grid.addWidget(QLabel('Прозрачность окна'),1,0);self.opacity=QComboBox()
@@ -438,19 +487,47 @@ class SettingsDialog(QDialog):
         connections = QPushButton("Подключения и вход")
         connections.clicked.connect(self.connections_requested)
         v.addWidget(connections)
-        group_rows=[row for row in data.rows.get('antigravity',[]) if any(cell and cell.window_id.startswith('ag-group:') for cell in (row.short,row.long))]
-        grouped=bool(group_rows)
-        v.addWidget(QLabel('Antigravity · недельные группы' if grouped else 'Antigravity · модель по умолчанию'));self.ag_mode=QComboBox()
-        options=(('Обе группы в compact','auto_today'),) if grouped else (('Авто: самая используемая сегодня','auto_today'),('Авто: последняя использованная','last_used'),('Фиксированная модель','fixed'),('Самый израсходованный лимит','most_consumed'))
-        for text,val in options:self.ag_mode.addItem(text,val)
-        idx=self.ag_mode.findData(ag_mode);self.ag_mode.setCurrentIndex(idx if idx>=0 else 0);v.addWidget(self.ag_mode);self.fixed=QComboBox();self.fixed.addItem('Выберите группу' if grouped else 'Выберите модель','')
-        for row in (group_rows or data.rows.get('antigravity',[])):
-            selection=next((cell for cell in (row.long,row.short) if cell and cell.window_id.startswith('ag-group:')),row.short or row.long)
-            self.fixed.addItem(row.name,selection.window_id if selection else '')
-        idx=self.fixed.findData(fixed_id);self.fixed.setCurrentIndex(idx if idx>=0 else 0);v.addWidget(self.fixed)
-        if grouped:
-            self.ag_mode.setEnabled(False);self.fixed.setEnabled(False)
-        hint=QLabel('В compact-режиме одновременно показываются обе недельные группы: Gemini Models и Claude/GPT Models.' if grouped else 'Для legacy/model-only источника показывается один фактический лимит модели.');hint.setWordWrap(True);hint.setObjectName('SettingsHint');v.addWidget(hint)
+        ag_rows = data.rows.get('antigravity', [])
+        ag_state = data.states.get('antigravity')
+        group_ids = {window.id for window in ag_state.snapshot.windows if window.role == 'group'} if ag_state else set()
+        group_rows = [row for row in ag_rows if any(cell and cell.window_id in group_ids for cell in (row.short, row.long))]
+        self.ag_mode = None
+        self.fixed = QComboBox()
+        if group_rows:
+            v.addWidget(QLabel('Antigravity · группа в заголовке'))
+            self.fixed.addItem('Авто: минимальный остаток', '')
+            for row in group_rows:
+                self.fixed.addItem(row.name, row.key.removeprefix('antigravity:'))
+            selection = fixed_group
+            unavailable = 'Выбранная группа сейчас недоступна'
+            hint_text = 'Автовыбор сравнивает остатки на неделю. Все группы открываются стрелкой.'
+        else:
+            v.addWidget(QLabel('Antigravity · модель по умолчанию'))
+            self.ag_mode = QComboBox()
+            options = (('Авто: самая используемая сегодня', 'auto_today'),
+                       ('Авто: последняя использованная', 'last_used'),
+                       ('Фиксированная модель', 'fixed'),
+                       ('Самый израсходованный лимит', 'most_consumed'))
+            for name, value in options:
+                self.ag_mode.addItem(name, value)
+            self.ag_mode.setCurrentIndex(max(0, self.ag_mode.findData(ag_mode)))
+            v.addWidget(self.ag_mode)
+            self.fixed.addItem('Выберите модель', '')
+            for row in ag_rows:
+                cell = row.short or row.long
+                if cell:
+                    self.fixed.addItem(row.name, cell.window_id)
+            selection = fixed_id
+            unavailable = 'Выбранная модель сейчас недоступна'
+            hint_text = 'В заголовке показывается лимит одной модели.'
+        if selection and self.fixed.findData(selection) < 0:
+            self.fixed.addItem(unavailable, selection)
+        self.fixed.setCurrentIndex(max(0, self.fixed.findData(selection)))
+        v.addWidget(self.fixed)
+        hint = QLabel(hint_text)
+        hint.setWordWrap(True)
+        hint.setObjectName('SettingsHint')
+        v.addWidget(hint)
 
         self.payments = dict(payments or {})
         self.payment_fields = {}
@@ -511,7 +588,9 @@ class SettingsDialog(QDialog):
         super().accept()
 
     def values(self):
-        vis={f'compact:{p}':cb.isChecked() for p,cb in self.provider_checks.items()};return int(self.interval.currentData()),self.topmost.isChecked(),int(self.opacity.currentData()),vis,str(self.ag_mode.currentData()),str(self.fixed.currentData() or '')
+        vis = {f'compact:{p}': cb.isChecked() for p, cb in self.provider_checks.items()}
+        mode = self.ag_mode.currentData() if self.ag_mode is not None else None
+        return self.interval.currentData(), self.topmost.isChecked(), self.opacity.currentData(), vis, mode, self.fixed.currentData()
 
 class MonitorWindow(QMainWindow):
     def __init__(self,db,*,auto_refresh=True,cache_scan=None):
@@ -665,7 +744,15 @@ class MonitorWindow(QMainWindow):
         self._connection_generation = 0
         self.cache_scanner=ThreadScanner(codex_ttl=self._load_int('monitor_cache_codex_ttl',CODEX_TTL_DEFAULT,CACHE_TTL_CHOICES),grok_ttl=self._load_int('monitor_cache_grok_ttl',GROK_TTL_DEFAULT,CACHE_TTL_CHOICES));self.cache_enabled=self.db.get_setting('monitor_cache_threads','1')!='0'
         self.cache_expanded={p:True for p,v in self._load_json('monitor_cache_expanded').items() if p in CACHE_PROVIDERS and v is True};self.cache_show_all={}
-        self.cache_threads={};self.cache_blocks={};self._cache_worker=None;self._cache_scan=scan;self.forecast_bars={};self.header_rows={};self.forecast_popup=None;self._popup_provider=None;self._clock_ticks=0;self._forecast_samples={}
+        self.cache_threads={};self.cache_blocks={};self._cache_worker=None;self._cache_scan=scan;self.forecast_bars={};self.header_rows={};self.forecast_popup=None;self._popup_provider=None;self._clock_ticks=0
+        self._forecasts = {}
+        self._forecast_workers = {}
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.timeout.connect(self._fit_to_content)
+        self._fit_settle_timer = QTimer(self)
+        self._fit_settle_timer.setSingleShot(True)
+        self._fit_settle_timer.timeout.connect(self._fit_to_content)
         self.usage_report=EMPTY_REPORT;self._spend={};self._usage_worker=None;self.usage_scanner=UsageScanner() if scan else None
         self.usage_timer=QTimer(self);self.usage_timer.setInterval(USAGE_SCAN_MS);self.usage_timer.timeout.connect(self._start_usage_scan)
         self.cache_timer=QTimer(self);self.cache_timer.setInterval(CACHE_SCAN_MS);self.cache_timer.timeout.connect(self._start_cache_scan)
@@ -688,11 +775,17 @@ class MonitorWindow(QMainWindow):
                 header.set_running(count)
                 changed = True
         if changed:
-            self._fit_to_content()
-            QTimer.singleShot(0, self, self._fit_to_content)
+            self._fit_after_change()
     def _make_cache_block(self,provider):
         if not self.cache_enabled or not self.cache_expanded.get(provider):return None
-        block=CacheThreadsBlock();block.more_clicked.connect(lambda p=provider:self.set_cache_show_all(p,True));block.less_clicked.connect(lambda p=provider:self.set_cache_show_all(p,False));block.restore_clicked.connect(lambda p=provider:self._restore_hidden(p));block.content_changed.connect(lambda:QTimer.singleShot(0,self,self._fit_to_content));self._fill_cache_block(provider,block);self.cache_blocks[provider]=block;return block
+        block = CacheThreadsBlock()
+        block.more_clicked.connect(lambda: self.set_cache_show_all(provider, True))
+        block.less_clicked.connect(lambda: self.set_cache_show_all(provider, False))
+        block.restore_clicked.connect(lambda: self._restore_hidden(provider))
+        block.content_changed.connect(lambda: self._fit_timer.start())
+        self._fill_cache_block(provider, block)
+        self.cache_blocks[provider] = block
+        return block
     def _fill_cache_block(self,provider,block):
         threads,hidden,pinned=self._apply_thread_rules(self._shown_threads(provider))
         return block.set_content(threads,dt.datetime.now(dt.timezone.utc),show_all=bool(self.cache_show_all.get(provider)),view=self.thread_view,pinned=pinned,hidden_count=hidden,spend=self._spend.get(provider))
@@ -703,10 +796,10 @@ class MonitorWindow(QMainWindow):
         pinned=frozenset(t.session_id for t in shown if rules.get(t.session_id,{}).get('pinned'))
         shown.sort(key=lambda t:t.session_id not in pinned)
         return shown,len(threads)-len(shown),pinned
-    def _refill_cache_blocks(self):
+    def _refill_cache_blocks(self, *, fit=True):
         changed=False
         for provider,block in self.cache_blocks.items():changed=self._fill_cache_block(provider,block) or changed
-        if changed:self._fit_to_content();QTimer.singleShot(0,self,self._fit_to_content)
+        if changed and fit:self._fit_after_change()
         return changed
     def _reload_thread_rules(self):
         self.thread_rules=self.db.thread_rules();self._refill_cache_blocks()
@@ -768,8 +861,12 @@ class MonitorWindow(QMainWindow):
         if expanded:self.cache_expanded[provider]=True
         else:self.cache_expanded.pop(provider,None);self.cache_show_all.pop(provider,None)
         self.db.set_setting('monitor_cache_expanded',json.dumps(self.cache_expanded,sort_keys=True))
-        if expanded and self._cache_scan:self._start_cache_scan();self._start_usage_scan()
-        self._render()
+        header = self.header_rows.get(provider)
+        if header is not None and self._sync_cache_card(provider, header):
+            self._fit_after_change()
+        if expanded and self._cache_scan:
+            self._start_cache_scan()
+            self._start_usage_scan()
 
     def _set_antigravity_expanded(self, expanded):
         self.antigravity_expanded = expanded
@@ -777,7 +874,10 @@ class MonitorWindow(QMainWindow):
         self._render()
 
     def set_cache_show_all(self,provider,show_all):
-        self.cache_show_all[provider]=bool(show_all);self._render()
+        self.cache_show_all[provider] = bool(show_all)
+        block = self.cache_blocks.get(provider)
+        if block is not None and self._fill_cache_block(provider, block):
+            self._fit_after_change()
     def _tick_cache(self):
         if self.cache_blocks:
             now=dt.datetime.now(dt.timezone.utc)
@@ -807,31 +907,66 @@ class MonitorWindow(QMainWindow):
         self.usage_report=report;self._spend={}
         for (agent,session_id),spend in report.threads.items():self._spend.setdefault(agent,{})[session_id]=spend
         self._refill_cache_blocks()
+        if self._popup_provider is not None:
+            self._request_forecast(self._popup_provider, force=True)
     @Slot(str)
     def _usage_failed(self,details):
         self._usage_worker=None;get_logger().error('AI Limits Monitor usage scan: %s',details)
-    def _week_samples(self,provider,window):
-        '''Замеры недели провайдера с ее начала (сброс минус 7 суток) для взвешенного темпа; из базы не чаще раза в FORECAST_SAMPLES_TTL секунд.'''
-        start=window.resets_at.astimezone(dt.timezone.utc)-WEEK;cached=self._forecast_samples.get(provider);moment=time.monotonic()
-        if cached is not None and cached[0]==start and moment-cached[1]<FORECAST_SAMPLES_TTL:return cached[2]
-        try:samples=self.db.quota_samples(start_utc=start,provider=provider)
-        except Exception:get_logger().exception('AI Limits Monitor forecast samples');samples=cached[2] if cached is not None and cached[0]==start else []
-        self._forecast_samples[provider]=(start,moment,samples);return samples
-    def _forecast_for(self,provider):
-        window=self.weekly_of(provider)
-        if window is None:return None
-        return build_forecast(window,samples=self._week_samples(provider,window))
-    def _make_forecast_bar(self,provider):
-        if not self.thread_view.forecast:return None
-        forecast=self._forecast_for(provider)
-        if forecast is None:return None
-        bar=ForecastBar();bar.set_forecast(forecast)
-        bar.clicked.connect(lambda: self._forecast_clicked(provider))
-        self.forecast_bars[provider]=bar;return bar
+    def _request_forecast(self, provider, *, force=False):
+        if self._quit or provider in self._forecast_workers:
+            return
+        bar = self.forecast_bars.get(provider)
+        window = self.weekly_of(provider)
+        if bar is None or window is None:
+            return
+        cached = self._forecasts.get(provider)
+        if cached is not None and cached.window == window:
+            if not force and time.monotonic() - cached.samples[1] < FORECAST_SAMPLES_TTL:
+                return
+        worker = ForecastWorker(
+            self.db, provider, self._connection_generation, window,
+            cached.samples if cached is not None else None,
+            self.usage_report.daily.get(provider, {}),
+        )
+        self._forecast_workers[provider] = worker
+        worker.signals.finished.connect(self._forecast_ready)
+        self.pool.start(worker)
+
+    @Slot(object)
+    def _forecast_ready(self, result):
+        provider = result.provider
+        self._forecast_workers.pop(provider, None)
+        if self._quit:
+            if self.worker is None and not self._forecast_workers:
+                self._finish_quit()
+            return
+        if result.generation != self._connection_generation or result.window != self.weekly_of(provider):
+            self._request_forecast(provider)
+            return
+        self._forecasts[provider] = result
+        bar = self.forecast_bars.get(provider)
+        if bar is not None and result.forecast is not None:
+            labels = bar.now_label.text(), bar.end_label.text()
+            bar.set_forecast(result.forecast)
+            if labels != (bar.now_label.text(), bar.end_label.text()):
+                self._fit_timer.start()
+            if self._popup_provider == provider:
+                self._update_forecast_popup(provider, bar)
+
+    def _sync_forecast_bar(self, provider, bar):
+        window = self.weekly_of(provider)
+        cached = self._forecasts.get(provider)
+        forecast = cached.forecast if cached is not None and cached.window == window else None
+        if forecast is None:
+            forecast = build_forecast(window)
+        if bar.forecast != forecast:
+            bar.set_forecast(forecast)
+        bar.set_chart_enabled(self.thread_view.chart == 'click')
+        self._request_forecast(provider)
+
     def _refresh_forecasts(self):
-        for provider,bar in self.forecast_bars.items():
-            forecast=self._forecast_for(provider)
-            if forecast is not None:bar.set_forecast(forecast)
+        for provider in self.forecast_bars:
+            self._request_forecast(provider, force=True)
     def _forecast_clicked(self, provider):
         bar = self.forecast_bars.get(provider)
         if self.thread_view.chart != 'click' or bar is None:
@@ -839,8 +974,7 @@ class MonitorWindow(QMainWindow):
         if self._popup_provider == provider:
             self._close_popup(restore_focus=True)
             return
-        forecast = self._forecast_for(provider)
-        if forecast is None:
+        if bar.forecast is None:
             bar.set_chart_open(False)
             return
         previous = self.forecast_bars.get(self._popup_provider)
@@ -851,18 +985,23 @@ class MonitorWindow(QMainWindow):
             self.forecast_popup.setStyleSheet(scaled_style(self.font_delta()))
             self.forecast_popup.closed.connect(lambda: self._close_popup(restore_focus=True))
         self._popup_provider = provider
-        self._update_forecast_popup(provider, bar, forecast)
+        self._update_forecast_popup(provider, bar)
         self.forecast_popup.show()
         self.forecast_popup.raise_()
         self.forecast_popup.activateWindow()
         self.forecast_popup.close_button.setFocus()
 
-    def _update_forecast_popup(self, provider, bar, forecast):
+    def _update_forecast_popup(self, provider, bar):
         bar.set_chart_open(True)
-        samples = self._week_samples(provider, self.weekly_of(provider))
+        cached = self._forecasts.get(provider)
+        chart = cached.chart if cached is not None and cached.forecast == bar.forecast else None
         popup = self.forecast_popup
-        popup.set_data(forecast, build_chart(forecast, samples, self.usage_report.daily.get(provider, {})))
+        popup.set_data(bar.forecast, chart)
         popup.adjustSize()
+        self._move_forecast_popup(bar)
+
+    def _move_forecast_popup(self, bar):
+        popup = self.forecast_popup
         area = self._screen_area()
         frame = self.frameGeometry()
         left = frame.left() - popup.width() - 8
@@ -908,6 +1047,31 @@ class MonitorWindow(QMainWindow):
         if self.cache_enabled and self._cache_scan:self.cache_timer.start();self._start_cache_scan()
         elif not self.cache_enabled:self.cache_timer.stop();self.cache_threads={}
         self._render()
+
+    def _sync_cache_card(self, provider, header):
+        expanded = self.cache_enabled and bool(self.cache_expanded.get(provider))
+        header.disclosure.setVisible(self.cache_enabled)
+        header.disclosure.set_expanded(expanded)
+        if expanded:
+            block = self.cache_blocks.get(provider) or self._make_cache_block(provider)
+        else:
+            self.cache_blocks.pop(provider, None)
+            block = None
+
+        if expanded and self.thread_view.forecast and self.weekly_of(provider) is not None:
+            bar = self.forecast_bars.get(provider)
+            if bar is None:
+                bar = ForecastBar()
+                bar.clicked.connect(lambda: self._forecast_clicked(provider))
+                self.forecast_bars[provider] = bar
+            self._sync_forecast_bar(provider, bar)
+        else:
+            if self._popup_provider == provider:
+                self._close_popup()
+            self.forecast_bars.pop(provider, None)
+            bar = None
+        return header.parentWidget().set_details(bar, block)
+
     def _render(self):
         delta=self.font_delta();rows=[row for row in self.data.compact_rows if self._visible(row.provider)]
         signature = delta, tuple(row.provider for row in rows)
@@ -946,43 +1110,22 @@ class MonitorWindow(QMainWindow):
                     changed |= block.set_rows(self.data.rows.get(provider, []))
                 details_changed |= card.set_details(None, block)
                 continue
-            expanded = self.cache_enabled and bool(self.cache_expanded.get(provider))
-            header.disclosure.setVisible(self.cache_enabled)
-            header.disclosure.set_expanded(expanded)
-            block = self.cache_blocks.get(provider)
-            if expanded and block is None:
-                block = self._make_cache_block(provider)
-            elif not expanded:
-                self.cache_blocks.pop(provider, None)
-                block = None
-            bar = self.forecast_bars.get(provider)
-            if block is not None and self.thread_view.forecast and self.weekly_of(provider):
-                if bar is None:
-                    bar = self._make_forecast_bar(provider)
-            else:
-                self.forecast_bars.pop(provider, None)
-                bar = None
-            details_changed |= card.set_details(bar, block)
+            details_changed |= self._sync_cache_card(provider, header)
         if not rebuilt:
-            self._refill_cache_blocks()
-            self._refresh_forecasts()
-        for bar in self.forecast_bars.values():
-            bar.set_chart_enabled(self.thread_view.chart == 'click')
+            changed |= self._refill_cache_blocks(fit=False)
         if self._popup_provider is not None:
             provider = self._popup_provider
             if self.thread_view.chart != 'click' or provider not in self.forecast_bars:
                 self._close_popup()
             elif rebuilt or details_changed:
-                self._update_forecast_popup(provider, self.forecast_bars[provider], self._forecast_for(provider))
+                self._update_forecast_popup(provider, self.forecast_bars[provider])
         live=sum(s.live for s in self.data.states.values());local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in self.data.states.values());cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in self.data.states.values());self.footer.setText(f'{live}/4 онлайн'+(f' · {local} локальные' if local else '')+(f' · {cached} кэш' if cached else '')+f' · Codex/AG {refresh_label(self.seconds)}');self._update_tray_tooltip()
         if changed or details_changed:
             for header in self.header_rows.values():
                 header.layout().invalidate();header.updateGeometry()
                 if header.parentWidget() is not None:header.parentWidget().layout().invalidate();header.parentWidget().updateGeometry()
             self.rows_box.invalidate();self.centralWidget().layout().invalidate()
-            was_visible=self.isVisible();self._fit_to_content()
-            QTimer.singleShot(0,self,self._fit_to_content)
-            if was_visible:QTimer.singleShot(FIT_SETTLE_MS,self,self._fit_to_content)
+            self._fit_after_change()
     def _update_clock(self):
         now = now_local()
         self.updated.setText(now.strftime('%H:%M'));self._tick_cache();self._clock_ticks+=1;self._refresh_countdowns(now)
@@ -995,8 +1138,14 @@ class MonitorWindow(QMainWindow):
             changed |= row.refresh_countdown(now)
             changed |= row.set_payment(self.payments.get(provider), today)
         if not changed:return
+        self._fit_after_change()
+
+    def _fit_after_change(self):
         self._fit_to_content()
-        if self.isVisible():QTimer.singleShot(FIT_SETTLE_MS,self,self._fit_to_content)
+        self._fit_timer.start()
+        if self.isVisible():
+            self._fit_settle_timer.start(FIT_SETTLE_MS)
+
     def _content_height(self, layout, width):
         layout.activate()
         return max(layout.totalMinimumSize().height(), layout.totalHeightForWidth(width))
@@ -1008,14 +1157,14 @@ class MonitorWindow(QMainWindow):
             blocks.append(header.parentWidget().block)
         if not blocks or area is None:
             return
-        for block in blocks:
-            block.set_height_cap(None)
-        excess = self._content_height(layout, width) - (area.height() - CACHE_SCREEN_MARGIN)
-        if excess > 0:
-            caps = distribute_height_caps([block.natural_height() for block in blocks],
-                                          excess, MIN_VISIBLE_ROWS * ROW_HEIGHT)
-            for block, cap in zip(blocks, caps):
-                block.set_height_cap(cap)
+        heights = [block.natural_height() for block in blocks]
+        current = sum(block.list_height() if isinstance(block, CacheThreadsBlock) else block.maximumHeight()
+                      for block in blocks)
+        natural = self._content_height(layout, width) - current + sum(heights)
+        excess = natural - (area.height() - CACHE_SCREEN_MARGIN)
+        caps = distribute_height_caps(heights, excess, MIN_VISIBLE_ROWS * ROW_HEIGHT)
+        for block, cap in zip(blocks, caps):
+            block.set_height_cap(cap)
 
     def _fit_commands(self, width):
         margins = self.actions.layout().contentsMargins()
@@ -1064,6 +1213,8 @@ class MonitorWindow(QMainWindow):
         height = max(COMPACT_MIN_HEIGHT, self._content_height(layout, width))
         self.setMinimumSize(minimum, height)
         self.setGeometry(self._anchored_geometry(before, width, height))
+        if self._popup_provider is not None and self.forecast_popup.isVisible():
+            self._move_forecast_popup(self.forecast_bars[self._popup_provider])
 
     def _anchored_geometry(self,current,width,height):
         '''Правый нижний угол остается на месте: окно растет вверх и влево, у края экрана упирается в него.'''
@@ -1082,7 +1233,8 @@ class MonitorWindow(QMainWindow):
     def _done(self,data):
         self.worker=None
         if self._quit:
-            self._finish_quit()
+            if not self._forecast_workers:
+                self._finish_quit()
             return
         previous=self._usage_inputs()
         if isinstance(data,MonitorData):self.data=data;self.states=data.states;self.rows=data.rows
@@ -1092,7 +1244,8 @@ class MonitorWindow(QMainWindow):
     def _failed(self,details):
         self.worker=None
         if self._quit:
-            self._finish_quit()
+            if not self._forecast_workers:
+                self._finish_quit()
             return
         get_logger().error('AI Limits Monitor refresh: %s',details);self.footer.setText('ошибка обновления · последние данные')
     def _finish_quit(self):
@@ -1119,7 +1272,8 @@ class MonitorWindow(QMainWindow):
         shell.setStyleSheet("QFrame#WidgetShell{background:transparent;border:none;}");self.setWindowOpacity(max(0.2,min(1.0,self.opacity/100)))
     def open_settings(self):
         mode=self.db.get_setting('monitor_ag_mode','auto_today') or 'auto_today';fixed=self.db.get_setting('monitor_ag_fixed_model','') or ''
-        d=SettingsDialog(self.data,self.visibility,self.seconds,self.topmost,self.opacity,mode,fixed,self,payments=self.payments)
+        d=SettingsDialog(self.data,self.visibility,self.seconds,self.topmost,self.opacity,mode,fixed,self,
+                         payments=self.payments,fixed_group=antigravity_fixed_group(self.db))
         d.connections_requested.connect(self.open_connections)
         d.setStyleSheet(QApplication.instance().styleSheet()+STYLE)
         if d.exec()!=QDialog.DialogCode.Accepted:return
@@ -1127,7 +1281,24 @@ class MonitorWindow(QMainWindow):
             stored = {provider: {'date': date.isoformat(), 'amount': amount} for provider, (date, amount) in d.payments.items()}
             self.db.set_setting(PAYMENTS_SETTING, json.dumps(stored, ensure_ascii=False))
             self.payments = d.payments
-        self.seconds,self.topmost,self.opacity,vis,mode,fixed=d.values();self.visibility.update(vis);self.db.set_setting('monitor_refresh_seconds',str(self.seconds));self.db.set_setting('monitor_always_on_top','1' if self.topmost else '0');self.db.set_setting('monitor_opacity',str(self.opacity));self.db.set_setting('monitor_compact_visibility',json.dumps(self.visibility,sort_keys=True));self.db.set_setting('monitor_ag_mode',mode);self.db.set_setting('monitor_ag_fixed_model',fixed);self.timer.setInterval(self.seconds*1000);self._apply_window_flags();self._apply_opacity();compact,selected=build_compact_rows(self.db,self.states,force_ag_scan=True);self.data.compact_rows=compact;self.data.antigravity_selected_id=selected;self._render()
+        self.seconds, self.topmost, self.opacity, vis, mode, fixed = d.values()
+        self.visibility.update(vis)
+        self.db.set_setting('monitor_refresh_seconds', str(self.seconds))
+        self.db.set_setting('monitor_always_on_top', '1' if self.topmost else '0')
+        self.db.set_setting('monitor_opacity', str(self.opacity))
+        self.db.set_setting('monitor_compact_visibility', json.dumps(self.visibility, sort_keys=True))
+        if mode is None:
+            self.db.set_setting(AG_FIXED_GROUP_SETTING, fixed)
+        else:
+            self.db.set_setting('monitor_ag_mode', mode)
+            self.db.set_setting('monitor_ag_fixed_model', fixed)
+        self.timer.setInterval(self.seconds * 1000)
+        self._apply_window_flags()
+        self._apply_opacity()
+        self.data.compact_rows, self.data.antigravity_selected_id = build_compact_rows(
+            self.db, self.states, force_ag_scan=True,
+        )
+        self._render()
     def open_connections(self):
         from .connections_dialog import ConnectionsDialog
         previous = load_connections()
@@ -1137,7 +1308,7 @@ class MonitorWindow(QMainWindow):
             self._connection_generation += 1
             self.cache_threads.clear()
             self._spend.clear()
-            self._forecast_samples.clear()
+            self._forecasts.clear()
             self.usage_report = EMPTY_REPORT
             states = cached_states(self.db)
             compact, selected = build_compact_rows(self.db, states)
@@ -1314,8 +1485,10 @@ class MonitorWindow(QMainWindow):
     def show_normal(self):self.show();self._enforce_topmost();self.raise_();self.activateWindow();QTimer.singleShot(0,self._enforce_topmost)
     def quit_monitor(self):
         self._quit=True;self.tray.hide();self.timer.stop();self.clock_timer.stop();self.cache_timer.stop();self.usage_timer.stop();self._close_popup();self.drawer.hide();self.drawer.deleteLater()
+        self._fit_timer.stop()
+        self._fit_settle_timer.stop()
         if self.forecast_popup is not None:self.forecast_popup.deleteLater();self.forecast_popup=None
-        if self.worker is None:self._finish_quit()
+        if self.worker is None and not self._forecast_workers:self._finish_quit()
     def _restore_geometry(self):
         raw=self.db.get_state('monitor_geometry_compact','') or ''
         if raw:

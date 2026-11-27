@@ -777,3 +777,20 @@ def test_codex_logs_of_long_cooled_threads_are_not_read_for_the_model(dirs, monk
     write_lines(codex_file(dirs, name="live.jsonl"), codex_records(session="cx-live", model="gpt-6.1-sol", last_offset=-60))
     scanner(dirs).scan(NOW)
     assert calls == ["live.jsonl"]
+
+
+def test_replaced_codex_rollout_resets_model_offset(dirs):
+    path = codex_file(dirs)
+    old = codex_records(model="gpt-5.5")
+    old.insert(2, {"type": "tool", "payload": {"output": "old" * 100}})
+    write_lines(path, old)
+    scan = scanner(dirs)
+    assert scan.scan(NOW)["codex"][0].estimated
+
+    new = codex_records(model="gpt-6.1-sol")
+    new.insert(2, {"type": "tool", "payload": {"output": "new" * 300}})
+    replacement = write_lines(path.with_suffix(".tmp"), new)
+    replacement.replace(path)
+    thread = scan.scan(NOW)["codex"][0]
+    assert thread.ttl_seconds == ct.CODEX_TTL_DOCUMENTED
+    assert not thread.estimated

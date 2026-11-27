@@ -16,9 +16,23 @@ from .models import ManualResetCredits, ManualResetItem, QuotaSnapshot, QuotaWin
 from .provider_settings import provider_config_key
 from .utils import database_path, get_logger, parse_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _MIN_QUOTA_INTERVAL = dt.timedelta(minutes=10)
+_QUOTA_SOURCES = {
+    "claude": ("codexbar:claude", "claude-code:statusline", "claude-code:official-mod"),
+    "codex": ("codexbar:codex", "codex-app-server:account/ratelimits/read"),
+    "grok": ("grok:local-billing-log",),
+    "antigravity": ("codexbar:antigravity", "antigravity:language-server",
+                    "antigravity:cli-usage", "antigravity:statusline"),
+}
+_QUOTA_COLUMNS = ("id,ts_utc,five_hour,weekly,fable_weekly,source,windows_json,"
+                  "main_window_id,login_method,manual_resets_json")
+_HAS_QUOTA = ("five_hour IS NOT NULL OR weekly IS NOT NULL OR fable_weekly IS NOT NULL "
+              "OR windows_json NOT IN ('[]', '')")
+_HAS_MANUAL_RESETS = ("CASE WHEN json_valid(manual_resets_json) "
+                      "THEN json_extract(manual_resets_json, '$.state') "
+                      "END NOT IN ('unknown', '', 0)")
 
 
 class Database:
@@ -48,6 +62,8 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version >= SCHEMA_VERSION:
+                return
             if version < 1:
                 self._create_v1()
                 version = 1
@@ -82,6 +98,15 @@ class Database:
                 columns = {row[1] for row in self._conn.execute("PRAGMA table_info(quota_samples)")}
                 if "profile_key" not in columns:
                     self._conn.execute("ALTER TABLE quota_samples ADD COLUMN profile_key TEXT NOT NULL DEFAULT ''")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quota_source_profile_ts "
+                "ON quota_samples(LOWER(source),profile_key,ts_utc DESC,id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quota_manual_source_profile_ts "
+                "ON quota_samples(LOWER(source),profile_key,ts_utc DESC,id DESC) "
+                "WHERE " + _HAS_MANUAL_RESETS
+            )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.commit()
             self._log.info("База готова, версия схемы %s", SCHEMA_VERSION)
@@ -196,7 +221,8 @@ class Database:
         if not isinstance(payload, dict):
             payload = {}
         items: list[ManualResetItem] = []
-        for item in payload.get("items") or []:
+        stored_items = payload.get("items")
+        for item in stored_items if isinstance(stored_items, list) else ():
             if not isinstance(item, dict):
                 continue
             items.append(ManualResetItem(
@@ -269,50 +295,81 @@ class Database:
             )
             self._conn.commit(); return True
 
-    def quota_samples(self, start_utc: dt.datetime | None = None, end_utc: dt.datetime | None = None, provider: str | None = None) -> list[dict[str, Any]]:
+    @staticmethod
+    def _quota_source_filter(provider: str | None, source: str | None = None) -> tuple[list[str], list[str]]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if provider:
+            key = provider.casefold()
+            if key in _QUOTA_SOURCES:
+                clauses.append("profile_key = ?")
+                params.append(provider_config_key(key))
+            if key == "cursor" and source is None:
+                clauses.append("(LOWER(source) = ? OR LOWER(source) LIKE ?)")
+                params.extend(("codexbar:cursor", "cursor:%"))
+            else:
+                sources = (source.casefold(),) if source else _QUOTA_SOURCES.get(key, (f"codexbar:{key}",))
+                placeholders = ", ".join("?" for _ in sources)
+                clauses.append(f"LOWER(source) IN ({placeholders})")
+                params.extend(sources)
+        return clauses, params
+
+    def _decode_quota_row(self, raw: sqlite3.Row, provider: str) -> dict[str, Any]:
+        row = dict(raw)
+        row.pop("id", None)
+        row["windows"] = self._decode_windows(row["windows_json"])
+        row["manual_resets"] = self._decode_manual_resets(row["manual_resets_json"], provider)
+        return row
+
+    def quota_samples(self, start_utc: dt.datetime | None = None, end_utc: dt.datetime | None = None,
+                      provider: str | None = None) -> list[dict[str, Any]]:
+        clauses, params = self._quota_source_filter(provider)
+        for column, stamp in (("ts_utc >= ?", start_utc), ("ts_utc <= ?", end_utc)):
+            if stamp is not None:
+                clauses.append(column)
+                params.append(stamp.astimezone(dt.timezone.utc).isoformat())
+        query = f"SELECT {_QUOTA_COLUMNS} FROM quota_samples"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         with self._lock:
-            query="SELECT ts_utc,five_hour,weekly,fable_weekly,source,windows_json,main_window_id,login_method,manual_resets_json FROM quota_samples"; params=[]; clauses=[]
-            if provider:
-                provider_key = provider.casefold()
-                if provider_key in ("claude", "codex", "grok", "antigravity"):
-                    clauses.append("profile_key = ?")
-                    params.append(provider_config_key(provider_key))
-                if provider_key == "cursor":
-                    clauses.append("(LOWER(source) = ? OR LOWER(source) LIKE ?)")
-                    params.extend(["codexbar:cursor", "cursor:%"])
-                elif provider_key == "grok":
-                    # Current Grok Build source; preserve legacy Grok rows only for history.
-                    clauses.append("LOWER(source) = ?")
-                    params.append("grok:local-billing-log")
-                elif provider_key == "claude":
-                    # Keep historical rows for analytics; cache chooses new source only.
-                    clauses.append("LOWER(source) IN (?, ?, ?)")
-                    params.extend([
-                        "codexbar:claude", "claude-code:statusline",
-                        "claude-code:official-mod",
-                    ])
-                elif provider_key == "codex":
-                    # Native Codex app-server samples are first-class cache/history.
-                    clauses.append("LOWER(source) IN (?, ?)")
-                    params.extend([
-                        "codexbar:codex",
-                        "codex-app-server:account/ratelimits/read",
-                    ])
-                elif provider_key == "antigravity":
-                    # Legacy samples are retained for historical comparisons.
-                    clauses.append("LOWER(source) IN (?, ?, ?, ?)")
-                    params.extend(["codexbar:antigravity", "antigravity:language-server", "antigravity:cli-usage", "antigravity:statusline"])
-                else:
-                    clauses.append("LOWER(source) = ?")
-                    params.append(f"codexbar:{provider_key}")
-            if start_utc is not None: clauses.append("ts_utc >= ?"); params.append(start_utc.astimezone(dt.timezone.utc).isoformat())
-            if end_utc is not None: clauses.append("ts_utc <= ?"); params.append(end_utc.astimezone(dt.timezone.utc).isoformat())
-            if clauses: query += " WHERE " + " AND ".join(clauses)
-            query += " ORDER BY ts_utc ASC"
-            rows=[]
-            for raw in self._conn.execute(query,params).fetchall():
-                row=dict(raw); row["windows"]=self._decode_windows(row.get("windows_json")); row["manual_resets"]=self._decode_manual_resets(row.get("manual_resets_json"), provider or ""); rows.append(row)
-            return rows
+            rows = self._conn.execute(query + " ORDER BY ts_utc, id", params).fetchall()
+        return [self._decode_quota_row(row, provider or "") for row in rows]
+
+    def latest_quota_rows(self, provider: str, *, source: str | None = None,
+                          include_manual: bool = True) -> tuple[dict | None, dict | None]:
+        """Читает последние пригодные квоты и сбросы независимо, без загрузки истории."""
+        key = provider.casefold()
+        sources = ((source,) if source else _QUOTA_SOURCES.get(key, (None,)))
+        quota = manual = None
+        quota_order = manual_order = None
+        with self._lock:
+            for provider_source in sources:
+                clauses, params = self._quota_source_filter(provider, provider_source)
+                where = " AND ".join(clauses)
+                query = f"SELECT {_QUOTA_COLUMNS} FROM quota_samples WHERE {where}"
+                order = " ORDER BY ts_utc DESC, id DESC"
+                for predicate, for_manual in ((_HAS_QUOTA, False), (_HAS_MANUAL_RESETS, True)):
+                    if for_manual and not include_manual:
+                        continue
+                    cursor = self._conn.execute(f"{query} AND ({predicate}){order}", params)
+                    try:
+                        for raw in cursor:
+                            recency = (raw["ts_utc"], raw["id"])
+                            previous = manual_order if for_manual else quota_order
+                            if previous is not None and recency <= previous:
+                                break
+                            row = self._decode_quota_row(raw, provider)
+                            if for_manual:
+                                if row["manual_resets"].state != "unknown":
+                                    manual, manual_order = row, recency
+                                    break
+                            elif (any(row[field] is not None for field in ("five_hour", "weekly", "fable_weekly"))
+                                  or any(w.used_percent is not None and not w.informational for w in row["windows"])):
+                                quota, quota_order = row, recency
+                                break
+                    finally:
+                        cursor.close()
+        return quota, manual
 
     # ------------------------------------------------------------------ #
     # Правила тредов

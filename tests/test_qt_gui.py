@@ -48,6 +48,16 @@ def test_analytics_refresh_preserves_expansion_sort_selection_and_filter(tmp_pat
     assert window.threads_table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "s1"
     assert window.threads_table.horizontalHeader().sortIndicatorSection() == 0
     assert window.threads_table.selectionModel().selectedRows()
+    assert window.cards["weekly"].value.text() == "12%"
+
+    monkeypatch.setattr(window, "_cached_quota", lambda provider: QuotaSnapshot(
+        provider=provider, weekly=13 if provider == "codex" else 12,
+    ))
+    recalculations = []
+    monkeypatch.setattr(window, "_apply_quota_to_result", recalculations.append)
+    window.reload_cached_quotas()
+    assert recalculations == []
+    assert window._quota_cache["codex"].weekly == 13
     window.close(); db.close(); qapp.processEvents()
 
 

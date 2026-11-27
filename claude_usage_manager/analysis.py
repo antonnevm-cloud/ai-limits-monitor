@@ -110,72 +110,78 @@ def scan_logs(
         except OSError:
             continue
 
-        selected: list[str] = []
         relative = source.relative_to(scan_projects)
         fallback_id = source.stem
-        try:
-            with source.open("r", encoding="utf-8", errors="replace") as stream:
-                for line in stream:
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
+        staged = None
+        with contextlib.ExitStack() as files:
+            try:
+                stream = files.enter_context(source.open("r", encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            while True:
+                try:
+                    line = stream.readline()
+                except OSError:
+                    break
+                if not line:
+                    break
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                session_id = item.get("sessionId") or fallback_id
+                if not isinstance(session_id, str):
+                    session_id = fallback_id
+
+                info = metadata.setdefault(session_id, {
+                    "custom_titles": [], "first_prompt": None,
+                    "period_prompt": None, "cwd": None,
+                })
+                if not info["cwd"] and isinstance(item.get("cwd"), str):
+                    info["cwd"] = item["cwd"]
+
+                title = item.get("customTitle")
+                if isinstance(title, str) and title.strip():
+                    info["custom_titles"].append(title.strip())
+
+                timestamp = parse_iso(item.get("timestamp"))
+                in_range = bool(timestamp and start_utc <= timestamp <= end_utc)
+
+                if item.get("type") == "user" and isinstance(item.get("message"), dict):
+                    prompt = clean_prompt(content_text(item["message"].get("content")))
+                    if meaningful_prompt(prompt):
+                        if not info["first_prompt"]:
+                            info["first_prompt"] = prompt
+                        if in_range and not info["period_prompt"]:
+                            info["period_prompt"] = prompt
+
+                if item.get("type") == "assistant" and in_range:
+                    message = item.get("message")
+                    if (not isinstance(message, dict) or not isinstance(message.get("usage"), dict)
+                            or message.get("model") == "<synthetic>" or item.get("isApiErrorMessage")):
                         continue
-                    if not isinstance(item, dict):
+                    if not _collect_event(events, seen_messages, session_id, timestamp, message):
                         continue
-                    session_id = item.get("sessionId") or fallback_id
-                    if not isinstance(session_id, str):
-                        session_id = fallback_id
-
-                    info = metadata.setdefault(session_id, {
-                        "custom_titles": [], "first_prompt": None,
-                        "period_prompt": None, "cwd": None,
-                    })
-                    if not info["cwd"] and isinstance(item.get("cwd"), str):
-                        info["cwd"] = item["cwd"]
-
-                    title = item.get("customTitle")
-                    if isinstance(title, str) and title.strip():
-                        info["custom_titles"].append(title.strip())
-
-                    timestamp = parse_iso(item.get("timestamp"))
-                    in_range = bool(timestamp and start_utc <= timestamp <= end_utc)
-
-                    if item.get("type") == "user" and isinstance(item.get("message"), dict):
-                        prompt = clean_prompt(content_text(item["message"].get("content")))
-                        if meaningful_prompt(prompt):
-                            if not info["first_prompt"]:
-                                info["first_prompt"] = prompt
-                            if in_range and not info["period_prompt"]:
-                                info["period_prompt"] = prompt
-
-                    if item.get("type") == "assistant" and in_range:
-                        message = item.get("message")
-                        if (not isinstance(message, dict) or not isinstance(message.get("usage"), dict)
-                                or message.get("model") == "<synthetic>" or item.get("isApiErrorMessage")):
-                            continue
-                        accepted = _collect_event(
-                            events, seen_messages, session_id, timestamp, message
-                        )
-                        if accepted:
-                            events[-1]["project_path"] = relative.parent.as_posix()
-                            if "subagents" in relative.parts[:-1]:
-                                events[-1]["source_session"] = source.stem
-                            if temp_root is not None:
-                                selected.append(line)
-        except OSError:
-            continue
-
-        if selected and temp_root is not None:
-            if len(relative.parts) > 1:
-                original_project = relative.parts[0]
-                alias = _project_alias(original_project, project_aliases)
-                target = temp_root / "projects" / alias / pathlib.Path(*relative.parts[1:])
-            else:
-                target = temp_root / "projects" / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("".join(selected), encoding="utf-8")
+                    events[-1]["project_path"] = relative.parent.as_posix()
+                    if "subagents" in relative.parts[:-1]:
+                        events[-1]["source_session"] = source.stem
+                    if temp_root is not None:
+                        if staged is None:
+                            target = _staged_log_path(temp_root, relative, project_aliases)
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            staged = files.enter_context(target.open("w", encoding="utf-8"))
+                        staged.write(line)
 
     return metadata, events, project_aliases
+
+
+def _staged_log_path(temp_root: pathlib.Path, relative: pathlib.Path, aliases: dict[str, str]) -> pathlib.Path:
+    if len(relative.parts) > 1:
+        alias = _project_alias(relative.parts[0], aliases)
+        return temp_root / "projects" / alias / pathlib.Path(*relative.parts[1:])
+    return temp_root / "projects" / relative
 
 
 def _collect_event(

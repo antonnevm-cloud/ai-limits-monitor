@@ -1,6 +1,7 @@
 import datetime as dt
 import json
 import os
+from threading import Event
 from dataclasses import replace
 
 import pytest
@@ -1278,14 +1279,90 @@ def forecast_window(tmp_path, name="forecast.db"):
     w.data = MonitorData(states, w.rows, compact, selected)
     w.cache_threads = {"claude": many(2)}
     w._spend = {"claude": {"t0": ThreadSpend(3.4, 10, 0, 2.1, 0.74), "t1": ThreadSpend(1.0, 5, 0, 0.6, 0.12)}}
+    w._render()
     w.show()
     w.toggle_cache_provider("claude")
     app.processEvents()
     return app, db, w
 
 
+def wait_for(condition, timeout=2000):
+    for _ in range(timeout // 10):
+        if condition():
+            return
+        QTest.qWait(10)
+    assert condition()
+
+
+def test_large_thread_list_keeps_visible_rows_and_keyboard_focus(tmp_path):
+    app, db, w = window(tmp_path)
+    w.cache_threads = {"claude": many(150), "codex": many(3, "codex")}
+    w.show()
+    w.toggle_cache_provider("claude")
+    w.toggle_cache_provider("codex")
+    app.processEvents()
+    block = w.cache_blocks["claude"]
+    first_rows = block.rows[:]
+    neighbor_rows = w.cache_blocks["codex"].rows[:]
+    link = block.link
+    link.setFocus()
+    QTest.keyClick(link, Qt.Key.Key_Space)
+    assert 3 < len(block.rows) < 150
+    assert block.rows[:3] == first_rows and link.hasFocus()
+    wait_for(lambda: len(block.rows) == 150)
+    assert block.thread_keys == [f"t{i}" for i in range(150)]
+    assert block._scroll.verticalScrollBar().maximum() > 0
+    assert w.height() <= w.screen().availableGeometry().height()
+    assert w.cache_blocks["codex"].rows == neighbor_rows
+
+    QTest.keyClick(link, Qt.Key.Key_Return)
+    assert block.rows == first_rows and link.hasFocus()
+    QTest.keyClick(link, Qt.Key.Key_Space)
+    QTest.keyClick(link, Qt.Key.Key_Return)
+    QTest.qWait(80)
+    assert block.rows == first_rows and link.hasFocus()
+    close(app, db, w)
+
+
+def test_disclosure_remains_usable_while_forecast_history_is_loading(tmp_path, monkeypatch):
+    app, db, w = window(tmp_path)
+    states = week_states()
+    compact, selected = build_compact_rows(db, states)
+    w.data = MonitorData(states, build_rows(states), compact, selected)
+    w._render()
+    w.show()
+    w.activateWindow()
+    app.processEvents()
+    started, release = Event(), Event()
+    original = db.quota_samples
+
+    def load_samples(**kwargs):
+        started.set()
+        if not release.wait(3):
+            raise RuntimeError("Загрузка истории не была разблокирована")
+        return original(**kwargs)
+
+    monkeypatch.setattr(db, "quota_samples", load_samples)
+    disclosure = w.header_rows["claude"].disclosure
+    try:
+        QTest.mouseClick(disclosure, Qt.MouseButton.LeftButton)
+        assert started.wait(1)
+        assert w.forecast_bars["claude"].forecast.method == "average"
+        assert "claude" in w._forecast_workers and "claude" not in w._forecasts
+        disclosure.setFocus()
+        QTest.keyClick(disclosure, Qt.Key.Key_Space)
+        assert "claude" not in w.cache_blocks and disclosure.hasFocus()
+    finally:
+        release.set()
+    wait_for(lambda: "claude" in w._forecasts)
+    assert "claude" not in w.forecast_bars
+    close(app, db, w)
+
+
 def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_path):
     app, db, w = forecast_window(tmp_path, "weighted.db")
+    bar = w.forecast_bars["claude"]
+    wait_for(lambda: "claude" in w._forecasts)
     window = w.weekly_of("claude")
     start = window.resets_at.astimezone(dt.timezone.utc) - dt.timedelta(days=7)
     for hours, used in ((24, 10), (72, 20), (95, 70)):
@@ -1295,11 +1372,12 @@ def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_p
             ((start + dt.timedelta(hours=hours)).isoformat(), used, "claude-code:official-mod", db._windows_json(snapshot)),
         )
     db._conn.commit()
-    assert w._forecast_for("claude").method == "average"  # замеры прочитаны до вставки и держатся FORECAST_SAMPLES_TTL
-    w._forecast_samples.clear()
-    forecast = w._forecast_for("claude")
-    assert forecast.method == "weighted" and forecast.rate_per_day > 17.5  # последние часы быстрее среднего
+    assert bar.forecast.method == "average"
+    w._forecasts.clear()
     w._refresh_forecasts()
+    wait_for(lambda: bar.forecast.method == "weighted")
+    forecast = bar.forecast
+    assert forecast.method == "weighted" and forecast.rate_per_day > 17.5  # последние часы быстрее среднего
     assert "открыть расход за неделю по проектам" in w.forecast_bars["claude"].toolTip()
     QTest.mouseClick(w.forecast_bars["claude"].chart_button, Qt.MouseButton.LeftButton)
     app.processEvents()
@@ -1309,6 +1387,7 @@ def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_p
 def test_expanded_card_has_forecast_and_spend_and_the_popup_follows_the_chart_mode(tmp_path):
     app, db, w = forecast_window(tmp_path)
     bar = w.forecast_bars["claude"]
+    wait_for(lambda: "claude" in w._forecasts)
     assert isinstance(bar, ForecastBar) and "кончится" in bar.end_label.text()
     assert "открыть расход за неделю по проектам" in bar.toolTip()
     assert not hasattr(bar, "status") and not hasattr(bar, "start_label")  # строки над полосой и дня начала недели нет
@@ -1324,7 +1403,7 @@ def test_expanded_card_has_forecast_and_spend_and_the_popup_follows_the_chart_mo
     QTest.qWait(350)
     assert w.forecast_popup is None
 
-    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=center_in_window(w, bar))
     app.processEvents()
     popup = w.forecast_popup
     assert popup.isVisible() and button.isChecked()

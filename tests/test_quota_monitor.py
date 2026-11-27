@@ -324,7 +324,7 @@ def test_cached_snapshot_skips_antigravity_offline_placeholder(tmp_path):
     assert not state.live
     assert state.snapshot.main_window_id=="ag-group:gemini:weekly"
     assert selected=="ag-group:gemini:weekly"
-    assert compact[-1].short.remaining==96
+    assert compact[-1].short is None and compact[-1].long.remaining==96
     db.close()
 
 def test_cached_antigravity_reset_stays_factual():
@@ -337,30 +337,33 @@ def test_cached_antigravity_reset_stays_factual():
     assert normalize_cached_reset(reset,"codex",False,updated,now)==reset
 
 
-def test_antigravity_compact_shows_both_weekly_groups(tmp_path):
+def test_antigravity_compact_shows_both_windows_of_the_fixed_group(tmp_path):
     db=Database(tmp_path/"q.db")
+    db.set_setting("monitor_ag_mode", "fixed")
+    db.set_setting("monitor_ag_fixed_model", "ag-group:gemini:weekly")
+    short_reset_at=dt.datetime(2026,8,13,15,6,tzinfo=dt.timezone.utc)
     gemini_reset=dt.datetime(2026,8,15,20,21,tzinfo=dt.timezone.utc)
     other_reset=dt.datetime(2026,8,20,14,59,tzinfo=dt.timezone.utc)
     state=ProviderState("antigravity",snap("antigravity",[
         QuotaWindow("ag-group:gemini:weekly","Gemini Models",4.12,resets_at=gemini_reset,window_minutes=10080,role="group"),
-        QuotaWindow("ag-group:gemini:5h","Gemini Models",1.48,resets_at=dt.datetime(2026,8,13,15,6,tzinfo=dt.timezone.utc),window_minutes=300,role="group"),
+        QuotaWindow("ag-group:gemini:5h","Gemini Models",1.48,resets_at=short_reset_at,window_minutes=300,role="group"),
         QuotaWindow("ag-group:claude-gpt:weekly","Claude and GPT models",12,resets_at=other_reset,window_minutes=10080,role="group"),
     ]),True)
     rows=build_rows({"antigravity":state})["antigravity"]
     assert [row.name for row in rows]==["Gemini Models","Claude and GPT models"]
     compact,selected=build_compact_rows(db,{"antigravity":state})
     row=compact[-1]
-    assert selected==""
-    assert row.short.label=="Gemini Models"
-    assert row.short.remaining==95.88
-    assert row.short.resets_at==gemini_reset
-    assert row.long.label=="Claude and GPT models"
-    assert row.long.remaining==88
-    assert row.long.resets_at==other_reset
+    assert selected=="ag-group:gemini:weekly"
+    assert row.short.label=="5 ч"
+    assert row.short.remaining==98.52
+    assert row.short.resets_at==short_reset_at
+    assert row.long.label=="Неделя"
+    assert row.long.remaining==95.88
+    assert row.long.resets_at==gemini_reset
     db.close()
 
 
-def test_grouped_antigravity_compact_ignores_old_single_group_setting(tmp_path):
+def test_antigravity_compact_chooses_lowest_weekly_remaining_in_auto_mode(tmp_path):
     db=Database(tmp_path/"q.db")
     db.set_setting("monitor_ag_mode","most_consumed")
     state=ProviderState("antigravity",snap("antigravity",[
@@ -369,12 +372,59 @@ def test_grouped_antigravity_compact_ignores_old_single_group_setting(tmp_path):
     ]),True)
     compact,selected=build_compact_rows(db,{"antigravity":state})
     row=compact[-1]
-    assert selected==""
-    assert row.short.label=="Gemini Models"
-    assert row.short.remaining==96
-    assert row.long.label=="Claude and GPT models"
+    assert selected=="ag-group:claude-gpt:weekly"
+    assert row.short is None
+    assert row.long.label=="Неделя"
     assert row.long.remaining==88
     db.close()
+
+def test_antigravity_group_setting_keeps_a_short_only_group_and_the_old_model_setting(tmp_path, monkeypatch):
+    from claude_usage_manager.quota_monitor import SettingsDialog
+
+    app = qapp()
+    db = Database(tmp_path / 'antigravity-settings.db')
+    db.set_setting('monitor_ag_mode', 'fixed')
+    db.set_setting('monitor_ag_fixed_model', 'model-b')
+    now = dt.datetime.now(dt.timezone.utc)
+    states = _four_agents(now, now + dt.timedelta(hours=2))
+    windows = states['antigravity'].snapshot.windows
+    windows[0] = QuotaWindow('ag-group:gemini:5h', 'Gemini Models', 12, window_minutes=300, role='group')
+    window = _countdown_window(app, db, states)
+
+    def save_group(dialog):
+        assert dialog.fixed.currentData() == ''
+        dialog.fixed.setCurrentIndex(dialog.fixed.findData('ag-group:gemini'))
+        dialog.accept()
+        return dialog.result()
+
+    def save_while_group_is_unavailable(dialog):
+        assert dialog.fixed.currentData() == 'ag-group:gemini'
+        dialog.accept()
+        return dialog.result()
+
+    try:
+        assert window.header_rows['antigravity'].summary_text == 'нед 80%'
+        monkeypatch.setattr(SettingsDialog, 'exec', save_group)
+        window.open_settings()
+        assert window.header_rows['antigravity'].summary_text == '5 ч 88%'
+        assert db.get_setting('monitor_ag_fixed_group') == 'ag-group:gemini'
+        assert db.get_setting('monitor_ag_mode') == 'fixed'
+        assert db.get_setting('monitor_ag_fixed_model') == 'model-b'
+
+        gemini = windows.pop(0)
+        window.data.rows = build_rows(states)
+        monkeypatch.setattr(SettingsDialog, 'exec', save_while_group_is_unavailable)
+        window.open_settings()
+        assert window.header_rows['antigravity'].summary_text == 'нед 80%'
+        assert db.get_setting('monitor_ag_fixed_group') == 'ag-group:gemini'
+
+        windows.insert(0, gemini)
+        _, selected = build_compact_rows(db, states)
+        assert selected == gemini.id
+    finally:
+        window.quit_monitor()
+        app.processEvents()
+        db.close()
 
 def test_compact_window_defaults_and_settings(tmp_path):
     app=qapp();db=Database(tmp_path/"ui.db");db.set_setting("monitor_refresh_seconds","120");db.set_setting("monitor_always_on_top","1");db.set_setting("monitor_opacity","20");db.set_setting("monitor_compact_visibility",'{"compact:claude": false}')
@@ -525,10 +575,10 @@ def test_compact_ui_shows_agent_cards_by_name_like_the_mockup(tmp_path):
     assert by_provider["claude"].summary_text=="5 ч 97% · нед 56%"
     assert by_provider["codex"].summary_text=="нед 8%/2"
     assert by_provider["grok"].summary_text=="нед 49%"
-    assert by_provider["antigravity"].summary_text=="Gemini 100% · Claude/GPT 80%"
-    assert "Gemini" in by_provider["antigravity"].quota_columns.headlines[0].text()
-    assert "Claude/GPT" in by_provider["antigravity"].quota_columns.headlines[1].text()
-    assert "Gemini Models" in by_provider["antigravity"].quota_columns.toolTip()
+    assert by_provider["antigravity"].summary_text=="нед 80%"
+    assert "нед" in by_provider["antigravity"].quota_columns.headlines[0].text()
+    assert by_provider["antigravity"].quota_columns.headlines[1].isHidden()
+    assert "Claude and GPT models" in by_provider["antigravity"].quota_columns.toolTip()
     assert all(row.icon.pixmap() is not None and row.icon.width()==18 for row in rows)
     assert by_provider["grok"].row.long.window_id=="grok:weekly"
     assert "сброс" in by_provider["claude"].quota_columns.toolTip()
@@ -734,16 +784,17 @@ def test_header_countdown_follows_font_delta_suffix_and_groups(tmp_path):
     columns = codex_row.quota_columns
     assert codex_row.summary_text=="нед 58%/2" and ">58%/2<" in columns.headlines[0].text()
     assert columns.countdowns[0].text() == "3д 8ч"
-    # Antigravity: под каждой группой свой срок
+    # Antigravity: под каждым периодом выбранной группы свой срок
     ag_state=ProviderState("antigravity",snap("antigravity",[
         QuotaWindow("ag-group:gemini:weekly","Gemini Models",0,resets_at=now+dt.timedelta(days=1,minutes=5),window_minutes=10080,role="group"),
+        QuotaWindow("ag-group:claude-gpt:5h","Claude and GPT models",22,resets_at=now+dt.timedelta(hours=4),window_minutes=300,role="group"),
         QuotaWindow("ag-group:claude-gpt:weekly","Claude and GPT models",20,resets_at=now+dt.timedelta(days=6,hours=23,minutes=59),window_minutes=10080,role="group"),
     ]),True)
     compact,_=build_compact_rows(db,{"antigravity":ag_state})
     ag_row=CompactRow(compact[0],ag_state,now=now)
     columns = ag_row.quota_columns
-    assert ag_row.summary_text=="Gemini 100% · Claude/GPT 80%"
-    assert [label.text() for label in columns.countdowns] == ["1д 0ч", "6д 23ч"]
+    assert ag_row.summary_text=="5 ч 78% · нед 80%"
+    assert [label.text() for label in columns.countdowns] == ["4ч 0м", "6д 23ч"]
     db.close()
 
 
@@ -802,7 +853,7 @@ def test_antigravity_quota_details_follow_refresh_in_the_316_widget(tmp_path, fo
     db = Database(tmp_path / 'antigravity-details.db')
     db.set_setting('monitor_width', '316')
     db.set_setting('monitor_thread_view', json.dumps({'font': f'+{font_delta}' if font_delta else '0'}))
-    db.set_setting('monitor_ag_mode', 'most_consumed')
+    db.set_setting('monitor_ag_fixed_group', 'ag-group:gemini')
     now = dt.datetime.now(dt.timezone.utc)
     states = _four_agents(now, now + dt.timedelta(hours=2))
     reset = now + dt.timedelta(hours=3)
@@ -811,6 +862,15 @@ def test_antigravity_quota_details_follow_refresh_in_the_316_widget(tmp_path, fo
     windows.append(QuotaWindow('ag-group:gemini:5h', 'Gemini Models', 28, reset, 300, 'group'))
     w = _countdown_window(app, db, states)
     try:
+        header = w.header_rows['antigravity']
+        claude = w.header_rows['claude']
+        assert w.width() == 316
+        assert header.summary_text == '5 ч 72% · нед 100%'
+        assert header.height() == claude.height()
+        assert header.quota_columns.height() == claude.quota_columns.height()
+        assert all('<br>' not in label.text() for label in header.quota_columns.headlines)
+        if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
+            assert w.grab().save(str(pathlib.Path(out) / f'antigravity-{font_delta}-closed.png'))
         button = w.header_rows['antigravity'].disclosure
         button.setFocus()
         QTest.keyClick(button, Qt.Key.Key_Return)
@@ -840,7 +900,7 @@ def test_antigravity_quota_details_follow_refresh_in_the_316_widget(tmp_path, fo
         windows[:] = [QuotaWindow('ag-group:custom:weekly', 'Новая группа', 24, window_minutes=10080, role='group')]
         refresh()
         assert {'Новая группа', '76%'} <= set(contents())
-        assert w.header_rows['antigravity'].summary_text == '76%'
+        assert w.header_rows['antigravity'].summary_text == 'нед 76%'
         windows[:] = [QuotaWindow('model-a', 'Gemini Pro', 17, role='model'),
                       QuotaWindow('model-b', 'Gemini Flash', 2, role='model')]
         refresh()

@@ -47,15 +47,21 @@ def test_unified_monitor_reuses_one_analytics_window(tmp_path, monkeypatch):
     class FakeAnalytics:
         def __init__(self, incoming_db):
             assert incoming_db is db
+            self.visible = False
             calls["created"] += 1
 
         def open_and_refresh(self):
+            self.visible = True
             calls["opened"] += 1
+
+        def isVisible(self):
+            return self.visible
 
         def reload_cached_quotas(self):
             calls["reloaded"] += 1
 
         def close(self):
+            self.visible = False
             calls["closed"] += 1
 
     monkeypatch.setattr(unified_monitor, "IntegratedAnalyticsWindow", FakeAnalytics)
@@ -74,9 +80,19 @@ def test_unified_monitor_reuses_one_analytics_window(tmp_path, monkeypatch):
     window._done(window.data)
     assert calls["reloaded"] == 1
 
+    first.close()
+    window._done(window.data)
+    assert calls["reloaded"] == 1
+
+    window.open_detail()
+    assert window._analytics_window is first
+    assert calls["opened"] == 3
+    window._done(window.data)
+    assert calls["reloaded"] == 2
+
     window.quit_monitor()
     app.processEvents()
-    assert calls["closed"] == 1
+    assert calls["closed"] == 2
     db.close()
 
 
@@ -195,6 +211,37 @@ def test_unchanged_limits_do_not_rebuild_details_on_each_poll(tmp_path):
     window._done(window.data)
     assert details.calls == 1
     window.quit_monitor(); app.processEvents(); db.close()
+
+
+def test_quit_waits_for_usage_and_forecast_across_multiple_polls(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    callbacks = []
+    exits = []
+
+    class Timer:
+        @staticmethod
+        def singleShot(delay, callback):
+            assert delay == 50
+            callbacks.append(callback)
+
+    monkeypatch.setattr(unified_monitor, "QTimer", Timer)
+    monkeypatch.setattr(app, "quit", lambda: exits.append(True))
+    window._usage_worker = object()
+    window._forecast_workers["claude"] = object()
+    try:
+        window._finish_quit()
+        callbacks.pop(0)()
+        window._usage_worker = None
+        callbacks.pop(0)()
+        assert not exits
+        window._forecast_workers.clear()
+        callbacks.pop(0)()
+        assert exits == [True] and not callbacks
+    finally:
+        stop_window(window)
+        db.close()
 
 
 def test_monitor_entry_point_uses_unified_process():

@@ -574,9 +574,9 @@ def _quota_drop_kind(previous: float, value: float) -> str:
 
 
 def _stored_quota_series(
-    db: Database, provider: str, window_id: str, start_ms: int, end_ms: int,
-) -> tuple[str, list[tuple[int, float]]]:
-    series: dict[str, list[tuple[int, float]]] = {}
+    db: Database, provider: str, window_ids: set[str], start_ms: int, end_ms: int,
+) -> dict[str, tuple[str, list[tuple[int, float]]]]:
+    by_window: dict[str, dict[str, list[tuple[int, float]]]] = {}
     for row in db.quota_samples(provider=provider):
         ts = parse_iso(row.get("ts_utc"))
         if ts is None:
@@ -584,14 +584,17 @@ def _stored_quota_series(
         stamp = int(ts.timestamp() * 1000)
         if stamp > end_ms:
             continue
-        value = next((w.used_percent for w in row.get("windows") or [] if w.id == window_id), None)
-        if value is None:
-            value = _legacy_window_value(row, provider, window_id)
-        if value is not None:
-            source = str(row.get("source") or "").casefold() if provider == "claude" else ""
-            series.setdefault(source, []).append((stamp, float(value)))
-    if not series:
-        return "", []
+        values = {}
+        for window in row.get("windows") or []:
+            if window.id in window_ids:
+                values.setdefault(window.id, window.used_percent)
+        source = str(row.get("source") or "").casefold() if provider == "claude" else ""
+        for window_id in window_ids:
+            value = values.get(window_id)
+            if value is None:
+                value = _legacy_window_value(row, provider, window_id)
+            if value is not None:
+                by_window.setdefault(window_id, {}).setdefault(source, []).append((stamp, float(value)))
 
     def coverage(item: tuple[str, list[tuple[int, float]]]) -> tuple[bool, bool, int, int]:
         source, values = item
@@ -601,28 +604,44 @@ def _stored_quota_series(
         priority = {CLAUDE_MOD_SOURCE: 2, CLAUDE_STATUSLINE_SOURCE: 1}.get(source, 0)
         return in_period, has_baseline, priority if in_period else 0, latest
 
-    return max(series.items(), key=coverage)
+    return {window_id: max(series.items(), key=coverage) for window_id, series in by_window.items()}
 
 
-def quota_window_consumed(
-    period: Period, db: Database | None, current_percent: float | None, provider: str, window_id: str,
+def quota_windows_consumed(
+    period: Period, db: Database | None, current_percents: dict[str, float | None], provider: str,
     *, current_source: str | None = None,
+) -> dict[str, float]:
+    """Рассчитывает расход по окнам, один раз читая историю провайдера из базы."""
+    provider = provider.casefold()
+    start_ms = int(period.start_utc.timestamp() * 1000)
+    end_ms = int(period.end_utc.timestamp() * 1000)
+    stored_window_ids = set(current_percents)
+    series = {}
+    if provider == "claude" and "secondary" in stored_window_ids:
+        history = _history_samples()
+        if history and (db is None or any(ts <= start_ms or start_ms < ts <= end_ms for ts, _ in history)):
+            series["secondary"] = CLAUDE_DESKTOP_SOURCE, history
+            stored_window_ids.remove("secondary")
+    if db is not None and stored_window_ids:
+        series.update(_stored_quota_series(db, provider, stored_window_ids, start_ms, end_ms))
+
+    consumed_by_window = {}
+    for window_id, current_percent in current_percents.items():
+        if window_id not in series:
+            continue
+        source, samples = series[window_id]
+        # Снимки разных источников Claude могут расходиться по времени и значениям.
+        if provider == "claude" and current_source is not None and current_source.casefold() != source:
+            current_percent = None
+        consumed = _consume_quota_series(samples, start_ms, end_ms, current_percent)
+        if consumed is not None:
+            consumed_by_window[window_id] = consumed
+    return consumed_by_window
+
+
+def _consume_quota_series(
+    samples: list[tuple[int, float]], start_ms: int, end_ms: int, current_percent: float | None,
 ) -> float | None:
-    provider=provider.casefold(); samples=[]
-    start_ms=int(period.start_utc.timestamp()*1000); end_ms=int(period.end_utc.timestamp()*1000)
-    # Compare observations from one source. Different snapshots of the same
-    # Claude window can arrive out of order and look like an unexplained drop.
-    source = ""
-    history = _history_samples() if provider == "claude" and window_id == "secondary" else []
-    history_covers_period = any(ts <= start_ms for ts, _ in history) or any(
-        start_ms < ts <= end_ms for ts, _ in history
-    )
-    if history and (history_covers_period or db is None):
-        source, samples = CLAUDE_DESKTOP_SOURCE, history
-    elif db is not None:
-        source, samples = _stored_quota_series(db, provider, window_id, start_ms, end_ms)
-    if provider == "claude" and current_source is not None and current_source.casefold() != source:
-        current_percent = None
     if not samples: return None
     merged={ts:value for ts,value in sorted(samples)}; ordered=sorted(merged.items())
     before=[s for s in ordered if s[0] <= start_ms]; inside=[s for s in ordered if start_ms < s[0] <= end_ms]
@@ -656,6 +675,15 @@ def quota_window_consumed(
         consumed += value-previous
     if not baseline_known and not observed: return None
     return max(0.0,consumed)
+
+
+def quota_window_consumed(
+    period: Period, db: Database | None, current_percent: float | None, provider: str, window_id: str,
+    *, current_source: str | None = None,
+) -> float | None:
+    return quota_windows_consumed(
+        period, db, {window_id: current_percent}, provider, current_source=current_source,
+    ).get(window_id)
 
 
 def quota_consumed(period: Period, db: Database | None, current_percent: float | None, provider: str, window_id: str | None = None) -> float | None:

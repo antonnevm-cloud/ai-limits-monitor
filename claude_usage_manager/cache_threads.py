@@ -35,6 +35,7 @@ from urllib.parse import unquote
 
 from . import provider_settings
 from .codex_sessions import record_usage, session_metadata, user_text as _codex_user_text
+from .history_jsonl import CODEX_MODEL_FIELDS, jsonl_records
 from .thread_activity import (
     AliveCheck,
     ClaudeUnreadReader,
@@ -206,7 +207,7 @@ def _read_tail_lines(path: pathlib.Path, size: int) -> list[str]:
         length = stream.tell()
         offset = max(0, length - size)
         stream.seek(offset)
-        data = stream.read()
+        data = stream.read(length - offset)
     lines = data.decode("utf-8", errors="replace").split("\n")
     if offset > 0 and lines:
         lines = lines[1:]
@@ -425,18 +426,8 @@ def _scan_codex_model(path: pathlib.Path, offset: int, model: str) -> tuple[int,
     """
     with path.open("rb") as stream:
         stream.seek(offset)
-        while True:
-            line = stream.readline()
-            if not line or not line.endswith(b"\n"):
-                break
-            offset += len(line)
-            if b'"turn_context"' not in line:
-                continue
-            try:
-                item = json.loads(line)
-            except ValueError:
-                continue
-            payload = item.get("payload") if isinstance(item, dict) and item.get("type") == "turn_context" else None
+        for offset, item in jsonl_records(stream, (b'"turn_context"',), CODEX_MODEL_FIELDS):
+            payload = item.get("payload") if item and item.get("type") == "turn_context" else None
             found = payload.get("model") if isinstance(payload, dict) else None
             if isinstance(found, str) and found:
                 model = found
@@ -858,7 +849,7 @@ class ThreadScanner:
         self._antigravity_dir = antigravity_dir  # в виджете не показывается: без явного каталога базу не читаем
         self._desktop_dirs = desktop_dirs
         self._desktop: DesktopSessionIndex | None = None
-        self._parsed: dict[str, tuple[int, int, CacheThread | None]] = {}
+        self._parsed: dict[str, tuple[tuple[int, int, int, int], CacheThread | None]] = {}
         self._head_meta: dict[str, dict[str, Any]] = {}
         self._codex_models: dict[str, tuple[int, str]] = {}
         self._grok_log: tuple[tuple[int, int], dict[str, dt.datetime]] | None = None
@@ -885,6 +876,9 @@ class ThreadScanner:
             claude = provider_settings.provider_profile("claude") if provider_settings.provider_enabled("claude") else None
             if claude != self._claude_dir:
                 self._desktop = None
+                self._desktop_resolved.clear()
+                self._desktop_sessions.clear()
+                self._claude_paths.clear()
                 self._claude_blocked.clear()
                 self._claude_dir = claude
             self._codex_dir = (provider_settings.provider_profile("codex") / "sessions"
@@ -893,6 +887,8 @@ class ThreadScanner:
             if grok != self._grok_dir:
                 self._grok_dir = grok
                 self._grok_log = None
+                self._grok_meta.clear()
+                self._grok_index.clear()
                 self._grok_events.clear()
         seen: set[str] = set()
         result = {
@@ -901,6 +897,10 @@ class ThreadScanner:
             "grok": self._scan_grok() if self._grok_dir else [],
             "antigravity": self._scan_antigravity() if self._antigravity_dir else [],
         }
+        if not result["claude"]:
+            self._claude_blocked.clear()
+        if not result["grok"]:
+            self._grok_events.clear()
         result["claude"] = self._with_activity("claude", result["claude"], lambda threads: self._claude_activity(threads))
         result["codex"] = self._with_activity("codex", result["codex"], lambda threads: self._codex_activity(threads, now))
         result["grok"] = self._with_activity("grok", result["grok"], lambda threads: self._grok_activity(threads))
@@ -1150,10 +1150,15 @@ class ThreadScanner:
         if horizon is not None and stat.st_mtime < horizon:
             return None
         seen.add(key)
-        signature = (stat.st_mtime_ns, stat.st_size)
+        signature = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
         cached = self._parsed.get(key)
-        if cached and cached[:2] == signature:
-            return cached[2]
+        if cached:
+            previous, thread = cached
+            if previous == signature:
+                return thread
+            if previous[:2] != signature[:2] or signature[3] <= previous[3]:
+                self._head_meta.pop(str(path), None)
+                self._codex_models.pop(str(path), None)
         try:
             thread = loader(path)
         except OSError:
@@ -1162,5 +1167,5 @@ class ThreadScanner:
             # Один испорченный журнал не должен ронять скан остальных (и лог каждые 10 секунд).
             get_logger().warning("Журнал %s пропущен при сканировании кэша тредов", path, exc_info=True)
             thread = None
-        self._parsed[key] = (*signature, thread)
+        self._parsed[key] = (signature, thread)
         return thread

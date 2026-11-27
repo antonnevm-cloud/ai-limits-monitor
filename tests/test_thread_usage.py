@@ -206,3 +206,68 @@ def test_weekly_scanner_changes_profile_without_reusing_former_spend(tmp_path, m
     assert scanner.scan({}, {}, now=stamp).spend("codex", "shared").tokens == 100
     monkeypatch.setattr(provider_settings, "provider_enabled", lambda _: False)
     assert scanner.scan({}, {}, now=stamp).threads == {}
+
+
+def test_large_assistant_record_is_processed_only_after_its_newline(tmp_path, monkeypatch):
+    from claude_usage_manager import history_jsonl
+
+    monkeypatch.setattr(history_jsonl, "CHUNK_BYTES", 64)
+    project = tmp_path / "project"
+    project.mkdir()
+    path = project / "session.jsonl"
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    row = json.loads(claude_line("large", start, USAGE))
+    row["message"] = {
+        "content": [{"text": '"quote" \\ text' * 50}, {"items": [1, {"text": "text" * 100}]}],
+        **row["message"],
+    }
+    serialized = json.dumps(row, ensure_ascii=False)
+    path.write_text(serialized, encoding="utf-8")
+    scanner = UsageScanner(tmp_path, None)
+    assert scanner.scan({"claude": start}, {}).spend("claude", "session") is None
+
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+        stream.write('{"bad": [' + "9" * 300 + '}\n')
+        stream.write(claude_line("normal", start, USAGE))
+    spend = scanner.scan({"claude": start}, {}).spend("claude", "session")
+    assert spend.tokens == 2000
+
+
+def test_replaced_claude_file_removes_retained_usage_and_keeps_subagent_usage(journals):
+    claude, _, start, main, _, _ = journals
+    now = start + dt.timedelta(days=3)
+    scanner = UsageScanner(claude, None)
+    first = scanner.scan({"claude": start}, {}, now).spend("claude", "s1")
+    replacement = main.with_suffix(".tmp")
+    replacement.write_text(claude_line("new", now, USAGE), encoding="utf-8")
+    replacement.replace(main)
+
+    updated = scanner.scan({"claude": start}, {}, now).spend("claude", "s1")
+    assert first.tokens > updated.tokens == 2000  # один основной ответ и один ответ субагента
+    main.unlink()
+    assert scanner.scan({"claude": start}, {}, now).spend("claude", "s1").tokens == 1000
+
+
+def test_codex_period_prunes_previous_usage_and_rewinds_to_earlier_start(tmp_path):
+    import os
+
+    profile = tmp_path / "profile"
+    archived = profile / "archived_sessions"
+    archived.mkdir(parents=True)
+    path = archived / "rollout.jsonl"
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+    recent = start + dt.timedelta(hours=1)
+    path.write_text(codex_lines("session", "gpt-6.1-sol", [
+        ("earlier", recent - dt.timedelta(days=4), {"input_tokens": 100}),
+        ("recent", recent, {"input_tokens": 1000}),
+    ]), encoding="utf-8")
+    os.utime(path, (recent.timestamp(), recent.timestamp()))
+    scanner = UsageScanner(None, profile / "sessions")
+
+    assert scanner.scan({"codex": start}, {}).spend("codex", "session").tokens == 1000
+    assert scanner.scan({"codex": start - dt.timedelta(days=5)}, {}).spend("codex", "session").tokens == 1100
+    assert scanner.scan({"codex": start + dt.timedelta(days=2)}, {}).threads == {}
+    assert not scanner._history["codex"].files
+    assert not scanner._history["codex"].sessions
+    assert scanner.scan({"codex": start}, {}).spend("codex", "session").tokens == 1000

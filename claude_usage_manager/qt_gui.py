@@ -62,7 +62,7 @@ from .periods import PRESETS, build_period, parse_custom
 from .providers import AGENTS, AGENT_LABELS, MultiAgentAnalyzer
 from .qt_chart import TimelineChart
 from .qt_theme import COLORS, build_stylesheet
-from .quota import fetch_quota, quota_consumed, quota_window_consumed, weekly_consumed
+from .quota import fetch_quota, quota_windows_consumed
 from .quota_monitor_model import cached_snapshot
 from .utils import (
     estimate_project_weekly_pp,
@@ -766,27 +766,25 @@ class MainWindow(QMainWindow):
         now_utc = dt.datetime.now(dt.timezone.utc)
         includes_now = result.period.start_utc <= now_utc <= result.period.end_utc
         windows = snapshot.windows
+        current_percents = {window.id: window.used_percent if includes_now else None for window in windows}
         if result.agent == "claude":
-            current = snapshot.weekly if includes_now else None
-            calculated = weekly_consumed(result.period, self.db, current, current_source=snapshot.source)
+            current_percents["secondary"] = snapshot.weekly if includes_now else None
+        elif not windows and snapshot.weekly is not None:
+            current_percents["primary"] = snapshot.weekly if includes_now else None
+        consumed_by_window = quota_windows_consumed(
+            result.period, self.db, current_percents, result.agent, current_source=snapshot.source,
+        )
+        if result.agent == "claude":
+            calculated = consumed_by_window.pop("secondary", None)
             if calculated is not None:
                 result.weekly_consumed_pp = calculated
             if result.weekly_consumed_pp is not None:
                 result.quota_consumed_by_window["secondary"] = result.weekly_consumed_pp
         elif not windows and snapshot.weekly is not None:
-            current = snapshot.weekly if includes_now else None
-            calculated = quota_consumed(result.period, self.db, current, result.agent)
+            calculated = consumed_by_window.pop("primary", None)
             if calculated is not None:
                 result.weekly_consumed_pp = calculated
-        for window in windows:
-            if result.agent == "claude" and window.id == "secondary":
-                continue
-            current = window.used_percent if includes_now else None
-            consumed = quota_window_consumed(
-                result.period, self.db, current, result.agent, window.id, current_source=snapshot.source,
-            )
-            if consumed is not None:
-                result.quota_consumed_by_window[window.id] = consumed
+        result.quota_consumed_by_window.update(consumed_by_window)
         main_id = snapshot.main_window_id
         if result.agent != "claude" and main_id in result.quota_consumed_by_window:
             result.weekly_consumed_pp = result.quota_consumed_by_window[main_id]

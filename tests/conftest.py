@@ -45,8 +45,8 @@ def _app_log_in_session_temp(tmp_path_factory):
 
     Иначе `get_logger()` (его зовут `Database`, сканеры и окна) открывал
     %LOCALAPPDATA%\\ClaudeUsageManager\\app.log работающего виджета, и туда попадали нарочные
-    ошибки тестов с путями `.pytest_tmp` (CLA-8). Журнал настраивается один раз за процесс,
-    поэтому достаточно настроить его первым; файл остается в `.pytest_tmp/app-log0` до следующего прогона.
+    ошибки тестов (CLA-8). Журнал настраивается один раз за процесс.
+    Файл создается в отдельном временном каталоге pytest.
     """
     from claude_usage_manager import utils
 

@@ -36,14 +36,19 @@ class IntegratedAnalyticsWindow(MainWindow):
             provider: self._cached_quota(provider)
             for provider in _QUOTA_PROVIDERS
         }
-        def signature(cache):
-            return tuple((provider, snapshot.source, snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly,
-                          tuple((w.id, w.used_percent, w.resets_at, w.window_minutes, w.role)
-                                for w in snapshot.windows))
-                         for provider, snapshot in sorted(cache.items()))
-        changed = signature(new_cache) != signature(self._quota_cache)
+        def signature(snapshot):
+            if snapshot is None:
+                return None
+            return (snapshot.source, snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly,
+                    tuple((w.id, w.used_percent, w.resets_at, w.window_minutes, w.role)
+                          for w in snapshot.windows))
+
+        previous_cache = self._quota_cache
         self._quota_cache = new_cache
-        if self.result is None or not changed:
+        if self.result is None:
+            return
+        agent = self.result.agent
+        if signature(new_cache.get(agent)) == signature(previous_cache.get(agent)):
             return
         tree = self.overview_tree
         iterator = QTreeWidgetItemIterator(tree)
