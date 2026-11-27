@@ -181,6 +181,34 @@ def test_unknown_model_is_counted_as_unpriced_not_guessed(tmp_path):
     assert not spend.priced
 
 
+def test_fork_copy_of_parent_history_is_counted_once(tmp_path):
+    project = tmp_path / "p"
+    project.mkdir()
+    start = utc(2026, 11, 9)
+    first, second = start + dt.timedelta(hours=1), start + dt.timedelta(hours=2)
+    (project / "parent.jsonl").write_text(claude_line("m1", first, USAGE), encoding="utf-8")
+    # Ответвление начинается с копии истории родителя (тот же message.id) и продолжается своим ответом.
+    (project / "fork.jsonl").write_text(claude_line("m1", first, USAGE) + claude_line("m2", second, USAGE),
+                                        encoding="utf-8")
+    report = UsageScanner(tmp_path, None).scan({"claude": start}, {"claude": 10.0}, now=start + dt.timedelta(days=1))
+    parent, fork = report.spend("claude", "parent"), report.spend("claude", "fork")
+    assert parent.tokens == 1000 and fork.tokens == 1000  # cache#3
+    assert parent.share == pytest.approx(5.0) and fork.share == pytest.approx(5.0)
+
+
+def test_unpriced_thread_does_not_inflate_the_share_of_priced_ones(tmp_path):
+    project = tmp_path / "p"
+    project.mkdir()
+    start = utc(2026, 11, 9)
+    (project / "priced.jsonl").write_text(claude_line("a", start + dt.timedelta(hours=1), USAGE), encoding="utf-8")
+    (project / "other.jsonl").write_text(
+        claude_line("b", start + dt.timedelta(hours=2), USAGE, model="claude-new-9"), encoding="utf-8")
+    report = UsageScanner(tmp_path, None).scan({"claude": start}, {"claude": 10.0}, now=start + dt.timedelta(days=1))
+    # Токены без цены оцениваются по средней цене агента: доля делится поровну, а не 10 к 0 (cache#2).
+    assert report.spend("claude", "priced").share == pytest.approx(5.0)
+    assert report.spend("claude", "other").share == pytest.approx(5.0)
+
+
 def test_missing_directories_give_an_empty_report(tmp_path):
     report = UsageScanner(tmp_path / "нет", tmp_path / "тоже нет").scan({}, {})
     assert report.threads == {} and report.daily == {}

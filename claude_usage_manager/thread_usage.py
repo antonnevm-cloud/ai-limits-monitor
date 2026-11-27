@@ -321,16 +321,22 @@ class UsageScanner:
     def _report(self, starts: dict[str, dt.datetime], weekly_used: dict[str, float], now: dt.datetime) -> UsageReport:
         sums: dict[tuple[str, str], list[float]] = {}
         totals: dict[str, float] = {}
+        priced_tokens: dict[str, int] = {}
         daily: dict[str, dict[str, list[float]]] = {}
         end = now.timestamp()
         for agent, history in self._history.items():
             start = starts[agent].timestamp()
+            owners = _event_owners(history.sessions) if agent == "claude" else {}
             for session_id, session in history.sessions.items():
                 cost = 0.0
                 tokens = unpriced = 0
                 series = None
-                for stamp, price, count in session.events.values():
+                for key, (stamp, price, count) in session.events.items():
                     if stamp < start or stamp > end:
+                        continue
+                    # Ответвление (fork) копирует историю родителя с теми же message.id:
+                    # такой ответ считается один раз, у треда-источника.
+                    if owners.get(key, session_id) != session_id:
                         continue
                     tokens += count
                     if price is None:
@@ -346,11 +352,42 @@ class UsageScanner:
                 if tokens or (session.rewrite is not None and session.last_time >= history.cutoff):
                     sums[(agent, session_id)] = [cost, tokens, unpriced]
                     totals[agent] = totals.get(agent, 0.0) + cost
+                    priced_tokens[agent] = priced_tokens.get(agent, 0) + tokens - unpriced
+        # Доля недели делится по стоимости. Токены моделей без цены оцениваются по средней цене
+        # токена этого агента, иначе их расход доставался бы остальным тредам.
+        rates = {agent: totals[agent] / count for agent, count in priced_tokens.items()
+                 if count > 0 and totals.get(agent, 0.0) > 0}
+
+        def weight(agent: str, cost: float, tokens: float, unpriced: float) -> float:
+            rate = rates.get(agent)
+            # Без единого ответа с ценой долю не угадываем.
+            return cost + unpriced * rate if rate is not None else cost
+
+        weights: dict[str, float] = {}
+        for (agent, _session_id), values in sums.items():
+            weights[agent] = weights.get(agent, 0.0) + weight(agent, *values)
         threads: dict[tuple[str, str], ThreadSpend] = {}
         for (agent, session_id), (cost, tokens, unpriced) in sums.items():
             used = weekly_used.get(agent)
-            total = totals.get(agent, 0.0)
-            share = used * cost / total if used is not None and total > 0 and cost > 0 else None
+            mine = weight(agent, cost, tokens, unpriced)
+            total = weights.get(agent, 0.0)
+            share = used * mine / total if used is not None and total > 0 and mine > 0 else None
             session = self._history[agent].sessions[session_id]
             threads[(agent, session_id)] = ThreadSpend(cost, int(tokens), int(unpriced), share, session.rewrite)
         return UsageReport(threads, daily, totals)
+
+
+def _event_owners(sessions: dict[str, "_Session"]) -> dict[str, str]:
+    """Тред-владелец каждого ответа: самый ранний по первому ответу (родитель раньше ответвления).
+
+    Ответвление начинается с копии истории, поэтому первый ответ у них общий; тогда владельцем
+    считается тред с меньшим числом ответов: ответвление - это история родителя плюс продолжение.
+    """
+    owners: dict[str, str] = {}
+    ordered = sorted(sessions.items(),
+                     key=lambda item: (min((event[0] for event in item[1].events.values()), default=0.0),
+                                       len(item[1].events), item[0]))
+    for session_id, session in ordered:
+        for key in session.events:
+            owners.setdefault(key, session_id)
+    return owners

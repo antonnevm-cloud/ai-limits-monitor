@@ -806,8 +806,11 @@ class MonitorWindow(QMainWindow):
         self.cache_blocks[provider] = block
         return block
     def _fill_cache_block(self,provider,block):
-        threads,hidden,pinned=self._apply_thread_rules(self._shown_threads(provider))
-        return block.set_content(threads,dt.datetime.now(dt.timezone.utc),show_all=bool(self.cache_show_all.get(provider)),view=self.thread_view,pinned=pinned,hidden_count=hidden,spend=self._spend.get(provider))
+        shown=self._shown_threads(provider)
+        threads,hidden,pinned=self._apply_thread_rules(shown)
+        # Пустой список из-за выключенных тредов терминала объясняется, а не выдается за отсутствие кэша.
+        message='Треды Claude Code из терминала скрыты: включи их в панели "Вид тредов".' if not threads and len(shown)<len(self.cache_threads.get(provider,[])) else ''
+        return block.set_content(threads,dt.datetime.now(dt.timezone.utc),show_all=bool(self.cache_show_all.get(provider)),message=message,view=self.thread_view,pinned=pinned,hidden_count=hidden,spend=self._spend.get(provider))
     def _apply_thread_rules(self,threads):
         '''Скрытые треды убираются, закрепленные идут первыми, если включен учет правил.'''
         if not self.thread_view.pin_hide:return threads,0,frozenset()
@@ -1061,6 +1064,8 @@ class MonitorWindow(QMainWindow):
         if getattr(previous_worker, "generation", self._connection_generation) != self._connection_generation:
             self._start_cache_scan()
             return
+        # Скрытие и закрепление из окна аналитики видны в списке без перезапуска виджета.
+        self.thread_rules=self.db.thread_rules()
         self.cache_threads=found;self._refill_cache_blocks();self._update_running()
     @Slot(str)
     def _cache_failed(self,details):

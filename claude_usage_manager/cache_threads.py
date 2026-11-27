@@ -176,9 +176,11 @@ def select_threads(
     треды; с `limit` - первые и число скрытых из-за лимита.
     """
     live = [t for t in threads if not t.cooled(now)]
+    # Тред, который сейчас работает или ждет ответа, не пропадает из списка и счетчика после остывания кэша.
     cooled = [
         t for t in threads
-        if t.cooled(now) and (now - t.expires_at).total_seconds() <= grace
+        if t.cooled(now) and ((now - t.expires_at).total_seconds() <= grace
+                              or getattr(t, "activity", "") in ("working", "needs_reply"))
     ]
     live.sort(key=lambda t: (t.fraction(now), t.expires_at))
     cooled.sort(key=lambda t: t.expires_at, reverse=True)
