@@ -10,6 +10,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import QApplication,QBoxLayout,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QLayout,QLineEdit,QMainWindow,QMenu,QMessageBox,QPushButton,QSizePolicy,QSlider,QStyle,QStyleOptionToolButton,QStylePainter,QSystemTrayIcon,QToolButton,QVBoxLayout,QWidget
 from .antigravity_details_qt import AntigravityDetails
+from .author_credit import author_site_button
 from .database import Database
 from .subscription_payments import next_monthly_payment, parse_last_payment
 from .icon import brand_svg, ensure_icon
@@ -663,6 +664,17 @@ class MonitorWindow(QMainWindow):
         self.footer.setWordWrap(True)
         self.footer.setToolTip('Онлайн: свежие данные. Локальные: данные из истории. Кэш: последний сохраненный снимок. Нет данных: источник и снимок недоступны.')
         layout.addWidget(self.footer)
+
+        author_row = QHBoxLayout()
+        author_row.setContentsMargins(6, 0, 0, 0)
+        author_row.setSpacing(4)
+        author = ElidedLabel("Антон (onetone)")
+        author.setObjectName("WidgetAuthor")
+        author.setAccessibleName("Разработчик Антон (onetone)")
+        author.setToolTip("Разработчик Антон (onetone)")
+        author_row.addWidget(author, 1)
+        author_row.addWidget(author_site_button("remont1c.ru", "WidgetAuthorLink"))
+        layout.addLayout(author_row)
         self._build_grips()
 
     @staticmethod
@@ -1510,6 +1522,13 @@ STYLE=f'''
 QLabel#WidgetTitle{{font-family:"Segoe UI";font-size:10.5pt;font-weight:700;color:{COLORS['text']};}}
 QLabel#UpdatedLabel,QLabel#WidgetFooter{{color:{COLORS['faint']};font-size:7.5pt;}}
 QLabel#WidgetFooter{{padding-left:6px;}}
+QLabel#WidgetAuthor,QPushButton#WidgetAuthorLink{{color:{COLORS['muted']};font-size:7.5pt;}}
+QPushButton#WidgetAuthorLink{{
+    background:transparent;text-decoration:underline;border:1px solid transparent;
+    border-radius:3px;padding:0 2px;min-height:16px;
+}}
+QPushButton#WidgetAuthorLink:hover{{color:{COLORS['text']};}}
+QPushButton#WidgetAuthorLink:focus{{border-color:#91BDF0;}}
 QFrame#WidgetActions{{background:#141D27;border:none;border-radius:7px;}}
 QPushButton#WidgetCommand,QPushButton#HideWidget,QToolButton#CardDisclosure{{
     background:transparent;color:#DBE4ED;border:1px solid transparent;border-radius:4px;

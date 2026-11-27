@@ -4,8 +4,9 @@ import pathlib
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from claude_usage_manager.database import Database
 import claude_usage_manager.unified_monitor as unified_monitor
@@ -131,6 +132,33 @@ def test_help_from_shared_menu_and_keyboard_reuses_one_window(tmp_path):
         QTest.keyClick(window, Qt.Key.Key_F1)
         app.processEvents()
         assert window._help_dialog is dialog and dialog.isVisible()
+    finally:
+        stop_window(window)
+        db.close()
+
+
+def test_widget_shows_author_and_opens_website_only_on_activation(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    db.set_setting("monitor_width", "316")
+    db.set_setting("monitor_thread_view", '{"font": "2"}')
+    websites = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: websites.append(url.toString()))
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    try:
+        window.show()
+        app.processEvents()
+        author = window.findChild(QLabel, "WidgetAuthor")
+        link = window.findChild(QPushButton, "WidgetAuthorLink")
+        assert author.isVisible() and author.text() == "Антон (onetone)"
+        assert link.isVisible() and link.text() == "remont1c.ru"
+        assert window.width() == 316
+        QTest.mouseClick(author, Qt.MouseButton.LeftButton)
+        assert websites == []
+        QTest.mouseClick(link, Qt.MouseButton.LeftButton)
+        link.setFocus()
+        QTest.keyClick(link, Qt.Key.Key_Return)
+        assert websites == ["https://remont1c.ru"] * 2
     finally:
         stop_window(window)
         db.close()

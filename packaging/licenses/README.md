@@ -1,6 +1,6 @@
 # Компоненты AI Limits Monitor
 
-Код AI Limits Monitor распространяется по Apache License 2.0. В этой папке есть текст лицензии `AI-Limits-Monitor-LICENSE.txt` и уведомление об авторстве и исходном проекте `AI-Limits-Monitor-NOTICE.txt`.
+Код AI Limits Monitor распространяется по Apache License 2.0 с условием Commons Clause 1.0. В этой папке есть полный текст `AI-Limits-Monitor-LICENSE.txt` и уведомление об авторстве и исходном проекте `AI-Limits-Monitor-NOTICE.txt`. Сторонние компоненты распространяются на собственных условиях.
 
 Сборка включает интерпретатор Python, библиотеки Qt 6.11.1, PySide6-Essentials и shiboken6, Pillow для изображений, openpyxl и et_xmlfile для таблиц, а также библиотеку packaging. Программа загружается через PyInstaller. Установщик Windows создан с помощью Inno Setup. В этом каталоге рядом лежат лицензии из поставок соответствующих версий. В `Qt-third-party.txt` собраны лицензии сторонних компонентов Qt Base, Qt SVG и Qt Image Formats по перечням из исходного выпуска Qt 6.11.1.
 

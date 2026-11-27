@@ -1,12 +1,12 @@
 """Встроенная справка AI Limits Monitor."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from .author_credit import author_site_button
 from .qt_theme import COLORS
 
 
@@ -175,19 +175,7 @@ class HelpDialog(QDialog):
         author = QLabel("Разработчик Антон ·")
         author.setObjectName("HelpAuthor")
         footer.addWidget(author)
-        credit = QPushButton("by onetone remont1c.ru")
-        credit.setObjectName("HelpCredit")
-        credit.setAutoDefault(False)
-        credit.setFlat(True)
-        credit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        credit.setCursor(Qt.CursorShape.PointingHandCursor)
-        credit.setToolTip("Открыть сайт разработчика в браузере")
-        credit.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://remont1c.ru")))
-        shortcut = QShortcut(credit)
-        shortcut.setKeys([QKeySequence(Qt.Key.Key_Return), QKeySequence(Qt.Key.Key_Enter)])
-        shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
-        shortcut.setAutoRepeat(False)
-        shortcut.activated.connect(credit.click)
+        credit = author_site_button("by onetone remont1c.ru", "HelpCredit")
         footer.addWidget(credit, 0, Qt.AlignmentFlag.AlignLeft)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
