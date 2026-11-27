@@ -8,7 +8,7 @@ on:
         type: string
         required: false
   push:
-    tags: ['v*']
+    tags: ['v*', 'preview-*']
 
 permissions:
   contents: read
@@ -53,7 +53,24 @@ jobs:
           python -m pip install --disable-pip-version-check --only-binary=:all: PyInstaller==6.22.3
           python -X utf8 packaging/check_distribution.py $env:AI_LIMITS_TEST_INSTALLER --standard-windows-install --work-dir $env:RUNNER_TEMP
 
+  test:
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_release == ''
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12.10'
+      - name: Тесты
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements.txt
+          python -X utf8 -m pytest -q
+
   build:
+    needs: test
     if: github.event_name != 'workflow_dispatch' || inputs.windows_release == ''
     strategy:
       fail-fast: false

@@ -173,7 +173,7 @@ def test_claude_activity_priority():
     assert ta.claude_activity("busy", False) == ta.ACTIVITY_WORKING
     assert ta.claude_activity("idle", False) == "" and ta.claude_activity(None, False) == ""
     assert ta.claude_activity("idle", True) == ta.ACTIVITY_UNREAD and ta.claude_activity(None, True) == ta.ACTIVITY_UNREAD
-    # Итог хода с blocked: true: процесс простаивает, но приложение ждет ответа владельца
+    # Итог хода с blocked: true: процесс простаивает, но приложение ждет ответа пользователя
     assert ta.claude_activity("idle", False, True) == ta.ACTIVITY_NEEDS_REPLY
     assert ta.claude_activity("idle", True, True) == ta.ACTIVITY_NEEDS_REPLY
     assert ta.claude_activity("busy", True, True) == ta.ACTIVITY_NEEDS_REPLY

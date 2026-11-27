@@ -1,4 +1,4 @@
-"""Значок приложения на основе фирменного знака Remont1C."""
+"""Значок приложения на основе фирменного знака R1."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,7 +21,7 @@ def build_icon(target: Path | None = None) -> Path:
     source = brand_svg()
     renderer = QSvgRenderer(str(source))
     if not renderer.isValid():
-        raise ValueError(f"Не удалось загрузить знак Remont1C: {source}")
+        raise ValueError(f"Не удалось загрузить знак R1: {source}")
 
     size = 256
     image = QImage(size, size, QImage.Format.Format_RGBA8888)

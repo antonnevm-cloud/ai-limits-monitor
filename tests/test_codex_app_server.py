@@ -1,4 +1,4 @@
-"""Обмен с Codex app-server на имитаторе процесса (ревью CLA-12: codex#7)."""
+"""Обмен с Codex app-server на имитаторе процесса."""
 import datetime as dt
 import json
 import queue

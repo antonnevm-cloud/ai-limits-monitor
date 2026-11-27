@@ -5,6 +5,7 @@ import argparse
 import json
 import marshal
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -16,6 +17,9 @@ from types import CodeType
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = runpy.run_path(str(ROOT / 'claude_usage_manager' / '__init__.py'))
+# Путь в профиле конкретного пользователя любой машины (подстановки вида <имя> и %USERNAME% допустимы).
+PRIVATE_PATH = re.compile(r'(?i)(?:\b[a-z]:[\\/]users[\\/]|/users/|/home/)(?!<|%|\{|public\b|default\b)[\w.-]+')
+FOREIGN_BINARY = re.compile(r'(?i)^(?:ucrtbase\.dll|api-ms-win-.*\.dll|lib(?:ssl|crypto)-3-x64\.dll|qtvirtualkeyboard.*)$')
 PROFILE_VARIABLES = (
     'PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'CONDA_PREFIX', 'QT_QPA_PLATFORM',
     'AI_LIMITS_DATA_DIR', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GROK_HOME',
@@ -32,9 +36,14 @@ def check_contents(target: Path, executable: Path, resources: Path) -> None:
     icons = {f.stem for f in (resources / 'assets' / 'providers').iterdir()}
     if icons != {'claude', 'codex', 'grok', 'antigravity'}:
         raise ValueError(f'Неверный состав значков в дистрибутиве: {icons}')
-    for filename in ('LGPL-3.0-only.txt', 'GPL-3.0-only.txt', 'Qt-third-party.txt', 'Python.txt', 'README.md'):
+    for filename in ('LGPL-3.0-only.txt', 'GPL-3.0-only.txt', 'Qt-third-party.txt', 'Python.txt',
+                     'Python-incorporated-software.txt', 'libaom.txt', 'README.md'):
         if not (resources / 'licenses' / filename).is_file():
             raise FileNotFoundError(filename)
+    # Посторонние DLL из PATH машины сборки (UCRT из JDK, OpenSSL из Git) и модули Qt только под GPL.
+    foreign = sorted(member.name for member in target.rglob('*.dll') if FOREIGN_BINARY.match(member.name))
+    if foreign:
+        raise ValueError(f'В дистрибутив попали посторонние библиотеки: {", ".join(foreign[:8])}')
     for filename in ('LICENSE', 'NOTICE'):
         packaged = resources / 'licenses' / f'AI-Limits-Monitor-{filename}.txt'
         if packaged.read_bytes() != (ROOT / filename).read_bytes():
@@ -46,9 +55,6 @@ def check_contents(target: Path, executable: Path, resources: Path) -> None:
             raise ValueError(f'В дистрибутив попали локальные данные: {member.name}')
     archive = CArchiveReader(str(executable))
     modules = archive.open_embedded_archive('PYZ.pyz')
-    removed = {'claude_usage_manager.cursor_provider', 'claude_usage_manager.windows_credential'}
-    if removed.intersection(modules.toc):
-        raise ValueError('В дистрибутив попал старый источник учетных данных')
     code = [marshal.loads(archive.extract('monitor'))]
     for name in modules.toc:
         if name == 'claude_usage_manager' or name.startswith('claude_usage_manager.'):
@@ -60,13 +66,19 @@ def check_contents(target: Path, executable: Path, resources: Path) -> None:
         filename = unit.co_filename
         if PureWindowsPath(filename).anchor or PurePosixPath(filename).anchor:
             raise ValueError('Код приложения содержит абсолютный путь из среды сборки')
-        for item in unit.co_consts:
+        constants = list(unit.co_consts)
+        while constants:
+            item = constants.pop()
             if isinstance(item, CodeType):
                 code.append(item)
-            elif isinstance(item, str):
-                normalized = item.replace('\\', '/').casefold()
-                if any(path in normalized or normalized == path.rstrip('/') for path in build_paths):
-                    raise ValueError(f'В модуле {filename} сохранен личный путь с машины сборки')
+            elif isinstance(item, (tuple, frozenset)):
+                constants.extend(item)
+            elif isinstance(item, (str, bytes)):
+                text = item.decode('utf-8', 'replace') if isinstance(item, bytes) else item
+                normalized = text.replace('\\', '/').casefold()
+                if (any(path in normalized or normalized == path.rstrip('/') for path in build_paths)
+                        or PRIVATE_PATH.search(text)):
+                    raise ValueError(f'В модуле {filename} сохранен личный путь: {text[:80]!r}')
 
     native_platform = 'qwindows.dll' if sys.platform == 'win32' else 'libqcocoa.dylib'
     if not any(target.rglob(native_platform)):
@@ -210,12 +222,41 @@ def check_standard_windows_install(package: Path, stage: Path) -> None:
                            cwd=stage, env=env, check=True, timeout=120)
 
 
+TEXT_SUFFIXES = {'.py', '.md', '.txt', '.spec', '.iss', '.ps1', '.yml', '.json', '.ini', '.svg', ''}
+LOCAL_FILES = re.compile(r'(?i)(?:\.(?:db|sqlite3?|log|jsonl|pem|key|pfx)|(?:^|/)(?:\.env|auth\.json|credentials\.json))$')
+
+
+def check_source_archive(archive: Path, forbidden: list[str]) -> None:
+    """Архив исходников: без локальных данных, личных путей и запрещенных слов (имена клиентов и проектов)."""
+    import zipfile
+
+    words = [word.casefold() for word in forbidden if word]
+    with zipfile.ZipFile(archive) as bundle:
+        for name in bundle.namelist():
+            if LOCAL_FILES.search(name):
+                raise ValueError(f'В архив исходников попал локальный файл: {name}')
+            if PurePosixPath(name).suffix.lower() not in TEXT_SUFFIXES or name.endswith('/'):
+                continue
+            text = bundle.read(name).decode('utf-8', 'replace')
+            found = PRIVATE_PATH.search(text)
+            if found:
+                raise ValueError(f'{name}: личный путь {found.group(0)!r}')
+            lowered = text.casefold()
+            for word in words:
+                if word in lowered:
+                    raise ValueError(f'{name}: запрещенное слово {word!r}')
+    print('Архив исходников проверен:', archive.name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package', type=Path)
     parser.add_argument('--work-dir', type=Path, default=ROOT / '.pytest_tmp' / 'packaging')
     parser.add_argument('--standard-windows-install', action='store_true',
                         help='Дополнительно проверить обычную установку на чистой машине Windows')
+    parser.add_argument('--source-archive', type=Path, help='Проверить также архив исходников (zip)')
+    parser.add_argument('--forbid', action='append', default=[],
+                        help='Слово, которого не должно быть в архиве исходников (можно повторять)')
     args = parser.parse_args()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='check-', dir=args.work_dir.resolve()) as tmp:
@@ -223,6 +264,8 @@ def main() -> None:
         check(package, Path(tmp))
         if args.standard_windows_install:
             check_standard_windows_install(package, Path(tmp))
+    if args.source_archive:
+        check_source_archive(args.source_archive.resolve(strict=True), args.forbid)
 
 
 if __name__ == '__main__':

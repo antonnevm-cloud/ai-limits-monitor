@@ -301,23 +301,12 @@ def test_detailed_limits_window_has_clean_cyrillic():
     assert not any(0x2500 <= ord(char) <= 0x259F for char in source)
 
 
-def test_installer_creates_only_unified_application_shortcut():
-    source = pathlib.Path("install.ps1").read_text(encoding="utf-8")
-    assert "$AppScript" not in source
-    assert "AI Limits Monitor.lnk') -ScriptPath $MonitorScript" in source
-    assert "Claude Usage Manager.lnk') -ScriptPath" not in source
-
-def test_root_launchers_point_to_unified_monitor():
-    normal = pathlib.Path("Run AI Limits Monitor.cmd")
-    debug = pathlib.Path("Run AI Limits Monitor Debug.cmd")
-    assert normal.exists() and debug.exists()
-    assert "monitor.py" in normal.read_text(encoding="utf-8-sig")
-    assert "monitor.py" in debug.read_text(encoding="utf-8-sig")
-    assert not pathlib.Path("Run Claude Usage Manager.cmd").exists()
-    assert not pathlib.Path("Run Claude Usage Manager Debug.cmd").exists()
-
 def test_legacy_runtime_surface_is_removed():
     for obsolete in (
+        # Установка только штатным установщиком: прежние запускалки требовали несуществующую .venv.
+        "install.ps1",
+        "Run AI Limits Monitor.cmd",
+        "Run AI Limits Monitor Debug.cmd",
         "app.py",
         "monitor_detail.py",
         "legacy_reference.py",

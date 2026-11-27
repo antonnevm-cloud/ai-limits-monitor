@@ -1,4 +1,4 @@
-"""Виджет и окно подробных лимитов (ревью CLA-12: ux#4, ux#5, ux#8, ux#9, ux#11, quotas#5, #6, #8, #10, docs#9, cache#7)."""
+"""Виджет и окно подробных лимитов."""
 import dataclasses
 import json
 import os

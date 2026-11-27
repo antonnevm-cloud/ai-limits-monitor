@@ -640,7 +640,7 @@ with tempfile.TemporaryDirectory() as temp:
     w.quit_monitor();app.processEvents();db.close()
 """
     env=os.environ.copy();env['QT_QPA_PLATFORM']='offscreen';env['QT_SCALE_FACTOR']='1.5'
-    env['LOCALAPPDATA']=str(tmp_path)  # журнал и данные приложения подпроцесса - не в живом каталоге виджета (CLA-8)
+    env['LOCALAPPDATA']=str(tmp_path)  # журнал и данные приложения подпроцесса - не в живом каталоге виджета
     result=subprocess.run([sys.executable,'-c',code],cwd=pathlib.Path.cwd(),env=env,capture_output=True,text=True,check=True,timeout=30)
     payload=json.loads(result.stdout)
     assert payload['screen_dpr']>=1.5 and payload['rows']==2

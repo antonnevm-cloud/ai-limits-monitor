@@ -24,6 +24,8 @@ OutputDir={#BuildOutput}
 OutputBaseFilename=AI-Limits-Monitor-{#AppVersion}-windows-x64-setup
 SetupIconFile={#SourcePath}\..\assets\icon.ico
 LicenseFile={#SourcePath}\..\LICENSE
+; Уведомление о Qt под LGPL v3 и остальных компонентах сборки.
+InfoAfterFile={#SourcePath}\licenses\README.md
 UninstallDisplayIcon={app}\{#AppExe}
 Uninstallable=not PortableInstall
 UsePreviousAppDir=not PortableInstall

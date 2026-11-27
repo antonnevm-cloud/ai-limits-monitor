@@ -176,11 +176,20 @@ class _ProviderPage(QWidget):
         layout.addLayout(actions)
 
         self.statusline: QPushButton | None = None
+        self.statusline_off: QPushButton | None = None
         if provider in {"claude", "antigravity"}:
+            row = QHBoxLayout()
             self.statusline = QPushButton("Подключить строку состояния")
             self.statusline.setToolTip("Сразу добавить источник лимитов в настройки выбранного профиля.")
             self.statusline.clicked.connect(self.connect_statusline)
-            layout.addWidget(self.statusline)
+            row.addWidget(self.statusline)
+            # Обратная операция: вернуть строку состояния, которая была в профиле до подключения монитора.
+            self.statusline_off = QPushButton("Отключить строку состояния")
+            self.statusline_off.setToolTip("Вернуть прежнюю строку состояния выбранного профиля. Чужую команду монитор не трогает.")
+            self.statusline_off.clicked.connect(self.disconnect_statusline)
+            row.addWidget(self.statusline_off)
+            row.addStretch(1)
+            layout.addLayout(row)
         self.result = QLabel()
         self.result.setWordWrap(True)
         layout.addWidget(self.result)
@@ -231,6 +240,7 @@ class _ProviderPage(QWidget):
             self.install.hide()
             if self.statusline is not None:
                 self.statusline.setEnabled(False)
+                self.statusline_off.setEnabled(False)
             return
         executable = settings.provider_executable(self.provider, current)
         profile = settings.provider_profile(self.provider, current)
@@ -254,6 +264,8 @@ class _ProviderPage(QWidget):
         if self.statusline is not None:
             # Для записи строки состояния программа клиента не нужна, нужен только профиль.
             self.statusline.setEnabled(current.enabled)
+            # Отключить можно и у выключенного источника: для этого его чаще всего и выключают.
+            self.statusline_off.setEnabled(True)
 
     def sign_in(self) -> None:
         try:
@@ -379,6 +391,30 @@ class _ProviderPage(QWidget):
             self.result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             return
         self.result.setText(messages.get(status, "Клиент не подтвердил подключение строки состояния."))
+
+    def disconnect_statusline(self) -> None:
+        if self.statusline_off is None or not self.statusline_off.isEnabled():
+            return
+        current = self.selection()
+        try:
+            if self.provider == "claude":
+                from .claude_local import remove_statusline_command
+
+                profile = settings.provider_profile(self.provider, current)
+                status = remove_statusline_command(settings_path=profile / "settings.json")
+            else:
+                from .antigravity_quota import remove_antigravity_statusline
+
+                status = remove_antigravity_statusline(cli_profile=settings.antigravity_cli_profile(current))
+        except (OSError, ValueError):
+            self.result.setText("Не удалось отключить строку состояния. Проверь путь и доступ к settings.json.")
+            return
+        messages = {
+            "removed": "Строка состояния монитора отключена, прежняя настройка профиля возвращена.",
+            "absent": "В этом профиле строка состояния не настроена.",
+            "foreign": "В профиле своя строка состояния, монитор ее не менял.",
+        }
+        self.result.setText(messages.get(status, "Строку состояния отключить не удалось."))
 
 
 class ConnectionsDialog(QDialog):

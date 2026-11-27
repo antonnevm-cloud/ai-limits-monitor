@@ -16,8 +16,7 @@ for filename in ('claude.svg', 'codex.svg', 'grok.png', 'antigravity.svg'):
 analysis = Analysis(
     [str(root / 'monitor.py')], pathex=[str(root)], datas=assets,
     hiddenimports=['PySide6.support.deprecated'],
-    excludes=['claude_usage_manager.cursor_provider', 'claude_usage_manager.windows_credential',
-              'pytest', 'tkinter'],
+    excludes=['pytest', 'tkinter'],
 )
 # Виджеты рисуются QPainter. Программный OpenGL из необязательной поставки Qt им не нужен.
 if sys.platform == 'win32':

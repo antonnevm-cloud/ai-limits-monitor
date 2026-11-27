@@ -28,8 +28,7 @@ def test_release_bundles_only_the_application_and_public_assets(system, tmp_path
     runpy.run_path(str(PACKAGING / 'monitor.spec'), init_globals={**namespace, 'SPECPATH': PACKAGING})
     args, options = calls['Analysis']
     assert args == ([str(PACKAGING.parent / 'monitor.py')],)
-    assert {'claude_usage_manager.cursor_provider',
-            'claude_usage_manager.windows_credential'} <= set(options['excludes'])
+    assert {'pytest', 'tkinter'} <= set(options['excludes'])
     resources = [(Path(src), dest) for src, dest in options['datas']]
     assert all(p.exists() for p, _ in resources)
     assert {dest for _, dest in resources} == {'assets', 'assets/providers', 'licenses'}

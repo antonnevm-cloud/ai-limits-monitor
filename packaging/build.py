@@ -19,8 +19,10 @@ PACKAGING = ROOT / 'packaging'
 APP = runpy.run_path(str(ROOT / 'claude_usage_manager' / '__init__.py'))
 NAME = APP['APP_NAME']
 VERSION = APP['APP_VERSION']
-WHEELS = ('Pillow', 'openpyxl', 'et-xmlfile', 'packaging', 'PySide6-Essentials', 'shiboken6',
+WHEELS = ('Pillow', 'openpyxl', 'et-xmlfile', 'PySide6-Essentials', 'shiboken6',
           'PyInstaller', 'pyinstaller-hooks-contrib')
+# В колесах Qt for Python лежит только коммерческая отсылка: рядом кладется указатель на LGPL v3.
+LGPL_WHEELS = ('PySide6-Essentials', 'shiboken6')
 
 
 def write_licenses(directory: Path, compiler: Path | None) -> None:
@@ -44,6 +46,10 @@ def write_licenses(directory: Path, compiler: Path | None) -> None:
                 shutil.copyfile(dist.locate_file(path), target / path.name)
         if not any(target.iterdir()):
             raise FileNotFoundError(f'В поставке {name} {dist.version} отсутствует лицензия')
+        if name in LGPL_WHEELS:
+            (target / 'LGPL-3.0-only-USED.txt').write_text(
+                f'{name} {dist.version} is used in this program under the GNU Lesser General Public License '
+                'version 3 (see ../LGPL-3.0-only.txt), not under a commercial Qt license.\n', encoding='utf-8')
     if compiler:
         shutil.copyfile(compiler.with_name('license.txt'), directory / 'Inno-Setup.txt')
 

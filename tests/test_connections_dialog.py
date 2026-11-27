@@ -122,6 +122,27 @@ def test_manual_statusline_uses_unsaved_profile_and_preserves_existing_handler(d
     assert not (settings.provider_profile("claude") / "settings.json").exists()
 
 
+def test_statusline_can_be_disconnected_even_for_a_disabled_source(dialog, tmp_path):
+    page = dialog.pages["claude"]
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    previous = {"type": "command", "command": "my-old-line"}
+    (profile / "settings.json").write_text(json.dumps({"statusLine": previous}), encoding="utf-8")
+    page.inputs["profile"].setText(str(profile))
+    page.statusline.click()
+    assert "своя строка состояния" in page.result.text()  # чужая команда не заменяется
+    (profile / "settings.json").write_text("{}", encoding="utf-8")
+    page.statusline.click()
+    assert "подключена" in page.result.text()
+    page.enabled.setChecked(False)
+    assert page.statusline_off.isEnabled()
+    page.statusline_off.click()
+    assert "отключена" in page.result.text()
+    assert "statusLine" not in json.loads((profile / "settings.json").read_text(encoding="utf-8"))
+    page.statusline_off.click()
+    assert "не настроена" in page.result.text()
+
+
 def test_cancel_discards_changes_and_save_round_trips(dialog, tmp_path):
     page = dialog.pages["codex"]
     page.inputs["profile"].setText(str(tmp_path / "unused"))

@@ -317,7 +317,7 @@ def test_duplicate_session_id_rows_are_aggregated():
 
 def test_short_session_gets_project_fallback_title():
     raw = [{
-        "sessionId": "febccca4-07fd-44e1-ba9d-fb9e9ab2a8ab",
+        "sessionId": "33333333-3333-4333-8333-333333333333",
         "projectPath": "C--Workspace-examples-tools-sandbox-c",
         "totalCost": 0.1,
         "totalTokens": 10,

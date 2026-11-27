@@ -5,18 +5,11 @@
 /LICENSE text eol=lf
 /NOTICE text eol=lf
 *.ps1 text eol=crlf
-*.cmd text eol=crlf
 *.png binary
 *.ico binary
 /assets/r1.svg text eol=lf
 
-# Публичный снимок содержит рабочее приложение и его проверки.
+# Архив исходников (git archive) содержит рабочее приложение и его проверки.
+# Файлы инструкций агентов, если они появятся в репозитории, в архив не попадают.
 /AGENTS.md export-ignore
 /CLAUDE.md export-ignore
-/CHANGELOG.md export-ignore
-/claude_usage_manager/cursor_provider.py export-ignore
-/claude_usage_manager/windows_credential.py export-ignore
-/tests/test_cursor_provider.py export-ignore
-/assets/providers/cursor.png export-ignore
-/packaging/install-package.ps1 export-ignore
-/integrations export-ignore

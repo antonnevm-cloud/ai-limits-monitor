@@ -49,7 +49,7 @@ def utcnow():
 
 def thread(session, started_ago, ttl=3600, agent="claude", estimated=False, title=None):
     return CacheThread(
-        agent=agent, session_id=session, title=title or f"Тред {session}", project="ut_bestparts",
+        agent=agent, session_id=session, title=title or f"Тред {session}", project="demo_shop",
         environment="Desktop", started_at=utcnow() - dt.timedelta(seconds=started_ago),
         ttl_seconds=ttl, estimated=estimated,
     )
@@ -153,9 +153,9 @@ def test_block_row_text_and_estimated_marker():
     block.set_content([thread("a", 100, ttl=300, agent="codex", estimated=True)], now)
     chip_text = block.rows[0].ring.text
     assert chip_text.startswith("~") and chip_text[1:].count(":") == 1
-    assert block.rows[0].project._full == "ut_bestparts"  # компактно: среда в подсказке
+    assert block.rows[0].project._full == "demo_shop"  # компактно: среда в подсказке
     block.set_content([thread("a", 100, ttl=300, agent="codex", estimated=True)], now, view=ThreadView(compact=False))
-    assert block.rows[0].project._full == "ut_bestparts · Desktop"
+    assert block.rows[0].project._full == "demo_shop · Desktop"
 
 
 # ------------------------------- Окно -------------------------------------- #
@@ -850,7 +850,7 @@ def test_invalid_saved_width_is_ignored(tmp_path):
     db.close()
 
 
-# ------------------- Этап 1 CLA-6: карточки, вид, закрепить и скрыть ------------ #
+# ------------------- Карточки, вид, закрепить и скрыть ------------ #
 def test_toggle_switch_toggles_and_emits():
     qapp()
     switch = ToggleSwitch(True)
@@ -1090,9 +1090,9 @@ def test_row_shows_project_and_environment_in_one_line_without_pill():
     qapp()
     detailed = ThreadView(compact=False)
     row = CacheThreadRow(thread("a", 100), utcnow(), detailed)
-    assert row.project._full == "ut_bestparts · Desktop" and not hasattr(row, "env")
+    assert row.project._full == "demo_shop · Desktop" and not hasattr(row, "env")
     bare = CacheThreadRow(replace(thread("a", 100), environment=""), utcnow(), detailed)
-    assert bare.project._full == "ut_bestparts"
+    assert bare.project._full == "demo_shop"
 
 
 def test_row_warns_shortly_before_the_cache_goes_cold():
@@ -1152,7 +1152,7 @@ def test_window_grows_when_a_warning_row_appears_and_shrinks_back(tmp_path):
 
 
 def test_window_is_never_shorter_than_its_content_after_expanding(tmp_path):
-    """Находка по снимку владельца: нижняя строка (подвал) обрезалась на 8 пикселей после первого разворачивания."""
+    """Находка по снимку экрана: нижняя строка (подвал) обрезалась на 8 пикселей после первого разворачивания."""
     app, db, w = window(tmp_path, "short.db")
     w.show()
     app.processEvents()
@@ -1204,7 +1204,7 @@ def test_compact_row_is_two_lines_with_project_and_short_chips():
     assert row.compact and row.ring.width() == COMPACT_RING_SIZE and row.minimumHeight() == COMPACT_ROW_HEIGHT
     assert row.ring._font_pt == 5.0 and row.ring._bold is False  # цифры в кольце мелкие и не жирные
     # проект без среды стоит в строке чипов, перед ними; среда и пояснения в подсказке
-    assert row.project.parentWidget() is row.chips_row and row.project._full == "ut_bestparts"
+    assert row.project.parentWidget() is row.chips_row and row.project._full == "demo_shop"
     assert "Desktop" in row.toolTip()
     assert chips(row) == ["~2,1%", "$3,40", "$0,74"]
     assert "перезапис" in row.rewrite_chip.toolTip()

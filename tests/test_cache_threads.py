@@ -716,7 +716,7 @@ def test_cache_hue_and_format():
     assert format_remaining(3600) == "60:00"
 
 
-# -------------------- Регрессии по ревью Fable 5.2 (CLA-5) ------------------ #
+# -------------------- Регрессии по ревью Fable 5.2 ------------------ #
 def test_fork_journal_takes_its_own_file_name_as_session_id_not_the_parents(dirs):
     """Журнал форка начинается с копии истории родителя: sessionId в ней принадлежит родителю."""
     write_lines(claude_file(dirs, "fork-1.jsonl", "p1"), [

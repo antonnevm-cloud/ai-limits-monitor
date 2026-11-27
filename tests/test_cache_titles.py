@@ -1,4 +1,4 @@
-"""Название треда в середине длинного журнала и кэш LevelDB нескольких каталогов (ревью CLA-12: cache#8, cache#10)."""
+"""Название треда в середине длинного журнала и кэш LevelDB нескольких каталогов."""
 import json
 
 from claude_usage_manager import chromium_leveldb

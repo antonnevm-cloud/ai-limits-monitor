@@ -1,4 +1,4 @@
-"""Прогноз недели (ревью CLA-12: forecast#1, #3, #4, #5, #9, #10)."""
+"""Прогноз недели."""
 import datetime as dt
 
 import pytest

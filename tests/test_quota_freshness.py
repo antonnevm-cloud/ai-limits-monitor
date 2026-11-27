@@ -1,4 +1,4 @@
-"""Свежесть кэша и запасных снимков квот (ревью CLA-12: codex#2, grok#1, antigravity#1, quotas#7)."""
+"""Свежесть кэша и запасных снимков квот."""
 import datetime as dt
 
 from claude_usage_manager import quota_monitor_model as model
