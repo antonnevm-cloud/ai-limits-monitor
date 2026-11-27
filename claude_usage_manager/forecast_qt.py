@@ -1,6 +1,8 @@
 """Прогноз недели в виджете: полоса прогноза в карточке агента и всплывающий график расхода по проектам."""
 from __future__ import annotations
 
+import html
+
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
@@ -32,7 +34,15 @@ def number(value: float, digits: int = 0) -> str:
 
 
 def series_color(index: int, name: str) -> str:
-    return OTHER_COLOR if name == OTHER_LABEL else SERIES_COLORS[index % len(SERIES_COLORS)]
+    if name == OTHER_LABEL:
+        return OTHER_COLOR
+    if index < len(SERIES_COLORS):
+        return SERIES_COLORS[index]
+    # После восьми проектов цвета не повторяются: оттенок идет по золотому углу.
+    return QColor.fromHsv(int((index * 137.508) % 360), 150, 200).name()
+
+
+LEGEND_NAME_LIMIT = 28
 
 
 # --------------------------------------------------------------------------- #
@@ -72,12 +82,19 @@ def rate_value(forecast: WeekForecast) -> str:
     return f"{mark}{number(forecast.rate_per_day, 1)}% в сутки"
 
 
+def exhausted_text(forecast: WeekForecast) -> str:
+    """"кончится вс 02:00" по прогнозу; если лимит уже исчерпан - так и сказано, без текущего времени."""
+    if forecast.used >= 100.0:
+        return "лимит исчерпан"
+    return f"кончится {clock_text(forecast.exhausted_at)}"
+
+
 def axis_texts(forecast: WeekForecast) -> tuple[str, str]:
     """Две подписи под полосой: сейчас слева, сброс справа (при нехватке перед ним время, когда лимит кончится)."""
     now = f"сейчас · осталось {number(forecast.remaining)}%"
     reset = f"сброс {clock_text(forecast.resets_at)}"
     if forecast.exhausted_at is not None and forecast.short_hours is not None:
-        return now, f"кончится {clock_text(forecast.exhausted_at)} · {reset}"
+        return now, f"{exhausted_text(forecast)} · {reset}"
     return now, reset
 
 
@@ -92,7 +109,7 @@ def reset_html(forecast: WeekForecast) -> str:
     """Правая подпись под полосой: «сброс пт 20:00» и цветом остаток к сбросу или время, когда лимит кончится."""
     reset = f"сброс {clock_text(forecast.resets_at)}"
     if forecast.exhausted_at is not None and forecast.short_hours is not None:
-        return f'<span style="color:{SHORT_COLOR}">кончится {clock_text(forecast.exhausted_at)}</span> · {reset}'
+        return f'<span style="color:{SHORT_COLOR}">{exhausted_text(forecast)}</span> · {reset}'
     left = reset_remaining_text(forecast)
     return reset if left is None else f'{reset} <span style="color:{COLORS["success"]}">{left}</span>'
 
@@ -408,15 +425,20 @@ class WeekChartView(QWidget):
             width = painter.fontMetrics().horizontalAdvance(name.capitalize())
             painter.drawText(QPointF(self._x(day + 0.5) - width / 2, 188), name.capitalize())
         painter.setPen(secondary)
-        text = f"сейчас: {number(forecast.used)}%"
-        painter.drawText(QPointF(self._x(now_days) - 4 - painter.fontMetrics().horizontalAdvance(text), 26), text)
         metrics = painter.fontMetrics()
+        text = f"сейчас: {number(forecast.used)}%"
+        width = metrics.horizontalAdvance(text)
+        # Подпись не уходит за левый край поля: в начале недели она стоит справа от линии "сейчас".
+        now_x = self._x(now_days) - 4 - width
+        if now_x < X0:
+            now_x = min(self._x(now_days) + 4, X1 - width)
+        painter.drawText(QPointF(now_x, 26 if exhaust is None else 14), text)
         reset_text = f"сброс {clock_text(forecast.resets_at)}"
         reset_x = X1 - 2 - metrics.horizontalAdvance(reset_text)
         reset_y = self._y(100) + 14
         painter.setPen(QColor(DANGER))
         if exhaust is not None:
-            text = f"кончится {clock_text(forecast.exhausted_at)}"
+            text = exhausted_text(forecast)
             width = metrics.horizontalAdvance(text)
             left = max(X0, min(self._x(exhaust * 7.0) - width / 2, X1 - width))
             if left + width + 6 > reset_x:  # подписи сошлись: сброс уходит строкой ниже
@@ -446,7 +468,12 @@ class LegendChip(QFrame):
         swatch.setFixedSize(10, 10)
         swatch.setStyleSheet(f"background:{self.color};border-radius:3px;border:none;")
         box.addWidget(swatch)
-        self.text = QLabel(f"{item.name} <b>{number(item.total)}%</b>")
+        # Имя папки показывается как текст; длинное сокращается, чтобы процент оставался виден.
+        name = item.name if len(item.name) <= LEGEND_NAME_LIMIT else item.name[:LEGEND_NAME_LIMIT - 1] + "…"
+        self.text = QLabel(f"{html.escape(name)} <b>{number(item.total)}%</b>")
+        self.text.setTextFormat(Qt.TextFormat.RichText)
+        if name != item.name:
+            self.setToolTip(html.escape(item.name))
         self.text.setObjectName("LegendText")
         box.addWidget(self.text)
         self.set_active(False)  # рамка нужна до расчета размера, иначе содержимое потом срезается
@@ -536,6 +563,13 @@ class ForecastPopup(QDialog):
         box.addWidget(self.note)
 
     def set_data(self, forecast: WeekForecast, chart: WeekChart | None) -> None:
+        # Фоновое обновление сохраняет выбранный проект и не пересобирает легенду без изменений.
+        previous = self.chart
+        selected = (previous.series[self.highlighted].name
+                    if previous is not None and 0 <= self.highlighted < len(previous.series) else None)
+        same_legend = (previous is not None and chart is not None
+                       and [(s.name, round(s.total)) for s in previous.series]
+                       == [(s.name, round(s.total)) for s in chart.series])
         self.forecast = forecast
         self.chart = chart
         short = forecast.short_hours is not None
@@ -553,8 +587,10 @@ class ForecastPopup(QDialog):
             value.style().polish(value)
         self.view.set_chart(chart)
         self.view.setVisible(chart is not None)
-        self._rebuild_legend()
-        self.set_highlighted(-1)
+        if not same_legend:
+            self._rebuild_legend()
+        names = [item.name for item in chart.series] if chart is not None else []
+        self.set_highlighted(names.index(selected) if selected in names else -1)
 
     def _rebuild_legend(self) -> None:
         for chip in self._chips:

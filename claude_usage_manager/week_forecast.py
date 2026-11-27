@@ -114,7 +114,8 @@ def build_forecast(
     left = resets - now
     allowed = None
     if left > dt.timedelta(0):
-        allowed = max(0.0, 100.0 - used) / (left.total_seconds() / 86400)
+        # В последние сутки показывается весь остаток, а не сотни процентов "в сутки".
+        allowed = max(0.0, 100.0 - used) / max(1.0, left.total_seconds() / 86400)
     rate = None
     method = RATE_AVERAGE
     exhausted = None
@@ -238,8 +239,10 @@ def build_chart(
     # Потеря точности последнего замера: к «сейчас» значение равно текущему проценту окна.
     values[-1] = forecast.used
     names = sorted(daily_cost, key=lambda name: -sum(daily_cost[name]))
+    # Внутренний ключ "прочего" не совпадает с папкой проекта, названной "прочее".
+    other_key = "\x00other"
     cumulative = {name: [0.0] for name in names}
-    cumulative[OTHER_LABEL] = [0.0]
+    cumulative[other_key] = [0.0]
     for index in range(len(edges) - 1):
         growth = max(0.0, values[index + 1] - values[index])
         day = min(DAYS - 1, index)  # отрезок index лежит в сутках index; неполный последний отрезок - в текущих сутках
@@ -247,15 +250,22 @@ def build_chart(
         total = sum(costs.values())
         for name in names:
             cumulative[name].append(cumulative[name][-1] + (growth * costs[name] / total if total > 0 else 0.0))
-        cumulative[OTHER_LABEL].append(cumulative[OTHER_LABEL][-1] + (growth if total <= 0 else 0.0))
+        cumulative[other_key].append(cumulative[other_key][-1] + (growth if total <= 0 else 0.0))
+    # Если процент падал без сброса (смена тарифа), сумма приростов больше израсходованного:
+    # проекты делят ровно израсходованное к "сейчас".
+    grown = sum(values[-1] for values in cumulative.values())
+    if grown > forecast.used > 0:
+        factor = forecast.used / grown
+        cumulative = {name: [value * factor for value in values] for name, values in cumulative.items()}
     big = [name for name in names if cumulative[name][-1] >= MIN_SERIES_PERCENT]
-    other = list(cumulative[OTHER_LABEL])
+    other = list(cumulative[other_key])
     for name in names:
         if name not in big:
             other = [left + right for left, right in zip(other, cumulative[name])]
-    series = [ChartSeries(name, tuple(cumulative[name])) for name in big]
+    series = [ChartSeries(name if name != OTHER_LABEL else f"{name} (папка)", tuple(cumulative[name])) for name in big]
     if other[-1] >= MIN_OTHER_PERCENT:
         series.append(ChartSeries(OTHER_LABEL, tuple(other)))
     boundaries = tuple(_clamp((edge - start) / WEEK) for edge in edges)
-    day_names = tuple(WEEKDAYS[(start.astimezone() + dt.timedelta(days=k)).weekday()] for k in range(DAYS))
+    # Сутки графика названы по дню, на который приходится их середина, а не начало отрезка.
+    day_names = tuple(WEEKDAYS[(start + dt.timedelta(days=k, hours=12)).astimezone().weekday()] for k in range(DAYS))
     return WeekChart(forecast, tuple(series), boundaries, day_names)

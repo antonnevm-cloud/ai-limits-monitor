@@ -114,7 +114,8 @@ class ForecastWorker(QRunnable):
         try:
             as_of = min(dt.datetime.now(dt.timezone.utc), self.window.resets_at)
             forecast = build_forecast(self.window, now=as_of, samples=cached[2])
-            if forecast is not None and forecast.now >= start:
+            # Расход по проектам известен только для Claude и Codex: у Grok график был бы одним "прочим".
+            if forecast is not None and forecast.now >= start and self.provider in ('claude', 'codex'):
                 chart = build_chart(forecast, cached[2], self.daily)
         except Exception:
             get_logger().exception('AI Limits Monitor forecast calculation')
@@ -726,7 +727,11 @@ class MonitorWindow(QMainWindow):
         if e.button()==Qt.MouseButton.LeftButton:self._drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft()
         super().mousePressEvent(e)
     def mouseMoveEvent(self,e):
-        if self._drag is not None and e.buttons()&Qt.MouseButton.LeftButton:self.move(e.globalPosition().toPoint()-self._drag)
+        if self._drag is not None and e.buttons()&Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint()-self._drag)
+            # Открытое окно расхода едет вместе с виджетом.
+            popup=getattr(self,'forecast_popup',None);bar=self.forecast_bars.get(self._popup_provider) if getattr(self,'_popup_provider',None) else None
+            if popup is not None and bar is not None and popup.isVisible():self._move_forecast_popup(bar)
         super().mouseMoveEvent(e)
     def mouseReleaseEvent(self,e):
         self._drag=None;super().mouseReleaseEvent(e)
@@ -912,8 +917,11 @@ class MonitorWindow(QMainWindow):
             now=dt.datetime.now(dt.timezone.utc)
             for block in self.cache_blocks.values():block.tick(now)
     def weekly_of(self,provider):
-        '''Недельное окно лимита провайдера (с процентом и временем сброса) или None.'''
-        state=self.data.states.get(provider);return weekly_window(state.snapshot.windows) if state is not None else None
+        '''Недельное окно лимита провайдера (с процентом и временем сброса) или None.
+
+        Окно с уже прошедшим сбросом прогноза не получает: его неделя закончилась.'''
+        state=self.data.states.get(provider);window=weekly_window(state.snapshot.windows) if state is not None else None
+        return window if window is not None and window.resets_at>dt.datetime.now(dt.timezone.utc) else None
     def _usage_inputs(self):
         starts={};used={}
         for provider in ('claude','codex'):
@@ -1033,6 +1041,10 @@ class MonitorWindow(QMainWindow):
         popup = self.forecast_popup
         area = self._screen_area()
         frame = self.frameGeometry()
+        drawer = getattr(self, 'drawer', None)
+        if drawer is not None and drawer.isVisible() and drawer.frameGeometry().right() <= frame.left():
+            # Слева от виджета открыта панель вида: окно расхода встает левее нее, а не поверх.
+            frame = frame.united(drawer.frameGeometry())
         left = frame.left() - popup.width() - 8
         top = bar.mapToGlobal(QPoint(0, 0)).y()
         if area is not None:
