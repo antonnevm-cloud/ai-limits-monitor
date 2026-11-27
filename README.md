@@ -1,12 +1,12 @@
-<h1><img src="assets/r1.svg" width="34" height="34" alt="R1"> AI Limits Monitor</h1>
+<h1><img src="docs/images/cover.svg" width="880" alt="R1 AI Limits Monitor"></h1>
 
-Антон (onetone) · [remont1c.ru](https://remont1c.ru)
-
-**Остаток лимитов Claude Code, Codex, Grok Build и Antigravity в одном виджете для Windows.**
+[by onetone](https://github.com/antonnevm-cloud)
 
 Я сделал AI Limits Monitor, чтобы видеть, сколько осталось до исчерпания лимита и когда он обновится. В виджете виден остаток по периодам и группам моделей. Чтобы понять, куда ушел лимит, можно открыть историю расхода по проектам, диалогам и моделям.
 
-[Скачать для Windows](https://github.com/antonnevm-cloud/ai-limits-monitor/releases/download/preview-2.0.5/AI-Limits-Monitor-2.0.5-windows-x64-setup.exe) · [Подключить сервисы](#подключение-сервисов) · [Посмотреть аналитику](#аналитика-и-история)
+[<img src="docs/images/download-windows.svg" width="228" alt="Скачать для Windows">](https://github.com/antonnevm-cloud/ai-limits-monitor/releases/download/preview-2.0.5/AI-Limits-Monitor-2.0.5-windows-x64-setup.exe)
+
+[Подключить сервисы](#подключение-сервисов) · [Посмотреть аналитику](#аналитика-и-история)
 
 <p align="center">
   <img src="docs/images/widget.png" alt="Виджет AI Limits Monitor с остатками лимитов четырех сервисов">
@@ -89,7 +89,7 @@
 
 Код проекта доступен по [Apache License 2.0 с условием Commons Clause 1.0](LICENSE). Вы можете пользоваться программой, создавать форки, менять код и бесплатно распространять сборки. При распространении сохраняйте лицензию и [NOTICE](NOTICE) с именем автора и ссылками на исходный проект и сайт. Отмечайте измененные файлы.
 
-Для продажи программы или ее переработки, которая существенно основана на ее возможностях, требуется отдельная лицензия от автора. За коммерческой лицензией обращайтесь ко мне через [remont1c.ru](https://remont1c.ru).
+Для продажи программы или ее переработки, которая существенно основана на ее возможностях, требуется отдельная лицензия от автора. Условия платного распространения можно согласовать со мной через [GitHub](https://github.com/antonnevm-cloud).
 
 У сторонних библиотек и компонентов есть [собственные лицензии](packaging/licenses/README.md).
 

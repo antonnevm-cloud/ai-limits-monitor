@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 188" role="img" aria-labelledby="title description">
+  <title id="title">R1 AI Limits Monitor</title>
+  <desc id="description">Квоты Claude Code, Codex, Grok Build и Antigravity</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#173b30"/>
+      <stop offset="1" stop-color="#0d211b"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="879" height="187" rx="22" fill="url(#background)" stroke="#316352"/>
+  <path d="M22 166v-14M22 166h54M804 22h54M858 22v14" fill="none" stroke="#e4a653" stroke-width="2" stroke-linecap="round"/>
+  <g transform="translate(46 42) scale(1.625)">
+    <rect width="64" height="64" rx="16" fill="#087458"/>
+    <path d="M16 45V19h13.4c6.8 0 11 3.5 11 9.2 0 3.8-2 6.6-5.5 8l6.3 8.8h-8l-5.1-7.6h-4.9V45H16Zm7.2-13.4h5.4c3 0 4.5-1.1 4.5-3.4 0-2.2-1.5-3.3-4.5-3.3h-5.4v6.7Z" fill="#fff"/>
+    <path d="M45.5 23.2h4.8V45h-6.1V30.1l-4.1 2.5v-5.8l5.4-3.6Z" fill="#e4a653"/>
+  </g>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <text x="182" y="93" fill="#f0f8f4" font-size="46" font-weight="700">AI Limits Monitor</text>
+    <text x="184" y="130" fill="#bddecf" font-size="21">Claude Code · Codex · Grok Build · Antigravity</text>
+  </g>
+</svg>

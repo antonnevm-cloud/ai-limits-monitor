@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from .author_credit import author_site_button
+from .author_credit import github_link_button
 from .qt_theme import COLORS
 
 
@@ -143,13 +143,13 @@ class HelpDialog(QDialog):
                 border: none; font-size: 11pt;
                 selection-background-color: {COLORS['selection']};
             }}
-            QLabel#HelpAuthor, QPushButton#HelpCredit {{ color: {COLORS['muted']}; font-size: 9pt; }}
+            QLabel#HelpAuthor {{ color: {COLORS['muted']}; font-size: 9pt; }}
             QPushButton#HelpCredit {{
-                background: transparent; text-decoration: underline;
+                background: transparent; color: #e4a653; font-size: 9pt; text-decoration: underline;
                 border: 1px solid transparent; border-radius: 3px; padding: 1px 3px; min-height: 18px;
             }}
             QPushButton#HelpCredit:hover {{ color: {COLORS['text']}; }}
-            QPushButton#HelpCredit:focus {{ border-color: {COLORS['muted']}; }}
+            QPushButton#HelpCredit:focus {{ border-color: #e4a653; }}
         """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
@@ -172,10 +172,10 @@ class HelpDialog(QDialog):
             self.tabs.addTab(page, title)
         footer = QHBoxLayout()
         footer.setSpacing(3)
-        author = QLabel("Разработчик Антон ·")
+        author = QLabel("by onetone ·")
         author.setObjectName("HelpAuthor")
         footer.addWidget(author)
-        credit = author_site_button("by onetone remont1c.ru", "HelpCredit")
+        credit = github_link_button("HelpCredit")
         footer.addWidget(credit, 0, Qt.AlignmentFlag.AlignLeft)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")

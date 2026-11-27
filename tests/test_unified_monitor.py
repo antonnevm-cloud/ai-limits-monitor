@@ -137,7 +137,7 @@ def test_help_from_shared_menu_and_keyboard_reuses_one_window(tmp_path):
         db.close()
 
 
-def test_widget_shows_author_and_opens_website_only_on_activation(tmp_path, monkeypatch):
+def test_widget_shows_author_and_opens_github_only_on_activation(tmp_path, monkeypatch):
     app = qapp()
     db = Database(tmp_path / "ui.sqlite")
     db.set_setting("monitor_width", "316")
@@ -150,15 +150,15 @@ def test_widget_shows_author_and_opens_website_only_on_activation(tmp_path, monk
         app.processEvents()
         author = window.findChild(QLabel, "WidgetAuthor")
         link = window.findChild(QPushButton, "WidgetAuthorLink")
-        assert author.isVisible() and author.text() == "Антон (onetone)"
-        assert link.isVisible() and link.text() == "remont1c.ru"
+        assert author.isVisible() and author.text() == "by onetone"
+        assert link.isVisible() and link.text() == "GitHub"
         assert window.width() == 316
         QTest.mouseClick(author, Qt.MouseButton.LeftButton)
         assert websites == []
         QTest.mouseClick(link, Qt.MouseButton.LeftButton)
         link.setFocus()
         QTest.keyClick(link, Qt.Key.Key_Return)
-        assert websites == ["https://remont1c.ru"] * 2
+        assert websites == ["https://github.com/antonnevm-cloud/ai-limits-monitor"] * 2
     finally:
         stop_window(window)
         db.close()
