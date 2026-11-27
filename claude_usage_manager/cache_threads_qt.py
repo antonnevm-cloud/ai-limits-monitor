@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import html
 import time
 import weakref
 from collections import deque
@@ -88,6 +89,8 @@ class ElidedLabel(QLabel):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._full = ""
+        # Названия тредов приходят из журналов: только текст, без разметки HTML и загрузки картинок.
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.set_full_text(text)
 
@@ -597,6 +600,9 @@ class CacheThreadRow(QFrame):
             else:
                 self.project.set_full_text(f"{thread.project} · {thread.environment}" if thread.environment else thread.project)
             tip = tooltip_text(thread)
+            if "<" in tip or "&" in tip:
+                # Подсказка Qt тоже понимает HTML: название из журнала показывается как текст.
+                tip = "<p style='white-space:pre-wrap'>" + html.escape(tip).replace("\n", "<br>") + "</p>"
             for widget in (self, self.title, self.project, self.ring, self.dot, self.warn_row):
                 if widget is not None:
                     widget.setToolTip(tip)

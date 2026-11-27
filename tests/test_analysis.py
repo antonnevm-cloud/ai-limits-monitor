@@ -6,7 +6,6 @@ import pytest
 from claude_usage_manager.analysis import (
     Analyzer,
     _collect_event,
-    _restore_project_paths,
     aggregate_models,
     aggregate_projects,
     apply_grouping,
@@ -53,20 +52,13 @@ def test_scan_range_and_dedup(make_claude_root, tmp_path):
         _assistant("m3", "2026-08-05T13:00:00Z"),          # вне диапазона
     ]
     make_claude_root("Demo", "S1.jsonl", records)
-    temp = tmp_path / "temp"
-    temp.mkdir()
 
-    metadata, events, _aliases = scan_logs(make_claude_root.root, START, END, temp)
+    metadata, events = scan_logs(make_claude_root.root, START, END)
 
-    ids_times = {(e["session_id"], e["timestamp"].isoformat()) for e in events}
     assert len(events) == 2  # m1 (один раз) + m2, synthetic и вне диапазона исключены
     assert metadata["S1"]["period_prompt"].startswith("Проанализируй")
-    copied = list(temp.rglob("*.jsonl"))
-    assert copied  # временная копия создана
-    copied_records = [line for path in copied for line in path.read_text(encoding="utf-8").splitlines()]
-    assert len(copied_records) == 2  # дубликат и synthetic не передаются в ccusage
-    assert "synthetic-abc" not in "\n".join(copied_records)
-    _ = ids_times
+    # Журналы никуда не копируются: временного каталога рядом нет.
+    assert not list(tmp_path.glob("cum-*"))
 
 
 def test_scan_exact_boundaries(make_claude_root, tmp_path):
@@ -77,9 +69,7 @@ def test_scan_exact_boundaries(make_claude_root, tmp_path):
         _assistant("after", "2026-08-05T12:00:01Z"),        # после — исключ.
     ]
     make_claude_root("Demo", "S1.jsonl", records)
-    temp = tmp_path / "temp"
-    temp.mkdir()
-    _metadata, events, _aliases = scan_logs(make_claude_root.root, START, END, temp)
+    _metadata, events = scan_logs(make_claude_root.root, START, END)
     assert len(events) == 2
 
 
@@ -91,59 +81,21 @@ def test_arbitrary_project_folder_and_user_request_reach_the_report(make_claude_
          "message": {"content": prompt}},
         _assistant("m1", START.isoformat()),
     ])
-    metadata, _, _ = scan_logs(make_claude_root.root, START, END)
+    metadata, _ = scan_logs(make_claude_root.root, START, END)
     rows = merge_sessions([{"sessionId": "S1", "projectPath": "arbitrary-project"}], metadata, {})
     assert rows[0].title == prompt
     assert rows[0].project == "v2"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Проверка командного файла Windows")
-def test_ccusage_cmd_runs_from_a_custom_windows_folder(tmp_path, monkeypatch):
-    from claude_usage_manager import analysis
-
-    program = tmp_path / "Пакеты %TEMP% & !" / "ccusage.cmd"
-    program.parent.mkdir()
-    program.write_text('@echo off\necho {"first":"%1","last":"%6"}\n', encoding="ascii")
-    monkeypatch.setattr(analysis, "find_ccusage", lambda: program)
-    assert analysis.run_ccusage(tmp_path) == {"first": "claude", "last": "--offline"}
-
-
-def test_scan_stages_long_project_under_short_alias(make_claude_root, tmp_path):
-    project = "long-project-" + "x" * 120
-    make_claude_root(project, "S1.jsonl", [
-        _assistant("long-path", "2026-08-05T10:10:00Z"),
-    ])
-    temp = tmp_path / "temp"
-    temp.mkdir()
-
-    _metadata, events, aliases = scan_logs(
-        make_claude_root.root, START, END, temp,
-    )
-
-    copied = list((temp / "projects").rglob("*.jsonl"))
-    assert len(events) == 1 and len(copied) == 1
-    staged_project = copied[0].relative_to(temp / "projects").parts[0]
-    assert staged_project.startswith("p-")
-    assert aliases[staged_project] == project
-    assert project not in str(copied[0])
-
-
-def test_restore_project_paths_keeps_nested_subagent_path():
-    alias = "p-0123456789abcdef"
-    original = "C--Users-demo-very-long-project"
-    sessions = [
-        {"projectPath": alias},
-        {"projectPath": f"{alias}\\parent-id\\subagents\\workflows"},
-        {"projectPath": f"{alias}/parent-id/subagents/workflows"},
-        {"projectPath": "unmapped-project"},
-    ]
-
-    _restore_project_paths(sessions, {alias: original})
-
-    assert sessions[0]["projectPath"] == original
-    assert sessions[1]["projectPath"] == f"{original}\\parent-id\\subagents\\workflows"
-    assert sessions[2]["projectPath"] == f"{original}/parent-id/subagents/workflows"
-    assert sessions[3]["projectPath"] == "unmapped-project"
+def test_subagent_without_parent_in_period_belongs_to_parent_project():
+    parent = "22222222-2222-2222-2222-222222222222"
+    metadata = {parent: {"custom_titles": [], "first_prompt": None, "period_prompt": None,
+                         "cwd": "/Users/test/Work/Project"}}
+    rows = merge_sessions([{"sessionId": "agent-1", "projectPath": f"Project/{parent}/subagents",
+                            "totalCost": 1.0, "totalTokens": 10}], metadata, {})
+    # Расход не уходит в несуществующий проект "subagents" (analytics#8).
+    assert [row.project for row in rows] == ["Project"]
+    assert rows[0].project_path == "Project"
 
 
 def test_resolve_title_priority():
@@ -216,23 +168,16 @@ def test_analyzer_filters_hidden_group_members_before_grouping(monkeypatch):
                 "hidden": {"hidden": True, "pinned": False, "group_name": "Задача"},
             }
 
-    def fake_scan(_root, _start, _end, temp_root):
-        logs = temp_root / "projects"
-        logs.mkdir()
-        (logs / "events.jsonl").write_text("{}\n", encoding="utf-8")
-        return {}, [], {}
-
-    monkeypatch.setattr(analysis_module, "scan_logs", fake_scan)
-    monkeypatch.setattr(analysis_module, "find_ccusage", lambda: "ccusage")
+    monkeypatch.setattr(analysis_module, "scan_logs", lambda *_args: ({}, []))
     monkeypatch.setattr(
         analysis_module,
-        "run_ccusage",
-        lambda _root: {"sessions": [
+        "local_sessions",
+        lambda _events: [
             {"sessionId": "visible", "projectPath": "C--Workspace-Demo", "totalCost": 1.0,
              "totalTokens": 10, "modelsUsed": ["claude-sonnet-5"]},
             {"sessionId": "hidden", "projectPath": "C--Workspace-Demo", "totalCost": 9.0,
              "totalTokens": 90, "modelsUsed": ["claude-sonnet-5"]},
-        ]},
+        ],
     )
     monkeypatch.setattr(analysis_module, "weekly_consumed", lambda *_args, **_kwargs: None)
 
@@ -414,10 +359,9 @@ def test_search_preserves_period_totals_and_share(make_claude_root, monkeypatch)
     make_claude_root("Demo", "A.jsonl", records_a)
     make_claude_root("Demo", "B.jsonl", records_b)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(make_claude_root.root))
-    monkeypatch.setattr(analysis_module, "find_ccusage", lambda: "ccusage")
     monkeypatch.setattr(
-        analysis_module, "run_ccusage",
-        lambda _root: {"sessions": [
+        analysis_module, "local_sessions",
+        lambda _events: [
             {
                 "sessionId": "A", "projectPath": "C--Workspace-Demo",
                 "totalCost": 6.0, "totalTokens": 200,
@@ -438,7 +382,7 @@ def test_search_preserves_period_totals_and_share(make_claude_root, monkeypatch)
                     "cacheCreationTokens": 0, "cacheReadTokens": 0,
                 }],
             },
-        ]},
+        ],
     )
     monkeypatch.setattr(analysis_module, "weekly_consumed", lambda *_args, **_kwargs: 20.0)
     period = Period("test", "Test", START.astimezone(), END.astimezone())
@@ -456,13 +400,9 @@ def test_search_preserves_period_totals_and_share(make_claude_root, monkeypatch)
 
 def test_standalone_claude_report_uses_profile_prices_titles_and_subagents(make_claude_root, monkeypatch):
     import pytest
-    from claude_usage_manager import analysis, provider_settings
+    from claude_usage_manager import analysis, process_utils, provider_settings
 
-    def missing():
-        raise RuntimeError("ccusage отсутствует")
-
-    monkeypatch.setattr(analysis, "find_ccusage", missing)
-    monkeypatch.setattr(analysis, "run_ccusage", lambda *_: pytest.fail("Внешний процесс"))
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_a, **_k: pytest.fail("Внешний процесс"))
     monkeypatch.setattr(provider_settings, "provider_profile", lambda _: make_claude_root.root)
     parent = "11111111-1111-1111-1111-111111111111"
     event = _assistant("m1", START.isoformat(), 0, "claude-opus-5-5")

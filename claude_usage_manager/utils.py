@@ -7,7 +7,6 @@ import logging
 import os
 import pathlib
 import re
-import shutil
 import sys
 from logging.handlers import RotatingFileHandler
 from typing import Any
@@ -136,22 +135,22 @@ def parse_iso(value: Any) -> dt.datetime | None:
 
 def to_utc(value: dt.datetime) -> dt.datetime:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=local_tz())
+        # Наивное местное время переводится по правилам пояса на эту дату, а не по смещению сейчас.
+        return value.astimezone(dt.timezone.utc)
     return value.astimezone(dt.timezone.utc)
 
 
 def local_hm(value: dt.datetime | None, timezone: dt.tzinfo | None = None) -> str:
     if not value:
         return "—"
-    timezone = timezone or local_tz()
-    return value.astimezone(timezone).strftime("%H:%M")
+    # Без явного пояса смещение берется на сам момент: летнее и зимнее время не путаются.
+    return (value.astimezone(timezone) if timezone else value.astimezone()).strftime("%H:%M")
 
 
 def local_dt_text(value: dt.datetime | None, timezone: dt.tzinfo | None = None) -> str:
     if not value:
         return "—"
-    timezone = timezone or local_tz()
-    return value.astimezone(timezone).strftime("%Y-%m-%d %H:%M")
+    return (value.astimezone(timezone) if timezone else value.astimezone()).strftime("%Y-%m-%d %H:%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -243,19 +242,3 @@ def estimate_project_weekly_pp(
 
 def format_pp(value: float | None) -> str:
     return "н/д" if value is None else "≈" + f"{value:.2f}".replace(".", ",") + " п.п."
-
-
-# --------------------------------------------------------------------------- #
-# Поиск ccusage
-# --------------------------------------------------------------------------- #
-def find_ccusage() -> pathlib.Path:
-    candidates = [shutil.which(name) for name in ("ccusage", "ccusage.exe", "ccusage.cmd", "ccusage.ps1")]
-    if os.name == "nt" and os.environ.get("APPDATA"):
-        npm_dir = pathlib.Path(os.environ["APPDATA"]) / "npm"
-        candidates.extend([npm_dir / "ccusage.cmd", npm_dir / "ccusage.ps1"])
-    for candidate in candidates:
-        if candidate and pathlib.Path(candidate).exists():
-            return pathlib.Path(candidate)
-    raise RuntimeError(
-        "Дополнительная утилита ccusage не найдена."
-    )

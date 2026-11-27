@@ -54,6 +54,26 @@ def test_export_xlsx_sheets(tmp_path):
     assert wb["Threads"].freeze_panes == "A2"
 
 
+def test_exports_keep_formula_like_titles_as_text(tmp_path):
+    # Название треда из журнала не становится формулой Excel и не срывает выгрузку (security#8, analytics#12).
+    from openpyxl import load_workbook
+
+    result = _result()
+    result.threads[0].title = '=HYPERLINK("http://example.invalid","x")'
+    result.threads[0].project = "Demo\x07bell"
+    csv_path = tmp_path / "out.csv"
+    export_csv(result, csv_path)
+    row = csv_path.read_text(encoding="utf-8-sig").splitlines()[1].split(";")
+    assert row[1].startswith("\"'=HYPERLINK") or row[1].startswith("'=HYPERLINK")
+    assert row[5] == "1,5" and row[6] == "100"
+    xlsx_path = tmp_path / "out.xlsx"
+    export_xlsx(result, xlsx_path)
+    sheet = load_workbook(xlsx_path)["Threads"]
+    assert sheet["A2"].data_type == "s"
+    assert sheet["A2"].value.startswith("=HYPERLINK")
+    assert sheet["B2"].value == "Demobell"
+
+
 def test_export_json(tmp_path):
     path = tmp_path / "out.json"
     export_json(_result(), path)
