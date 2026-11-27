@@ -24,10 +24,11 @@ analysis = Analysis(
 if sys.platform == 'win32':
     analysis.binaries = [entry for entry in analysis.binaries if Path(entry[0]).name.lower() != 'opengl32sw.dll']
 archive = PYZ(analysis.pure)
+# Подсистема Windows без консоли: консольный EXE открывает окно терминала и завершается вместе с ним.
+# Обработчики строки состояния и служебные режимы получают потоки от вызывающего процесса.
 exe = EXE(
     archive, analysis.scripts, [], name=name, exclude_binaries=True, icon=icon,
-    console=sys.platform == 'win32', hide_console='hide-early' if sys.platform == 'win32' else None,
-    upx=False,
+    console=False, upx=False,
 )
 payload = COLLECT(exe, analysis.binaries, analysis.datas, name=name, upx=False)
 if sys.platform == 'darwin':

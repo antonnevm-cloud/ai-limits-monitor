@@ -337,7 +337,9 @@ def install_statusline_command(command: str, *,
 def statusline_main(args: list[str] | None = None) -> int:
     """Claude Code invokes this command with JSON on stdin; no Qt, tokens, or HTTP."""
     try:
-        raw = sys.stdin.buffer.read(MAX_PAYLOAD + 1)
+        # У программы без консоли стандартный ввод отсутствует, если вызывающий процесс его не передал.
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(MAX_PAYLOAD + 1) if stream is not None else b""
         if len(raw) > MAX_PAYLOAD:
             print("Claude")
             return 0

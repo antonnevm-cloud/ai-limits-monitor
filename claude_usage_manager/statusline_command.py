@@ -67,7 +67,10 @@ def statusline_command(flag: str, *arguments: str) -> str:
     special = any(c in value for value in command_line for c in ('%', '!', '"', '$', '^', '\\', chr(96), '\r', '\n'))
     if special or not (uses_cmd or uses_bash):
         literals = ["'" + value.replace("'", "''") + "'" for value in command_line]
-        script = "& " + " ".join(literals) + "; exit $LASTEXITCODE"
+        # Программу без консоли PowerShell не ждет, если она последняя в конвейере:
+        # вывод приходит после выхода оболочки, код завершения теряется. ForEach-Object возвращает ожидание
+        # и входит в ядро PowerShell, поэтому не пишет в stderr сообщение о подготовке модулей.
+        script = "& " + " ".join(literals) + " | ForEach-Object { $_ }; exit $LASTEXITCODE"
         encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         shell = _system_powershell()
         if not re.fullmatch(r"[A-Za-z0-9:/_.-]+", shell):

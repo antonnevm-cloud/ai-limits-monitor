@@ -73,6 +73,15 @@ def check_contents(target: Path, executable: Path, resources: Path) -> None:
         raise FileNotFoundError(native_platform)
 
 
+def windows_subsystem(executable: Path) -> int:
+    """Подсистема из заголовка PE: 2 - программа без консоли, 3 - консольная."""
+    with executable.open('rb') as stream:
+        stream.seek(0x3C)
+        header = int.from_bytes(stream.read(4), 'little')
+        stream.seek(header + 4 + 20 + 68)
+        return int.from_bytes(stream.read(2), 'little')
+
+
 def check(package: Path, stage: Path) -> None:
     profile = stage / 'profile'
     profile.mkdir()
@@ -90,6 +99,9 @@ def check(package: Path, stage: Path) -> None:
                        timeout=180, check=True)
         executable = target / f'{APP["APP_NAME"]}.exe'
         resources = target / '_internal'
+        if windows_subsystem(executable) != 2:
+            # Консольный EXE открывает окно терминала при запуске по ярлыку и закрывается вместе с ним.
+            raise ValueError('Программа Windows собрана с консолью')
     else:
         env['PATH'] = '/usr/bin:/bin:/usr/sbin:/sbin'
         target = stage / 'Install'

@@ -36,7 +36,9 @@ def test_release_bundles_only_the_application_and_public_assets(system, tmp_path
         'claude', 'codex', 'grok', 'antigravity',
     }
     assert calls['EXE'][1]['name'] == APP_NAME
-    assert calls['EXE'][1]['console'] == (system == 'win32')
+    # Консольный EXE открывает окно терминала при запуске по ярлыку и закрывается вместе с ним.
+    assert calls['EXE'][1]['console'] is False
+    assert not calls['EXE'][1].get('hide_console')
     if system == 'darwin':
         assert calls['BUNDLE'][1]['name'] == f'{APP_NAME}.app'
         assert calls['BUNDLE'][1]['info_plist']['CFBundleShortVersionString'] == APP_VERSION
