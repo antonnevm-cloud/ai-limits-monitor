@@ -19,6 +19,8 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.windows_release }}
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12.10'
@@ -31,9 +33,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           $version = python -c "from claude_usage_manager import APP_VERSION; print(APP_VERSION)"
-          if ($env:RELEASE_TAG -notin @("preview-$version", "v$version")) { throw 'Метка выпуска не соответствует версии исходников' }
+          if ($env:RELEASE_TAG -notin @($version, "preview-$version", "v$version")) { throw 'Метка выпуска не соответствует версии исходников' }
           $commit = gh api "repos/$env:GITHUB_REPOSITORY/commits/$env:RELEASE_TAG" --jq '.sha'
-          if ($commit -ne $env:GITHUB_SHA) { throw 'Метка выпуска и проверяемые исходники указывают на разные коммиты' }
+          $sourceCommit = git rev-parse HEAD
+          if ($commit -ne $sourceCommit) { throw 'Метка выпуска и проверяемые исходники указывают на разные коммиты' }
           $file = "AI-Limits-Monitor-$version-windows-x64-setup.exe"
           $release = gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json
           $asset = @($release.assets | Where-Object name -eq $file)
