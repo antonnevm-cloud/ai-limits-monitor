@@ -70,10 +70,10 @@ def manual_reset_urgency(
     *,
     now: dt.datetime | None = None,
 ) -> str:
-    expiry = credits.nearest_expiry()
+    current = now or dt.datetime.now(dt.timezone.utc)
+    expiry = credits.nearest_expiry(current)
     if credits.state != "available" or not credits.available_count or expiry is None:
         return "normal"
-    current = now or dt.datetime.now(dt.timezone.utc)
     remaining_time = expiry.astimezone(dt.timezone.utc) - current.astimezone(dt.timezone.utc)
     if remaining_time < dt.timedelta(hours=24):
         return "critical"
@@ -410,7 +410,9 @@ def cached_snapshot(db: Database, provider: str) -> QuotaSnapshot:
         return result
     base=r or manual_row or {}
     manual=manual_row.get("manual_resets") if manual_row else ManualResetCredits(provider=provider)
-    if isinstance(manual,ManualResetCredits) and manual.state != "unknown": manual.freshness="cached"
+    if isinstance(manual,ManualResetCredits) and manual.state != "unknown":
+        manual.freshness="cached"
+        _drop_expired_credits(manual, dt.datetime.now(dt.timezone.utc))
     q=QuotaSnapshot(five_hour=base.get("five_hour"),weekly=base.get("weekly"),fable_weekly=base.get("fable_weekly"),source=str(base.get("source") or default_source),provider=provider,login_method=str(base.get("login_method") or ""),updated_at=parse_iso(base.get("ts_utc")),windows=list(base.get("windows") or []),main_window_id=str(base.get("main_window_id") or ""),manual_resets=manual)
     if provider == "grok":
         now = dt.datetime.now(dt.timezone.utc)
@@ -435,6 +437,14 @@ def cached_snapshot(db: Database, provider: str) -> QuotaSnapshot:
                                  manual_resets=q.manual_resets)
         q.five_hour = next((w.used_percent for w in q.windows if w.window_minutes == 300), None)
         q.weekly = next((w.used_percent for w in q.windows if w.window_minutes == 10080), None)
+    if provider == "codex":
+        # Окно, срок сброса которого прошел, в кэше уже неверно: после сброса остаток другой.
+        now = dt.datetime.now(dt.timezone.utc)
+        q.windows = [w for w in q.windows if w.resets_at is None or w.resets_at > now]
+        if not any(w.used_percent is not None and not w.informational for w in q.windows):
+            return QuotaSnapshot(provider=provider, source=q.source, manual_resets=q.manual_resets,
+                                 error="Нет актуального лимита Codex")
+        q.five_hour = q.weekly = q.fable_weekly = None
     if provider == "antigravity":
         now = dt.datetime.now(dt.timezone.utc)
         measured = next((w.details["observed_at"] for w in q.windows if w.details.get("observed_at")), None)
@@ -449,6 +459,18 @@ def cached_snapshot(db: Database, provider: str) -> QuotaSnapshot:
     if q.five_hour is None and short is not None:
         q.five_hour=short.used_percent; q.five_hour_resets_at=short.resets_at
     return q
+
+
+def _drop_expired_credits(credits: ManualResetCredits, now: dt.datetime) -> None:
+    """Из кэша убираются кредиты сброса, срок которых уже истек."""
+    alive = [item for item in credits.items if item.expires_at is None or item.remaining_seconds(now)]
+    expired = [item for item in credits.items if item not in alive]
+    if not expired:
+        return
+    credits.items = alive
+    if credits.available_count is not None:
+        lost = sum(1 for item in expired if item.status == "available")
+        credits.available_count = max(0, credits.available_count - lost)
 
 
 def _merge_cached_resets(current: QuotaSnapshot, cached: QuotaSnapshot) -> None:
@@ -550,9 +572,14 @@ def refresh_provider(db: Database, provider: str, *, excluded_providers=()) -> P
     if kept is not None:
         return kept
     if current.has_data():
+        # Запасной снимок (прошлая запись журнала Grok, прошлый вывод строки состояния agy)
+        # не вытесняет более новое измерение из базы и не пишется в историю как свежий замер.
+        if (cached.has_data() and cached.updated_at is not None
+                and (current.updated_at is None or cached.updated_at >= current.updated_at)):
+            return ProviderState(provider, cached, False, current.fallback_source)
         if provider != "antigravity":
             _merge_cached_resets(current, cached)
-        db.record_quota(current, profile_key=key)
+        db.record_quota(current, profile_key=key, observed_at=current.updated_at)
         return ProviderState(provider, current, False, current.fallback_source)
     if current.manual_resets.state != "unknown":
         db.record_quota(current, profile_key=key)

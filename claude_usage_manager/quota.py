@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import queue
@@ -12,6 +13,7 @@ import threading
 import time
 from typing import Any
 
+from . import APP_VERSION
 from .database import Database
 from .models import ManualResetCredits, ManualResetItem, Period, QuotaSnapshot, QuotaWindow
 from .grok_provider import fetch_grok_quota
@@ -50,7 +52,16 @@ def plan_history_path() -> pathlib.Path | None:
     if claude_root().resolve() != (pathlib.Path.home() / ".claude").resolve():
         return None
     paths = desktop_history_paths()
-    return next((path for path in paths if path.is_file()), paths[0] if paths else None)
+
+    def modified(path: pathlib.Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return -1.0
+
+    existing = [path for path in paths if path.is_file()]
+    # Самая свежая история из найденных профилей Desktop, а не первая по списку.
+    return max(existing, key=modified) if existing else (paths[0] if paths else None)
 
 
 def _latest_plan_usage_sample() -> tuple[dt.datetime, float | None, float | None] | None:
@@ -284,20 +295,20 @@ def _codex_response(messages: queue.Queue, request_id: int, timeout: float) -> d
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("Codex app-server response timeout")
+            raise TimeoutError("Codex не ответил вовремя")
         try:
             message = messages.get(timeout=remaining)
         except queue.Empty as error:
-            raise TimeoutError("Codex app-server response timeout") from error
+            raise TimeoutError("Codex не ответил вовремя") from error
         if message is None:
-            raise RuntimeError("Codex app-server closed the response stream")
+            raise RuntimeError("Codex завершился без ответа. Проверь установку клиента и вход в Codex.")
         if message.get("id") != request_id:
             continue
         failure = message.get("error")
         if isinstance(failure, dict):
             code = failure.get("code")
-            detail = str(failure.get("message") or "unknown error")[:160]
-            raise RuntimeError(f"Codex app-server error {code}: {detail}")
+            detail = str(failure.get("message") or "без описания")[:160]
+            raise RuntimeError(f"Codex отказал в запросе лимитов (код {code}): {detail}")
         return message
 
 
@@ -348,7 +359,7 @@ def _read_codex_rate_limits_uncached(timeout: float = _CODEX_APP_SERVER_TIMEOUT)
             env=provider_environment("codex"),
         )
         if process.stdin is None or process.stdout is None:
-            raise RuntimeError("Codex app-server pipes are unavailable")
+            raise RuntimeError("Не удалось связаться с запущенным Codex")
         messages: queue.Queue = queue.Queue()
         reader = threading.Thread(
             target=_codex_message_reader,
@@ -369,7 +380,7 @@ def _read_codex_rate_limits_uncached(timeout: float = _CODEX_APP_SERVER_TIMEOUT)
                 "clientInfo": {
                     "name": "ai_limits_monitor",
                     "title": "AI Limits Monitor",
-                    "version": "1.8.7",
+                    "version": APP_VERSION,
                 },
                 "capabilities": {"experimentalApi": False},
             },
@@ -450,6 +461,14 @@ def parse_codex_app_server_windows(payload: Any) -> tuple[list[QuotaWindow], str
     secondary = _codex_app_server_window("secondary", "Дополнительный лимит", main_limits.get("secondary"), "secondary")
     if secondary is not None:
         windows.append(secondary)
+    # Название по длительности окна: у тарифов с двумя окнами primary бывает пятичасовым.
+    for window in windows:
+        if window.window_minutes == 10080:
+            window.title = "Недельная квота"
+        elif window.window_minutes == 300:
+            window.title = "Лимит 5 часов"
+        elif window.window_minutes and window.role == "primary":
+            window.title = "Основной лимит"
 
     main_id = str(main_limits.get("limitId") or "codex")
     for limit_id, entry in sorted(by_id.items()):
@@ -480,7 +499,7 @@ def fetch_codex_quota_from_app_server(timeout: float = _CODEX_APP_SERVER_TIMEOUT
         return snapshot
     windows, plan = parse_codex_app_server_windows(response)
     if not windows:
-        snapshot.error = "Codex app-server не вернул окна лимитов"
+        snapshot.error = "Codex не сообщил лимиты. Проверь вход в Codex."
         return snapshot
     snapshot.windows = windows
     snapshot.login_method = plan
@@ -490,7 +509,7 @@ def fetch_codex_quota_from_app_server(timeout: float = _CODEX_APP_SERVER_TIMEOUT
         snapshot.main_window_id = main.id
         snapshot.weekly = main.used_percent
         snapshot.weekly_resets_at = main.resets_at
-    snapshot.main_label = "Недельная квота"
+    snapshot.main_label = main.title if main is not None else "Недельная квота"
     spark = next((w for w in windows if "spark" in w.id.casefold()), None)
     if spark is not None:
         snapshot.fable_weekly = spark.used_percent
@@ -500,6 +519,9 @@ def fetch_codex_quota_from_app_server(timeout: float = _CODEX_APP_SERVER_TIMEOUT
     return snapshot
 
 
+_CODEX_LAST_OK = True
+
+
 def _choose_main(provider: str, windows: list[QuotaWindow]) -> QuotaWindow | None:
     usable = [window for window in windows if window.used_percent is not None and not window.informational]
     if not usable:
@@ -507,7 +529,10 @@ def _choose_main(provider: str, windows: list[QuotaWindow]) -> QuotaWindow | Non
     if provider == "claude":
         return next((window for window in usable if window.window_minutes == 10080), usable[0])
     if provider == "codex":
-        return next((window for window in usable if window.role == "primary"), usable[0])
+        # Недельное окно основного лимита, а не место primary в ответе.
+        own = [window for window in usable if window.role in ("primary", "secondary")]
+        return next((window for window in own if window.window_minutes == 10080),
+                    next((window for window in own if window.role == "primary"), usable[0]))
     return usable[0]
 
 
@@ -519,11 +544,14 @@ def fetch_quota(provider: str = "claude") -> QuotaSnapshot:
     if provider == "claude":
         return read_best_local_claude_quota()
     if provider == "codex":
+        global _CODEX_LAST_OK
         snapshot = fetch_codex_quota_from_app_server()
-        if not snapshot.has_data():
-            # app-server мог не успеть подняться: одна повторная попытка в этом же цикле.
+        if not snapshot.has_data() and _CODEX_LAST_OK:
+            # app-server мог не успеть подняться: одна повторная попытка после удачного опроса.
+            # При устойчивом отказе (нет входа, нет клиента) второй запуск в каждом цикле не нужен.
             reset_codex_rate_limits_cache()
             snapshot = fetch_codex_quota_from_app_server()
+        _CODEX_LAST_OK = snapshot.has_data()
         return snapshot
     if provider == "grok":
         return fetch_grok_quota()
@@ -533,26 +561,44 @@ def fetch_quota(provider: str = "claude") -> QuotaSnapshot:
 
 
 def _history_samples() -> list[tuple[int, float]]:
+    """Недельные замеры истории Claude Desktop только аккаунта самого нового замера.
+
+    Поврежденный или чужой файл дает пустой ряд, а не исключение в аналитике.
+    """
+    from .claude_desktop import MAX_BYTES
+
     path = plan_history_path()
-    if path is None or not path.exists(): return []
-    try: data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError): return []
-    if not isinstance(data, dict): return []
-    out=[]
-    for sample in data.get("samples") or []:
+    try:
+        if path is None or not path.is_file() or path.stat().st_size > MAX_BYTES:
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return []
+    samples = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(samples, list):
+        return []
+    rows: list[tuple[int, float, Any]] = []
+    for sample in samples:
         if not isinstance(sample, dict):
             continue
-        usage=sample.get("u") or {}
-        if not isinstance(usage, dict) or "sd" not in usage:
+        usage = sample.get("u")
+        stamp = sample.get("t")
+        value = _percent(usage.get("sd")) if isinstance(usage, dict) else None
+        if value is None or not math.isfinite(value) or not 0 <= value <= 100:
             continue
-        try:
-            stamp = int(sample.get("t", 0))
-            if stamp < 100_000_000_000:
-                stamp *= 1000
-            out.append((stamp, float(usage["sd"])))
-        except (TypeError, ValueError):
-            pass
-    return sorted(out)
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            continue
+        if not math.isfinite(stamp) or stamp < 0:
+            continue
+        stamp = int(stamp)
+        if stamp < 100_000_000_000:
+            stamp *= 1000
+        rows.append((stamp, value, sample.get("org")))
+    if not rows:
+        return []
+    # После смены аккаунта в Desktop расход двух аккаунтов не складывается.
+    newest_org = max(rows, key=lambda row: row[0])[2]
+    return sorted((stamp, value) for stamp, value, org in rows if org == newest_org)
 
 
 def _legacy_window_value(row: dict[str, Any], provider: str, window_id: str) -> float | None:
@@ -577,7 +623,10 @@ def _stored_quota_series(
     db: Database, provider: str, window_ids: set[str], start_ms: int, end_ms: int,
 ) -> dict[str, tuple[str, list[tuple[int, float]]]]:
     by_window: dict[str, dict[str, list[tuple[int, float]]]] = {}
-    for row in db.quota_samples(provider=provider):
+    # Читается только период и неделя перед ним (базовый замер), а не вся история поставщика.
+    lower = dt.datetime.fromtimestamp(max(0, start_ms // 1000 - _BASELINE_LOOKBACK_SEC), dt.timezone.utc)
+    upper = dt.datetime.fromtimestamp(max(0, end_ms // 1000) + 1, dt.timezone.utc)
+    for row in db.quota_samples(start_utc=lower, end_utc=upper, provider=provider):
         ts = parse_iso(row.get("ts_utc"))
         if ts is None:
             continue
@@ -607,6 +656,23 @@ def _stored_quota_series(
     return {window_id: max(series.items(), key=coverage) for window_id, series in by_window.items()}
 
 
+_BASELINE_LOOKBACK_SEC = 8 * 86400
+
+
+def _desktop_history_covers(history: list[tuple[int, float]], stored, start_ms: int,
+                            end_ms: int, current_source: str | None) -> bool:
+    """История Desktop берется, если текущий снимок из Desktop или ее замеры в периоде не старее базы.
+
+    Давно не обновлявшийся файл Desktop не подменяет ряд строки состояния из базы.
+    """
+    if not stored:
+        return any(ts <= end_ms for ts, _ in history)
+    if (current_source or "").casefold() == CLAUDE_DESKTOP_SOURCE.casefold():
+        return True
+    inside = [ts for ts, _ in history if start_ms < ts <= end_ms]
+    return bool(inside) and max(inside) >= max(ts for ts, _ in stored[1])
+
+
 def quota_windows_consumed(
     period: Period, db: Database | None, current_percents: dict[str, float | None], provider: str,
     *, current_source: str | None = None,
@@ -617,13 +683,12 @@ def quota_windows_consumed(
     end_ms = int(period.end_utc.timestamp() * 1000)
     stored_window_ids = set(current_percents)
     series = {}
-    if provider == "claude" and "secondary" in stored_window_ids:
-        history = _history_samples()
-        if history and (db is None or any(ts <= start_ms or start_ms < ts <= end_ms for ts, _ in history)):
-            series["secondary"] = CLAUDE_DESKTOP_SOURCE, history
-            stored_window_ids.remove("secondary")
     if db is not None and stored_window_ids:
         series.update(_stored_quota_series(db, provider, stored_window_ids, start_ms, end_ms))
+    if provider == "claude" and "secondary" in stored_window_ids:
+        history = _history_samples()
+        if history and _desktop_history_covers(history, series.get("secondary"), start_ms, end_ms, current_source):
+            series["secondary"] = CLAUDE_DESKTOP_SOURCE, history
 
     consumed_by_window = {}
     for window_id, current_percent in current_percents.items():

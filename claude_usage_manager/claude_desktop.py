@@ -31,6 +31,13 @@ def desktop_history_paths() -> tuple[pathlib.Path, ...]:
         roaming = pathlib.Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming")
         local = pathlib.Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
         paths = [roaming / "Claude" / HISTORY_FILE]
+        # Профили Desktop в %LOCALAPPDATA%\Claude-Data\<профиль>: там же их ищет сканер тредов.
+        profiles = local / "Claude-Data"
+        if profiles.is_dir():
+            try:
+                paths.extend(folder / HISTORY_FILE for folder in sorted(profiles.iterdir()) if folder.is_dir())
+            except OSError:
+                pass
         packages = local / "Packages"
         if packages.is_dir():
             try:

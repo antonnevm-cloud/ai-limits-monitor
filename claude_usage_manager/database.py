@@ -259,8 +259,12 @@ class Database:
         credits.items = credits.sorted_items()
         return credits
 
-    def record_quota(self, snapshot: QuotaSnapshot, *, profile_key: str | None = None) -> bool:
-        """Пишет provider-specific snapshot; arbitrary windows сохраняются JSON-ом."""
+    def record_quota(self, snapshot: QuotaSnapshot, *, profile_key: str | None = None,
+                     observed_at: dt.datetime | None = None) -> bool:
+        """Пишет provider-specific snapshot; arbitrary windows сохраняются JSON-ом.
+
+        ``observed_at`` - время измерения для запасного снимка: запись получает его, а не время записи.
+        """
         with self._lock:
             source = snapshot.source or (f"unknown:{snapshot.provider}" if snapshot.provider else "")
             if profile_key is None:
@@ -272,6 +276,8 @@ class Database:
                 "FROM quota_samples WHERE source = ? AND profile_key = ? ORDER BY id DESC LIMIT 1", (source, profile_key),
             ).fetchone()
             now = dt.datetime.now(dt.timezone.utc)
+            if observed_at is not None and observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
             if row is not None:
                 # Время наблюдения, время сбора кредитов и срок сброса, пересчитанный из "через N секунд",
                 # меняются на каждом опросе при тех же лимитах. Иначе каждый опрос Codex и Antigravity
@@ -283,9 +289,11 @@ class Database:
                         and _same_manual_resets(row["manual_resets_json"] or "{}", manual_resets_json))
                 last_ts=parse_iso(row["ts_utc"]) or now
                 if same and (now-last_ts) < _MIN_QUOTA_INTERVAL: return False
+                if observed_at is not None and observed_at <= last_ts: return False
+            stamp = observed_at if observed_at is not None and observed_at < now else now
             self._conn.execute(
                 "INSERT INTO quota_samples (ts_utc,five_hour,weekly,fable_weekly,source,windows_json,main_window_id,login_method,manual_resets_json,profile_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (now.isoformat(), snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly, source, windows_json, snapshot.main_window_id, snapshot.login_method, manual_resets_json, profile_key),
+                (stamp.astimezone(dt.timezone.utc).isoformat(), snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly, source, windows_json, snapshot.main_window_id, snapshot.login_method, manual_resets_json, profile_key),
             )
             self._conn.commit(); return True
 

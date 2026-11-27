@@ -67,9 +67,9 @@ def dot_tooltip(provider,status,state):
     name=PROVIDER_LABELS.get(provider,provider);stamp=state.snapshot.updated_at;when=stamp.astimezone().strftime('%d.%m %H:%M') if stamp else 'неизвестно';note=(state.error or '').strip();source=SOURCE_NOTES.get(provider,'')
     if status=='онлайн':lines=[f'ОНЛАЙН — {name}: данные получены от источника.',source,f'{note} Данные от {when}.' if note else '']
     elif status=='локальные данные':
-        if provider=='claude':return 'ЛОКАЛЬНЫЕ ДАННЫЕ — основной источник недоступен; показана локальная история Claude Code.'
+        if provider=='claude':return f'ЛОКАЛЬНЫЕ ДАННЫЕ — Claude: свежего замера нет, Claude Code сообщает остаток только во время работы. Показан последний локальный замер от {when}.'
         lines=[f'ЛОКАЛЬНЫЕ ДАННЫЕ — {name}: основной источник недоступен. {state.snapshot.fallback_source}.',source]
-    elif status=='кэш':lines=[f'КЭШ — {name}: источник сейчас не отвечает, показан последний сохранённый снимок от {when}.',f'Причина: {note}' if note else 'Причина записана в backend.log.',source]
+    elif status=='кэш':lines=[f'КЭШ — {name}: источник сейчас не отвечает, показан последний сохранённый снимок от {when}.',f'Причина: {note}' if note else 'Причина записана в журнал программы (app.log или backend.log в папке данных).',source]
     else:lines=[f'НЕТ ДАННЫХ — {name}: нет ни текущего ответа, ни сохранённого снимка.',f'Причина: {note}' if note else '']
     return '\n'.join(line for line in lines if line)
 
@@ -186,14 +186,16 @@ def agent_summary(row,state):
 def expiring_reset(credits,now=None,days=RESET_NOTICE_DAYS):
     '''Ближайший срок доступного полного сброса, если до него меньше `days` суток; иначе None.'''
     if credits is None or credits.state!='available' or not credits.available_count:return None
-    expiry=credits.nearest_expiry()
+    now=now or dt.datetime.now(dt.timezone.utc)
+    expiry=credits.nearest_expiry(now)
     if expiry is None:return None
-    now=now or dt.datetime.now(dt.timezone.utc);left=expiry.astimezone(dt.timezone.utc)-now.astimezone(dt.timezone.utc)
+    left=expiry.astimezone(dt.timezone.utc)-now.astimezone(dt.timezone.utc)
     return expiry if dt.timedelta(0)<left<dt.timedelta(days=days) else None
 
 def reset_notice_text(credits,expiry,now=None):
     now=now or dt.datetime.now(dt.timezone.utc);left=expiry.astimezone(dt.timezone.utc)-now.astimezone(dt.timezone.utc);local=expiry.astimezone()
-    when=f'через {left.days} дн.' if left.days>=1 else f'через {max(1,round(left.total_seconds()/3600))} ч'
+    hours=int(left.total_seconds()//3600)
+    when=f'через {left.days} дн.' if left.days>=1 else f'через {hours} ч' if hours>=1 else f'через {max(1,int(left.total_seconds()//60))} мин'
     count=credits.available_count or 1
     if count==1:return f'Есть полный сброс: сгорит {local:%d.%m} {local:%H:%M} ({when}), успей использовать'
     return f'Полных сбросов: {count}, ближайший сгорит {local:%d.%m} {local:%H:%M} ({when}), успей использовать'

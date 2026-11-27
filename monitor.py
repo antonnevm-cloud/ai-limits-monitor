@@ -55,6 +55,9 @@ def _run(args):
 
 def main():
     try:
+        from claude_usage_manager.process_utils import reset_inherited_dll_directory
+
+        reset_inherited_dll_directory()
         return _run(sys.argv[1:])
     except Exception:
         # Программа без консоли показала бы окно с ошибкой, в том числе при каждом вызове строки состояния.

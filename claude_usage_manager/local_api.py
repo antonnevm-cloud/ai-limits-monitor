@@ -42,7 +42,7 @@ def manual_resets_payload(
     now: dt.datetime,
     provider: str = "",
 ) -> dict[str, Any]:
-    nearest = credits.nearest_expiry()
+    nearest = credits.nearest_expiry(now)
     owner = credits.provider or provider
     return {
         "state": credits.state,

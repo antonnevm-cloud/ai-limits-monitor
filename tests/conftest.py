@@ -145,6 +145,7 @@ def _never_start_live_agent_clis(monkeypatch):
 
     monkeypatch.setattr(grok_provider, "grok_cli", lambda: None)
     monkeypatch.setattr(quota, "codex_cli", lambda: None)
+    monkeypatch.setattr(quota, "_CODEX_LAST_OK", True)
 
     def reset():
         grok_provider.reset_cli_cache()

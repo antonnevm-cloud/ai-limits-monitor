@@ -64,18 +64,59 @@ def test_weekly_consumed_no_data(monkeypatch):
     assert quota.weekly_consumed(_period(), None, current_weekly=None) is None
 
 
-def test_weekly_consumed_prefers_native_history_over_conflicting_database(monkeypatch):
+def test_weekly_consumed_prefers_newer_native_history_over_database(monkeypatch):
     history = [
         (_ms(2026, 8, 5, 9, 0), 30.0),
         (_ms(2026, 8, 5, 10, 30), 40.0),
     ]
     monkeypatch.setattr(quota, "_history_samples", lambda: history)
 
-    class ConflictingDb:
-        def quota_samples(self, provider=None):
-            raise AssertionError("для недельной квоты Claude не нужен второй источник")
+    class OlderDb:
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
+            return [
+                {"ts_utc": "2026-08-05T09:00:00+00:00", "weekly": 30.0, "source": quota.CLAUDE_STATUSLINE_SOURCE},
+                {"ts_utc": "2026-08-05T09:30:00+00:00", "weekly": 33.0, "source": quota.CLAUDE_STATUSLINE_SOURCE},
+            ]
 
-    assert quota.weekly_consumed(_period(), ConflictingDb(), 40.0) == 10.0
+    assert quota.weekly_consumed(_period(), OlderDb(), 40.0) == 10.0
+
+
+def test_stale_desktop_history_does_not_hide_statusline_samples(monkeypatch):
+    # Desktop давно не открывали: его единственный замер не подменяет ряд строки состояния (claude#1).
+    monkeypatch.setattr(quota, "_history_samples", lambda: [(_ms(2026, 8, 2, 9, 0), 40.0)])
+    statusline = quota.CLAUDE_STATUSLINE_SOURCE
+
+    class StatuslineDb:
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
+            return [
+                {"ts_utc": "2026-08-05T08:00:00+00:00", "weekly": 50.0, "source": statusline},
+                {"ts_utc": "2026-08-05T10:30:00+00:00", "weekly": 58.0, "source": statusline},
+                {"ts_utc": "2026-08-05T11:00:00+00:00", "weekly": 62.0, "source": statusline},
+            ]
+
+    assert quota.weekly_consumed(_period(), StatuslineDb(), 65.0, current_source=statusline) == 15.0
+
+
+def test_history_samples_keep_only_newest_account(monkeypatch, tmp_path):
+    path = tmp_path / "plan-usage-history.json"
+    path.write_text(json.dumps({"version": 2, "samples": [
+        {"t": _ms(2026, 8, 5, 8, 0), "org": "a", "u": {"sd": 30}},
+        {"t": _ms(2026, 8, 5, 9, 0), "org": "a", "u": {"sd": 41}},
+        {"t": _ms(2026, 8, 5, 10, 0), "org": "b", "u": {"sd": 3}},
+        {"t": _ms(2026, 8, 5, 11, 0), "org": "b", "u": {"sd": 5.2}},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(quota, "plan_history_path", lambda: path)
+
+    assert quota._history_samples() == [(_ms(2026, 8, 5, 10, 0), 3.0), (_ms(2026, 8, 5, 11, 0), 5.2)]
+
+
+@pytest.mark.parametrize("content", ['{"samples": {"t": 1}}', "[" * 5000, '{"samples": [{"t": "x", "u": 5}]}'])
+def test_history_samples_survive_damaged_file(monkeypatch, tmp_path, content):
+    path = tmp_path / "plan-usage-history.json"
+    path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(quota, "plan_history_path", lambda: path)
+
+    assert quota._history_samples() == []
 
 
 def test_weekly_consumed_falls_back_to_database_outside_history(monkeypatch):
@@ -86,7 +127,7 @@ def test_weekly_consumed_falls_back_to_database_outside_history(monkeypatch):
     )
 
     class DatabaseFallback:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             assert provider == "claude"
             return [
                 {"ts_utc": "2026-08-05T09:00:00+00:00", "weekly": 30.0},
@@ -102,7 +143,7 @@ def test_weekly_consumed_keeps_one_claude_source(monkeypatch):
     statusline = "claude-code:statusline"
 
     class DatabaseFallback:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             assert provider == "claude"
             return [
                 {"ts_utc": "2026-08-05T09:00:00+00:00", "weekly": 34.0, "source": mod},
@@ -250,7 +291,7 @@ def test_informational_main_window_is_not_selected():
 def test_quota_consumed_isolated_provider_history(monkeypatch):
     monkeypatch.setattr(quota, "_history_samples", lambda: [(_ms(2026, 8, 5, 9, 0), 99.0)])
     class FakeDb:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             assert provider == "codex"
             return [
                 {"ts_utc": "2026-08-05T09:00:00+00:00", "weekly": 10.0, "source": "codexbar:codex"},
@@ -262,7 +303,7 @@ def test_quota_consumed_isolated_provider_history(monkeypatch):
 def test_quota_consumed_does_not_invent_before_first_snapshot(monkeypatch):
     monkeypatch.setattr(quota, "_history_samples", lambda: [])
     class FakeDb:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             return [{"ts_utc": "2026-08-05T10:30:00+00:00", "weekly": 13.0, "source": f"codexbar:{provider}"}]
     assert quota.quota_consumed(_period(), FakeDb(), 13.0, "antigravity") is None
 
@@ -274,7 +315,7 @@ def test_quota_window_consumed_isolated_windows(monkeypatch):
     monkeypatch.setattr(quota, "_history_samples", lambda: [])
     from claude_usage_manager.models import QuotaWindow
     class FakeDb:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             assert provider == "antigravity"
             return [
                 {"ts_utc": "2026-08-05T09:00:00+00:00", "windows": [QuotaWindow("model-a", "A", 10.0), QuotaWindow("model-b", "B", 50.0)]},
@@ -292,7 +333,7 @@ def test_quota_windows_share_one_read_without_mixing_claude_sources(monkeypatch)
     calls = []
 
     class FakeDb:
-        def quota_samples(self, provider=None):
+        def quota_samples(self, start_utc=None, end_utc=None, provider=None):
             calls.append(provider)
             return [
                 {"ts_utc": "2026-08-05T09:00:00+00:00", "source": mod, "weekly": 7.0, "five_hour": 5.0},
@@ -394,7 +435,7 @@ def test_fetch_quota_codex_reports_native_error(monkeypatch):
     snap = quota.fetch_quota("codex")
     assert snap.source == "codex-app-server:account/rateLimits/read"
     assert not snap.has_data()
-    assert "не вернул окна лимитов" in snap.error
+    assert "не сообщил лимиты" in snap.error
 
 
 def test_codex_rate_limits_cache_serves_one_call_per_cycle(monkeypatch):
