@@ -33,13 +33,14 @@ from .quota_columns import QuotaColumns, cell_label, limit_suffix, manual_reset_
 from .qt_theme import COLORS,build_stylesheet
 from .quota_monitor_model import AG_FIXED_GROUP_SETTING,PROVIDERS,PROVIDER_LABELS,MonitorData,ProviderState,antigravity_fixed_group,build_compact_rows,build_rows,cached_states,manual_reset_tooltip,refresh_monitor_data
 from .utils import get_logger,now_local,setup_logging
-from .windows_ui import enable_per_monitor_dpi_awareness,set_window_always_on_top
+from .windows_ui import enable_per_monitor_dpi_awareness,keep_tool_window_visible,set_window_always_on_top
 from .widget_ipc import acquire_widget_mutex as _mutex
 
 MONITOR_NAME='AI Limits Monitor'; MONITOR_VERSION=APP_VERSION; DEFAULT_REFRESH=60; CACHE_SCAN_MS=10000; USAGE_SCAN_MS=30000; FORECAST_REFRESH_TICKS=30; FORECAST_SAMPLES_TTL=60; DEFAULT_LIST_WIDTH=380; CACHE_PROVIDERS=('claude','codex','grok'); CACHE_TTL_CHOICES={300,600,900,1800,3600}
 BADGES={'claude':'C','codex':'X','grok':'G','antigravity':'A'}
 BADGE_COLORS={'claude':'#A86F58','codex':'#426D72','grok':'#6A6F76','antigravity':'#5D4A87'}
 COMPACT_WIDTH=180; COMPACT_MIN_WIDTH=180; COMPACT_MIN_HEIGHT=150; FIT_SETTLE_MS=60; CACHE_SCREEN_MARGIN=24; MAX_USER_WIDTH=3000; DRAWER_WIDTH=300
+ANCHOR_STATE='monitor_anchor'; ANCHOR_MARGIN=16
 ICON_LOGICAL_SIZE=18; ICON_BOX_SIZE=18; RESET_NOTICE_DAYS=14; RESET_CRITICAL_DAYS=3
 PAYMENTS_SETTING = 'monitor_subscription_payments'
 PAYMENT_AMOUNT_LENGTH = 24
@@ -783,6 +784,19 @@ class MonitorWindow(QMainWindow):
         if scan:self.cache_timer.start();QTimer.singleShot(400,self._start_cache_scan);self.usage_timer.start();QTimer.singleShot(1500,self._start_usage_scan)
     def _list_expanded(self):return self.cache_enabled and any(self.cache_expanded.get(p) for p in CACHE_PROVIDERS)
     def _cache_wanted(self):return self.cache_enabled and (self._cache_scan or self._list_expanded())
+    def _hidden_by_user(self):
+        '''Окно спрятано в область уведомлений: сканы тредов, расхода и прогноза ждут показа (квоты для подсказки значка идут дальше).'''
+        hidden=self.isHidden() and self.testAttribute(Qt.WidgetAttribute.WA_WState_ExplicitShowHide)
+        if hidden:self._scans_paused=True
+        return hidden
+    def showEvent(self,event):
+        super().showEvent(event)
+        if getattr(self,'_scans_paused',False):
+            self._scans_paused=False
+            QTimer.singleShot(0,self._resume_scans)
+    def _resume_scans(self):
+        if self._quit:return
+        self._start_cache_scan();self._start_usage_scan();self._refresh_forecasts()
     def running_count(self,provider):
         '''Сколько тредов агента работает сейчас; None, пока сканирования не было или агент без тредов.'''
         if not self.cache_enabled or provider not in CACHE_PROVIDERS or provider not in self.cache_threads:return None
@@ -837,7 +851,7 @@ class MonitorWindow(QMainWindow):
     def _make_drawer(self):
         """Панель вида тредов рядом с виджетом."""
         # Окно без фона со скругленной рамкой внутри: фон из стиля у прозрачного окна верхнего уровня не рисуется.
-        drawer=QWidget(None,Qt.WindowType.Tool|Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint);drawer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground,True);drawer.setFixedWidth(DRAWER_WIDTH);outer=QVBoxLayout(drawer);outer.setContentsMargins(0,0,0,0)
+        drawer=QWidget(None,Qt.WindowType.Tool|Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint);drawer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground,True);keep_tool_window_visible(drawer);drawer.setFixedWidth(DRAWER_WIDTH);outer=QVBoxLayout(drawer);outer.setContentsMargins(0,0,0,0)
         body=QFrame();body.setObjectName('ThreadDrawer');outer.addWidget(body);box=QVBoxLayout(body);box.setContentsMargins(14,10,14,12);box.setSpacing(6);self.view_combos={}
         head=QHBoxLayout();head.setContentsMargins(0,0,0,2);heading=QLabel('Вид тредов');heading.setObjectName('DrawerHeading');close=QToolButton();close.setObjectName('PopupClose');close.setText('×');close.setAccessibleName('Закрыть настройки вида');close.setToolTip('Закрыть настройки вида');close.setCursor(Qt.CursorShape.PointingHandCursor);close.clicked.connect(drawer.hide);head.addWidget(heading,1);head.addWidget(close);box.addLayout(head)
         for spec in THREAD_VIEW_FIELDS:
@@ -882,7 +896,10 @@ class MonitorWindow(QMainWindow):
         self.drawer.adjustSize();area=self._screen_area();frame=self.frameGeometry();left=frame.left()-self.drawer.width()-8
         if area is not None and left<area.left():left=frame.right()+8
         top=frame.top()
-        if area is not None:top=max(area.top(),min(top,area.bottom()+1-self.drawer.height()))
+        if area is not None:
+            # Широкое окно: панель не уходит за правый край экрана, а встает поверх виджета.
+            left=max(area.left(),min(left,area.right()+1-self.drawer.width()))
+            top=max(area.top(),min(top,area.bottom()+1-self.drawer.height()))
         self.drawer.move(left,top);self.drawer.show();self.drawer.raise_();self.drawer.activateWindow()
     def _set_thread_view(self,name,value):
         view=self.thread_view.with_value(name,value)
@@ -931,7 +948,7 @@ class MonitorWindow(QMainWindow):
     def _usage_wanted(self):return self.usage_scanner is not None and self._list_expanded() and not self._quit
     @Slot()
     def _start_usage_scan(self):
-        if not self._usage_wanted() or self._usage_worker:return
+        if not self._usage_wanted() or self._usage_worker or self._hidden_by_user():return
         starts,used=self._usage_inputs();worker=UsageScanWorker(self.usage_scanner,starts,used);worker.generation=self._connection_generation;worker.signals.finished.connect(self._usage_scanned);worker.signals.failed.connect(self._usage_failed);self._usage_worker=worker;self.pool.start(worker)
     @Slot(object)
     def _usage_scanned(self,report):
@@ -1002,6 +1019,7 @@ class MonitorWindow(QMainWindow):
         self._request_forecast(provider)
 
     def _refresh_forecasts(self):
+        if self._hidden_by_user():return
         for provider in self.forecast_bars:
             self._request_forecast(provider, force=True)
     def _forecast_clicked(self, provider):
@@ -1066,7 +1084,7 @@ class MonitorWindow(QMainWindow):
                 bar.chart_button.setFocus()
     @Slot()
     def _start_cache_scan(self):
-        if not self._cache_wanted() or self._cache_worker or self._quit:return
+        if not self._cache_wanted() or self._cache_worker or self._quit or self._hidden_by_user():return
         worker=CacheScanWorker(self.cache_scanner);worker.generation=self._connection_generation;worker.signals.finished.connect(self._cache_scanned);worker.signals.failed.connect(self._cache_failed);self._cache_worker=worker;self.pool.start(worker)
     @Slot(object)
     def _cache_scanned(self,found):
@@ -1162,7 +1180,11 @@ class MonitorWindow(QMainWindow):
                 self._close_popup()
             elif rebuilt or details_changed:
                 self._update_forecast_popup(provider, self.forecast_bars[provider])
-        live=sum(s.live for s in self.data.states.values());local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in self.data.states.values());cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in self.data.states.values());self.footer.setText(f'{live}/4 онлайн'+(f' · {local} локальные' if local else '')+(f' · {cached} кэш' if cached else '')+f' · Codex/AG {refresh_label(self.seconds)}');self._update_tray_tooltip()
+        try:enabled={key for key,connection in load_connections().items() if connection.enabled}
+        except Exception:enabled=set(PROVIDERS)
+        # Выключенный в подключениях источник в счетчике не участвует.
+        states=[s for p,s in self.data.states.items() if p in enabled]
+        live=sum(s.live for s in states);local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in states);cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in states);self.footer.setText(f'{live}/{len(enabled)} онлайн'+(f' · {local} локальные' if local else '')+(f' · {cached} кэш' if cached else '')+f' · Codex/AG {refresh_label(self.seconds)}');self._update_tray_tooltip()
         if changed or details_changed:
             for header in self.header_rows.values():
                 header.layout().invalidate();header.updateGeometry()
@@ -1306,7 +1328,7 @@ class MonitorWindow(QMainWindow):
     def _apply_window_flags(self):
         flags=Qt.WindowType.FramelessWindowHint|Qt.WindowType.Tool
         if self.topmost:flags|=Qt.WindowType.WindowStaysOnTopHint
-        visible=self.isVisible();self.setWindowFlags(flags);self._enable_transparency(self);self._enable_transparency(self.centralWidget())
+        visible=self.isVisible();self.setWindowFlags(flags);self._enable_transparency(self);self._enable_transparency(self.centralWidget());keep_tool_window_visible(self)
         if visible:self.show()
         QTimer.singleShot(0,self,self._enforce_topmost)
     def _apply_opacity(self):
@@ -1556,7 +1578,11 @@ class MonitorWindow(QMainWindow):
         self.show();self._enforce_topmost()
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating,False)
     def _save_geometry(self):
-        try:self.db.set_state('monitor_geometry_compact',bytes(self.saveGeometry().toHex()).decode('ascii'))
+        try:
+            g=self.geometry()
+            # Окно растет вверх и влево, поэтому место окна - его правый нижний угол.
+            self.db.set_state(ANCHOR_STATE,json.dumps({'right':g.right(),'bottom':g.bottom()}))
+            self.db.set_state('monitor_geometry_compact',bytes(self.saveGeometry().toHex()).decode('ascii'))
         except Exception:get_logger().warning('Не удалось сохранить положение окна',exc_info=True)
     def prepare_for_session_end(self):
         # Запрос завершения от Windows или установщика: закрытие окна больше не прячет его в область уведомлений.
@@ -1568,11 +1594,29 @@ class MonitorWindow(QMainWindow):
         self._fit_settle_timer.stop()
         if self.forecast_popup is not None:self.forecast_popup.deleteLater();self.forecast_popup=None
         if self.worker is None and not self._forecast_workers:self._finish_quit()
+    def _saved_anchor(self):
+        '''Сохраненный правый нижний угол окна, если он лежит на одном из текущих экранов.'''
+        try:
+            data=json.loads(self.db.get_state(ANCHOR_STATE,'') or 'null')
+            point=QPoint(int(data['right']),int(data['bottom']))
+        except (TypeError,ValueError,KeyError):return None
+        screen=QApplication.screenAt(point)
+        if screen is None:return None
+        area=screen.availableGeometry()
+        return QPoint(min(point.x(),area.right()),min(point.y(),area.bottom()))
     def _restore_geometry(self):
-        raw=self.db.get_state('monitor_geometry_compact','') or ''
-        if raw:
-            try:self.restoreGeometry(QByteArray.fromHex(raw.encode('ascii')))
+        '''Первый запуск, отключенный экран или отказ восстановления: окно встает в правый нижний угол рабочей области.'''
+        anchor=self._saved_anchor()
+        if anchor is None:
+            raw=self.db.get_state('monitor_geometry_compact','') or ''
+            try:
+                # Положение, сохраненное прежними версиями, пока нет нового ключа.
+                if raw and self.db.get_state(ANCHOR_STATE,'') in (None,'') and self.restoreGeometry(QByteArray.fromHex(raw.encode('ascii'))):return
             except Exception:pass
+            screen=QApplication.primaryScreen()
+            if screen is None:return
+            area=screen.availableGeometry();anchor=QPoint(area.right()-ANCHOR_MARGIN,area.bottom()-ANCHOR_MARGIN)
+        size=self.size();self.setGeometry(QRect(anchor.x()+1-size.width(),anchor.y()+1-size.height(),size.width(),size.height()))
     def closeEvent(self,event:QCloseEvent):
         self._save_geometry()
         if self._quit:super().closeEvent(event)

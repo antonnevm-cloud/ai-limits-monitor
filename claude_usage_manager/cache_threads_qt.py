@@ -241,8 +241,13 @@ class CacheRing(QWidget):
 
 
 def explicitly_hidden(widget: QWidget) -> bool:
-    """Скрыт ли виджет явно (hide()); новый виджет до первого показа тоже isHidden(), но анимацию ему запускать надо."""
-    return widget.isHidden() and widget.testAttribute(Qt.WidgetAttribute.WA_WState_ExplicitShowHide)
+    """Скрыт ли явно (hide()) сам виджет или его окно; новый виджет до первого показа тоже isHidden(), но анимацию ему запускать надо.
+
+    Окно, спрятанное в область уведомлений, анимацию не запускает: при показе окна кольца получат showEvent.
+    """
+    explicit = Qt.WidgetAttribute.WA_WState_ExplicitShowHide
+    top = widget.window()
+    return any(item.isHidden() and item.testAttribute(explicit) for item in (widget, top))
 
 
 def spinner_angle(seconds: float) -> float:

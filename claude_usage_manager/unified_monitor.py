@@ -6,7 +6,7 @@ import logging
 import sys
 import traceback
 
-from PySide6.QtCore import QRunnable, QTimer, Slot
+from PySide6.QtCore import QRunnable, Qt, QTimer, Slot
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import QApplication
 
@@ -161,7 +161,8 @@ class UnifiedMonitorWindow(MonitorWindow):
         """Open provider/model quota details without starting another process."""
         try:
             if self._limits_window is None:
-                self._limits_window = DetailedLimitsWindow(self.db, auto_refresh=False)
+                # "Обновить" в окне лимитов идет через сборщик виджета, а не отдельным опросом мимо него.
+                self._limits_window = DetailedLimitsWindow(self.db, auto_refresh=False, refresh_handler=self.refresh_now)
                 self._limits_window.timer.stop()
                 self._limits_window.setStyleSheet(DETAILED_STYLE)
                 apply_windows_dark_frame(self._limits_window)
@@ -275,6 +276,14 @@ def run_monitor(autostart: bool = False) -> int:
         window.show_without_activation()
     else:
         bring_to_front(window)
+    if sys.platform == "darwin":
+        # Событий показа Windows здесь нет: щелчок по значку в Dock при спрятанных окнах возвращает виджет.
+        def _reactivated(state) -> None:
+            if (state == Qt.ApplicationState.ApplicationActive and not window._quit
+                    and not any(widget.isVisible() for widget in app.topLevelWidgets())):
+                window.show_normal()
+
+        app.applicationStateChanged.connect(_reactivated)
     show_event = open_show_event()
     show_timer = QTimer(window)
     show_timer.setInterval(150)

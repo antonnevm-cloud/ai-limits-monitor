@@ -64,5 +64,22 @@ def test_portable_installer_skips_registration_and_all_shortcuts():
     assert len(registry) == 1 and 'Tasks: autostart' in registry[0] and '--autostart' in registry[0]
     assert 'Check: not PortableInstall' in registry[0]
     # Старые файлы программы удаляются до копирования новой версии.
-    assert sections['InstallDelete'] == ['Type: filesandordirs; Name: "{app}\\_internal"']
+    assert sections['InstallDelete'] == ['Type: filesandordirs; Name: "{app}\\_internal"',
+                                         'Type: files; Name: "{app}\\portable.txt"; Check: not PortableInstall']
     assert any('--uninstall' in line for line in sections['UninstallRun'])
+    # Переносимая копия требует своей папки и получает признак хранения данных рядом с программой.
+    assert "ExpandConstant('{param:dir|}') = ''" in source
+    assert "{app}\\portable.txt" in source
+
+
+def test_portable_marker_moves_data_next_to_program(tmp_path, monkeypatch):
+    from claude_usage_manager import utils
+
+    monkeypatch.delenv('AI_LIMITS_DATA_DIR', raising=False)
+    program = tmp_path / 'Копия программы'
+    program.mkdir()
+    monkeypatch.setattr(utils.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(utils.sys, 'executable', str(program / 'AI Limits Monitor.exe'))
+    assert utils.portable_data_dir() is None
+    (program / utils.PORTABLE_MARKER).write_text('portable', encoding='utf-8')
+    assert utils.data_dir() == program.resolve() / 'data'

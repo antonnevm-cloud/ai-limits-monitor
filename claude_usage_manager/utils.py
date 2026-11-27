@@ -38,13 +38,31 @@ def app_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
+PORTABLE_MARKER = "portable.txt"
+
+
+def portable_data_dir() -> pathlib.Path | None:
+    """Папка data рядом с программой, если установщик положил признак переносимой установки (/PORTABLE=1).
+
+    Тогда вторая копия рядом с обычной установкой не делит с ней историю, настройки и блокировку окна,
+    а перенос папки программы переносит и данные.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    folder = pathlib.Path(sys.executable).resolve().parent
+    return folder / "data" if (folder / PORTABLE_MARKER).is_file() else None
+
+
 def data_dir() -> pathlib.Path:
     """Личные настройки и история пользователя, общие для виджета и обработчиков."""
     override = os.environ.get("AI_LIMITS_DATA_DIR")
+    portable = None if override else portable_data_dir()
     if override:
         path = pathlib.Path(override).expanduser()
         if not path.is_absolute():
             raise ValueError("AI_LIMITS_DATA_DIR должен содержать абсолютный путь")
+    elif portable is not None:
+        path = portable
     elif sys.platform == "darwin":
         path = pathlib.Path.home() / "Library" / "Application Support" / APP_DIR_NAME
     elif os.name == "nt":

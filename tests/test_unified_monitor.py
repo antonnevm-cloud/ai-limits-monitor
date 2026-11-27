@@ -174,9 +174,10 @@ def test_unified_monitor_reuses_one_limits_window(tmp_path, monkeypatch):
             calls["stopped"] += 1
 
     class FakeLimits:
-        def __init__(self, incoming_db, *, auto_refresh=True):
+        def __init__(self, incoming_db, *, auto_refresh=True, refresh_handler=None):
             assert incoming_db is db
             assert auto_refresh is False
+            assert refresh_handler is not None
             calls["created"] += 1
             self.timer = FakeTimer()
             self.states = {}

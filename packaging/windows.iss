@@ -50,6 +50,8 @@ english.AutoStartLabel=Start the monitor when I sign in to Windows
 [InstallDelete]
 ; Файлы прежней версии, которых нет в новой, не должны оставаться рядом с программой.
 Type: filesandordirs; Name: "{app}\_internal"
+; Обычная установка в папку переносимой копии хранит данные в профиле пользователя.
+Type: files; Name: "{app}\portable.txt"; Check: not PortableInstall
 
 [Files]
 Source: "{#Payload}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -131,6 +133,18 @@ begin
   end;
 end;
 
+function InitializeSetup: Boolean;
+begin
+  Result := True;
+  { Без своей папки переносимая копия легла бы поверх обычной установки, не обновив запись о ней. }
+  if PortableInstall and (ExpandConstant('{param:dir|}') = '') then
+  begin
+    SuppressibleMsgBox('Для переносимой установки укажи папку параметром /DIR="полный путь".',
+                       mbError, MB_OK, IDOK);
+    Result := False;
+  end;
+end;
+
 function RestartAfterSilentUpdate: Boolean;
 begin
   Result := WizardSilent and WidgetWasRunning and not PortableInstall;
@@ -147,6 +161,11 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Shortcut: String;
 begin
+  if (CurStep = ssPostInstall) and PortableInstall then
+    { Признак переносимой копии: настройки и история хранятся в папке data рядом с программой. }
+    SaveStringToFile(ExpandConstant('{app}\portable.txt'),
+                     'AI Limits Monitor portable copy: settings and history are kept in the data folder next to the program.' + #13#10,
+                     False);
   if (CurStep = ssPostInstall) and not PortableInstall then
   begin
     { Прежние версии включали автозапуск ярлыком в папке автозагрузки. Выбор пользователя сохраняется. }

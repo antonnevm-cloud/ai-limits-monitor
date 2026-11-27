@@ -124,6 +124,16 @@ def check(package: Path, stage: Path) -> None:
         if expected not in result.stdout:
             raise ValueError(f'{option}: отсутствует ожидаемый ответ {expected!r}')
         print(option, result.stdout.strip())
+    if sys.platform == 'win32':
+        # Переносимая копия без AI_LIMITS_DATA_DIR хранит данные в папке data рядом с программой, а не в профиле.
+        if not (target / 'portable.txt').is_file():
+            raise FileNotFoundError('Переносимая установка без признака portable.txt')
+        portable_env = {key: value for key, value in env.items() if key != 'AI_LIMITS_DATA_DIR'}
+        subprocess.run([str(executable), '--smoke-test'], stdout=subprocess.PIPE, cwd=stage, env=portable_env,
+                       timeout=40, check=True)
+        if not (target / 'data' / 'usage.db').is_file() or any((profile / 'Local').glob('*/usage.db')):
+            raise ValueError('Переносимая копия хранит данные не рядом с программой')
+        print('portable data', target / 'data')
 
 
 def _visible_window_titles(process_id: int) -> set[str]:

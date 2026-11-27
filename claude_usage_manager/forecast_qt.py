@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from .qt_theme import COLORS
+from .windows_ui import keep_tool_window_visible
 from .week_forecast import HALF_LIFE_HOURS, OTHER_LABEL, RATE_WEIGHTED, WEEKDAYS, ChartSeries, WeekChart, WeekForecast, clock_text
 
 ACCENT = "#4C9AF0"
@@ -497,6 +498,7 @@ class ForecastPopup(QDialog):
         self.rejected.connect(self.closed)
         # Окно без фона, скругленная рамка с фоном внутри: у прозрачного окна верхнего уровня фон из стиля не рисуется.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        keep_tool_window_visible(self)
         self.setFixedWidth(POPUP_WIDTH)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
