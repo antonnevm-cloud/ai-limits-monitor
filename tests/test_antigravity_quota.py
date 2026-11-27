@@ -208,6 +208,7 @@ def test_installed_command_receives_official_stdin_via_system_shell(tmp_path, mo
 
 def test_installer_moves_only_the_command_it_installed(tmp_path, monkeypatch):
     cli = tmp_path / "cli"
+    cli.mkdir()
     monkeypatch.setattr(ag, "_bridge_command", lambda key: "app-v1 --antigravity-statusline " + key)
     assert ag.install_antigravity_statusline(profile=tmp_path / "history", cli_profile=cli) == "installed"
     monkeypatch.setattr(ag, "_bridge_command", lambda key: "app-v2 --antigravity-statusline " + key)

@@ -100,6 +100,36 @@ def _isolate_desktop_and_statusline_quota(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_client_profiles(monkeypatch, tmp_path):
+    """Каталоги клиентов и профиля Windows ведут во временную папку: тесты не читают журналы Grok,
+    Codex, Claude и историю Claude Desktop владельца, в том числе в дочерних процессах."""
+    from claude_usage_manager import grok_provider
+
+    clients = tmp_path / "client-profiles"
+    # Переменные каталогов клиентов не задаются: от них зависит ключ истории квот в тестах.
+    for variable, name in (("APPDATA", "AppData/Roaming"), ("LOCALAPPDATA", "AppData/Local")):
+        monkeypatch.setenv(variable, str(clients / name))
+    monkeypatch.setattr(grok_provider, "log_path", lambda: clients / ".grok" / "logs" / "unified.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_autostart(monkeypatch):
+    """Переключатель автозапуска в тестах не пишет в раздел Run настоящего профиля."""
+    from claude_usage_manager import autostart, quota_monitor
+
+    state = {"value": None}
+    monkeypatch.setattr(autostart, "registered", lambda: state["value"])
+
+    def set_enabled(enabled):
+        state["value"] = autostart.command() if enabled else None
+
+    monkeypatch.setattr(autostart, "set_enabled", set_enabled)
+    # В закадровой платформе Qt нет области уведомлений; окна в тестах ведут себя как при видимом значке.
+    monkeypatch.setattr(quota_monitor.MonitorWindow, "_tray_ready", lambda self: True)
+    return state
+
+
+@pytest.fixture(autouse=True)
 def _never_start_live_agent_clis(monkeypatch):
     """Тесты не запускают боевые `grok agent stdio` и `codex app-server` (регрессия по ревью CLA-5).
 

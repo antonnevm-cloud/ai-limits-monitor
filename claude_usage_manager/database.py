@@ -62,6 +62,10 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                self._log.warning("База создана более новой версией программы (схема %s, эта версия знает %s). "
+                                  "Обнови программу, иначе часть данных может отображаться неверно.",
+                                  version, SCHEMA_VERSION)
             if version >= SCHEMA_VERSION:
                 return
             if version < 1:
@@ -269,24 +273,14 @@ class Database:
             ).fetchone()
             now = dt.datetime.now(dt.timezone.utc)
             if row is not None:
-                previous_windows = row["windows_json"] or "[]"
-                comparison_windows = windows_json
-                if source == "grok:local-billing-log":
-                    def without_observation(value):
-                        try:
-                            windows = json.loads(value)
-                            for window in windows:
-                                if isinstance(window, dict) and isinstance(window.get("details"), dict):
-                                    window["details"].pop("observed_at", None)
-                            return windows
-                        except (ValueError, TypeError):
-                            return value
-                    previous_windows = without_observation(previous_windows)
-                    comparison_windows = without_observation(windows_json)
+                # Время наблюдения, время сбора кредитов и срок сброса, пересчитанный из "через N секунд",
+                # меняются на каждом опросе при тех же лимитах. Иначе каждый опрос Codex и Antigravity
+                # добавлял бы строку истории.
                 same = (_close(row["five_hour"],snapshot.five_hour) and _close(row["weekly"],snapshot.weekly)
-                        and _close(row["fable_weekly"],snapshot.fable_weekly) and previous_windows == comparison_windows
+                        and _close(row["fable_weekly"],snapshot.fable_weekly)
+                        and _same_windows(row["windows_json"] or "[]", windows_json)
                         and (row["main_window_id"] or "") == snapshot.main_window_id and (row["login_method"] or "") == snapshot.login_method
-                        and (row["manual_resets_json"] or "{}") == manual_resets_json)
+                        and _same_manual_resets(row["manual_resets_json"] or "{}", manual_resets_json))
                 last_ts=parse_iso(row["ts_utc"]) or now
                 if same and (now-last_ts) < _MIN_QUOTA_INTERVAL: return False
             self._conn.execute(
@@ -294,6 +288,31 @@ class Database:
                 (now.isoformat(), snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly, source, windows_json, snapshot.main_window_id, snapshot.login_method, manual_resets_json, profile_key),
             )
             self._conn.commit(); return True
+
+    def migrate_profile_keys(self) -> int:
+        """Перенести историю, записанную с ключом прежних версий (в нем были пути к программам)."""
+        from .provider_settings import legacy_provider_config_key, load_connections
+
+        moved = 0
+        with self._lock:
+            for provider, connection in load_connections().items():
+                sources = _QUOTA_SOURCES.get(provider)
+                if not sources:
+                    continue
+                old = legacy_provider_config_key(provider, connection)
+                new = provider_config_key(provider, connection)
+                if old == new:
+                    continue
+                placeholders = ", ".join("?" for _ in sources)
+                cursor = self._conn.execute(
+                    f"UPDATE quota_samples SET profile_key = ? WHERE profile_key = ? AND LOWER(source) IN ({placeholders})",
+                    (new, old, *sources),
+                )
+                moved += cursor.rowcount
+            self._conn.commit()
+        if moved:
+            self._log.info("История квот перенесена на новый ключ профиля: %s строк", moved)
+        return moved
 
     @staticmethod
     def _quota_source_filter(provider: str | None, source: str | None = None) -> tuple[list[str], list[str]]:
@@ -502,6 +521,52 @@ class Database:
                 (key, value),
             )
             self._conn.commit()
+
+
+_RESET_JITTER = dt.timedelta(minutes=2)
+
+
+def _load_list(raw: str) -> list | None:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, list) else None
+
+
+def _same_windows(previous: str, current: str) -> bool:
+    """Одинаковые окна: без времени наблюдения, срок сброса с допуском на пересчет из оставшихся секунд."""
+    left, right = _load_list(previous), _load_list(current)
+    if left is None or right is None or len(left) != len(right):
+        return previous == current
+    for a, b in zip(left, right):
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return previous == current
+        a, b = dict(a), dict(b)
+        for item in (a, b):
+            if isinstance(item.get("details"), dict):
+                item["details"] = {k: v for k, v in item["details"].items() if k != "observed_at"}
+        reset_a, reset_b = parse_iso(a.pop("resets_at", None)), parse_iso(b.pop("resets_at", None))
+        if (reset_a is None) != (reset_b is None):
+            return False
+        if reset_a is not None and abs(reset_a - reset_b) > _RESET_JITTER:
+            return False
+        if a != b:
+            return False
+    return True
+
+
+def _same_manual_resets(previous: str, current: str) -> bool:
+    try:
+        left, right = json.loads(previous), json.loads(current)
+    except (TypeError, ValueError):
+        return previous == current
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return previous == current
+    # Время сбора кредитов Codex ставится на каждом опросе.
+    left.pop("updated_at", None)
+    right.pop("updated_at", None)
+    return left == right
 
 
 def _close(left: float | None, right: float | None, tol: float = 1e-6) -> bool:

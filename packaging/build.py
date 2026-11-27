@@ -72,6 +72,12 @@ def build(output: Path, work: Path, compiler: Path | None) -> Path:
         environment.update(PYTHONNOUSERSITE='1', PYINSTALLER_CONFIG_DIR=str(stage / 'cache'),
                            AI_LIMITS_BUILD_LICENSES=str(notices), TEMP=str(stage), TMP=str(stage),
                            TMPDIR=str(stage))
+        if sys.platform == 'win32':
+            # PyInstaller добирает DLL из каталогов PATH: из Git, JDK и других программ машины сборки
+            # в поставку попадали посторонние UCRT и OpenSSL. Оставляем только окружение сборки и Windows.
+            system = Path(os.environ.get('SystemRoot', r'C:\Windows'))
+            environment['PATH'] = os.pathsep.join(
+                [str(Path(sys.executable).parent), str(system / 'System32'), str(system)])
         subprocess.run([sys.executable, '-m', 'PyInstaller', '--log-level', 'WARN',
                         '--distpath', str(stage / 'dist'), '--workpath', str(stage / 'work'),
                         str(PACKAGING / 'monitor.spec')], cwd=ROOT, env=environment, check=True)

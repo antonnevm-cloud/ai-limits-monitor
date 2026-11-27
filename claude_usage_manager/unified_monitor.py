@@ -20,7 +20,7 @@ from .quota_monitor_detailed import MonitorWindow as DetailedLimitsWindow
 from .quota_monitor_detailed import STYLE as DETAILED_STYLE
 from .quota_monitor_model import MonitorData, build_compact_rows, build_rows
 from .qt_theme import build_stylesheet
-from .utils import database_path, get_logger, setup_logging
+from .utils import database_path, get_logger, now_local, setup_logging
 from .windows_ui import enable_per_monitor_dpi_awareness
 from .widget_ipc import bring_to_front, open_show_event, request_show, show_requested
 
@@ -72,6 +72,8 @@ class UnifiedMonitorWindow(MonitorWindow):
     def open_settings(self) -> None:
         super().open_settings()
         self.timer.setInterval(DISPLAY_REFRESH_MS)
+        # Новый интервал опроса действует сразу, а не после текущего ожидания сборщика.
+        self.refresh_now()
 
     def open_connections(self) -> None:
         super().open_connections()
@@ -84,7 +86,11 @@ class UnifiedMonitorWindow(MonitorWindow):
     def refresh(self) -> None:
         if self.worker or self._quit:
             return
-        worker = BackendRefreshWorker(self.db, request_update=self._refresh_requested, collector=self.collector)
+        if self._polling and self.collector is None and not existing_backend_available():
+            # Отдельный сборщик остановлен: виджет возвращается к собственному сбору.
+            self.collector = BackendService(serve_http=False)
+            self.collector.start()
+        worker =BackendRefreshWorker(self.db, request_update=self._refresh_requested, collector=self.collector)
         worker.generation = self._connection_generation
         self._refresh_requested = False
         worker.signals.finished.connect(self._done)
@@ -129,9 +135,13 @@ class UnifiedMonitorWindow(MonitorWindow):
         if self._limits_window is None:
             return
         rows = build_rows(self.states)
-        key = (rows, tuple((provider, state.live, state.error, state.snapshot.fallback_source,
-                            state.snapshot.login_method, state.snapshot.manual_resets)
-                           for provider, state in sorted(self.states.items())))
+        # Время последнего замера и текущая дата входят в ключ: от них зависят "Обновлено" и "сброс завтра".
+        latest = max((state.snapshot.updated_at for state in self.states.values()
+                      if state.snapshot.updated_at is not None), default=None)
+        key = (rows, latest, now_local().date(),
+               tuple((provider, state.live, state.error, state.snapshot.fallback_source,
+                      state.snapshot.login_method, state.snapshot.manual_resets)
+                     for provider, state in sorted(self.states.items())))
         self._limits_window.states = self.states
         self._limits_window.rows = rows
         if not force and key == self._limits_render_key:
@@ -225,16 +235,23 @@ class UnifiedMonitorWindow(MonitorWindow):
         super().quit_monitor()
 
 
-def run_monitor() -> int:
+def _release(handle) -> None:
+    if sys.platform == "win32" and handle not in (None, True):
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def run_monitor(autostart: bool = False) -> int:
     setup_logging(logging.INFO)
     dpi_mode = enable_per_monitor_dpi_awareness()
     mutex = _mutex()
     if mutex is None:
-        request_show()
+        if not autostart:
+            request_show()
         return 0
 
     first_launch = not database_path().exists()
     db = Database()
+    db.migrate_profile_keys()
     app = QApplication.instance() or QApplication(sys.argv)
     font = app.font()
     font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
@@ -253,33 +270,60 @@ def run_monitor() -> int:
     window = UnifiedMonitorWindow(db, collector=collector)
     if collector is not None:
         collector.start()
-    bring_to_front(window)
+    if autostart:
+        # При входе в Windows пользователь уже работает в другой программе: окно не забирает клавиатуру.
+        window.show_without_activation()
+    else:
+        bring_to_front(window)
     show_event = open_show_event()
     show_timer = QTimer(window)
     show_timer.setInterval(150)
     show_timer.timeout.connect(lambda: bring_to_front(window) if show_requested(show_event) else None)
     if show_event:
         show_timer.start()
+    # Завершение сеанса Windows и закрытие программы установщиком через Restart Manager:
+    # окно не должно отклонять выход, даже если открыты другие окна программы.
+    app.commitDataRequest.connect(lambda _manager: window.prepare_for_session_end())
     if first_launch:
         QTimer.singleShot(0, window.open_connections)
     try:
         return app.exec()
     finally:
-        if window.collector is not None:
-            window.collector.stop()
+        show_timer.stop()
+        # Повторный запуск во время остановки сборщика должен открыть новое окно, а не звать уходящее.
         if show_event:
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(show_event))
+        _release(mutex)
+        if window.collector is not None:
+            window.collector.stop()
         db.close()
-        if sys.platform == "win32" and mutex not in (None, True):
-            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(mutex))
 
 
-def main() -> int:
+def _show_fatal_error() -> None:
+    from .utils import log_path
+
+    message = ("AI Limits Monitor не удалось запустить.\n\n"
+               f"Подробности записаны в журнал:\n{log_path()}")
+    if sys.platform == "win32":
+        ctypes.windll.user32.MessageBoxW(None, message, "AI Limits Monitor", 0x10)
+        return
     try:
-        return run_monitor()
+        from PySide6.QtWidgets import QMessageBox
+
+        if QApplication.instance() is not None:
+            QMessageBox.critical(None, "AI Limits Monitor", message)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def main(autostart: bool = False) -> int:
+    try:
+        return run_monitor(autostart=autostart)
     except Exception:
         get_logger().error(
             "AI Limits Monitor unified fatal: %s",
             traceback.format_exc(),
         )
+        # Без окна с ошибкой программа без консоли исчезала молча.
+        _show_fatal_error()
         return 1

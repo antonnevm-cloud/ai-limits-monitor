@@ -132,8 +132,33 @@ def provider_enabled(provider: str) -> bool:
     return load_connections()[provider].enabled
 
 
-def provider_config_key(provider: str) -> str:
-    connection = load_connections()[provider]
+def _normalized(path: Path | str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.expanduser(str(path))))
+
+
+def provider_config_key(provider: str, connection: Connection | None = None) -> str:
+    """Ключ истории квот: зависит только от каталога данных клиента, а не от пути к программе.
+
+    Выбор той же программы или явное указание стандартного каталога историю не прячет.
+    """
+    connection = connection or load_connections()[provider]
+    try:
+        profile = _normalized(provider_profile(provider, connection))
+    except ValueError:
+        profile = _normalized(connection.profile)
+    standard = Path.home() / _PROFILES[provider]
+    paths = ["" if profile == _normalized(standard) else profile]
+    if provider == "antigravity":
+        cli = _normalized(antigravity_cli_profile(connection))
+        paths.append("" if cli == _normalized(standard.parent / "antigravity-cli") else cli)
+    if not any(paths):
+        return ""
+    return hashlib.sha256(json.dumps(paths, ensure_ascii=True).encode("ascii")).hexdigest()[:20]
+
+
+def legacy_provider_config_key(provider: str, connection: Connection | None = None) -> str:
+    """Ключ версий до 2.0.6: в него входили пути к программе и приложению."""
+    connection = connection or load_connections()[provider]
     profile = connection.profile
     if not profile:
         effective = os.path.normpath(provider_profile(provider, connection))

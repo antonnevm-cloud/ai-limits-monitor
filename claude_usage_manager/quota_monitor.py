@@ -856,7 +856,14 @@ class MonitorWindow(QMainWindow):
         value=max(20,min(100,int(step)*10))
         if value==self.opacity:return
         self.opacity=value;self.opacity_value.setText(f'{value}%');self.db.set_setting('monitor_opacity',str(value));self._apply_opacity()
+    def _tray_ready(self):
+        return hasattr(self,'tray') and QSystemTrayIcon.isSystemTrayAvailable() and self.tray.isVisible()
     def hide_to_tray(self):
+        self._save_geometry()
+        if not self._tray_ready():
+            # Без значка в области уведомлений спрятанное окно вернуть было бы нечем.
+            get_logger().warning('Область уведомлений недоступна: окно не скрыто')
+            return
         self.drawer.hide();self._close_popup();self.hide()
     def toggle_drawer(self):
         '''Открывает панель настроек слева от виджета (справа, если слева нет места) на высоте его верха; повторный щелчок закрывает.'''
@@ -1470,6 +1477,14 @@ class MonitorWindow(QMainWindow):
         menu.addAction('Настроить вид', self.toggle_drawer)
         menu.addAction('Все настройки', self.open_settings)
         menu.addAction('Подключения и вход', self.open_connections)
+        from . import autostart
+        self.autostart_action = None
+        if autostart.supported():
+            self.autostart_action = menu.addAction('Запускать при входе в Windows')
+            self.autostart_action.setCheckable(True)
+            self.autostart_action.setChecked(autostart.is_enabled())
+            self.autostart_action.toggled.connect(self.set_autostart)
+            menu.aboutToShow.connect(lambda: self._sync_autostart_action())
         self.cache_action = menu.addAction('Таймеры кэша тредов')
         self.cache_action.setCheckable(True)
         self.cache_action.setChecked(self.cache_enabled)
@@ -1492,15 +1507,41 @@ class MonitorWindow(QMainWindow):
         self.tray.activated.connect(lambda reason: self.show_normal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.show()
         self._update_tray_tooltip()
+    def _sync_autostart_action(self):
+        from . import autostart
+        if self.autostart_action is None:return
+        self.autostart_action.blockSignals(True);self.autostart_action.setChecked(autostart.is_enabled());self.autostart_action.blockSignals(False)
+    def set_autostart(self,enabled):
+        from . import autostart
+        try:autostart.set_enabled(bool(enabled))
+        except OSError as error:
+            QMessageBox.warning(self,'Автозапуск',f'Не удалось изменить автозапуск: {error}')
+        self._sync_autostart_action()
     def _update_tray_tooltip(self):
         if not hasattr(self,'tray'):return
+        try:enabled={key for key,connection in load_connections().items() if connection.enabled}
+        except Exception:enabled=None
         parts=[]
         for row in self.data.compact_rows:
+            if enabled is not None and row.provider not in enabled:continue
             state=self.data.states.get(row.provider);status=state_status(state);c=primary_cell(row)
             parts.append(f'{row.name}: {percent_text(c.remaining if c else None)} ({status})')
-        self.tray.setToolTip('AI Limits · осталось\n'+' · '.join(parts[:4]))
+        # Windows обрезает подсказку значка после 127 знаков.
+        text='AI Limits · осталось\n'+' · '.join(parts[:4]) if parts else 'AI Limits · источники выключены'
+        self.tray.setToolTip(text if len(text)<=127 else text[:126]+'…')
     def show_normal(self):self.show();self._enforce_topmost();self.raise_();self.activateWindow();QTimer.singleShot(0,self._enforce_topmost)
+    def show_without_activation(self):
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating,True)
+        self.show();self._enforce_topmost()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating,False)
+    def _save_geometry(self):
+        try:self.db.set_state('monitor_geometry_compact',bytes(self.saveGeometry().toHex()).decode('ascii'))
+        except Exception:get_logger().warning('Не удалось сохранить положение окна',exc_info=True)
+    def prepare_for_session_end(self):
+        # Запрос завершения от Windows или установщика: закрытие окна больше не прячет его в область уведомлений.
+        self._save_geometry();self._quit=True
     def quit_monitor(self):
+        self._save_geometry();self.hide()
         self._quit=True;self.tray.hide();self.timer.stop();self.clock_timer.stop();self.cache_timer.stop();self.usage_timer.stop();self._close_popup();self.drawer.hide();self.drawer.deleteLater()
         self._fit_timer.stop()
         self._fit_settle_timer.stop()
@@ -1512,8 +1553,9 @@ class MonitorWindow(QMainWindow):
             try:self.restoreGeometry(QByteArray.fromHex(raw.encode('ascii')))
             except Exception:pass
     def closeEvent(self,event:QCloseEvent):
-        self.db.set_state('monitor_geometry_compact',bytes(self.saveGeometry().toHex()).decode('ascii'))
+        self._save_geometry()
         if self._quit:super().closeEvent(event)
+        elif not self._tray_ready():event.ignore()
         else:self._close_popup();self.drawer.hide();event.ignore();self.hide()
 
 STYLE=f'''

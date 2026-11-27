@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import runpy
 import sys
 from types import SimpleNamespace
@@ -50,7 +51,18 @@ def test_portable_installer_skips_registration_and_all_shortcuts():
     source = (PACKAGING / 'windows.iss').read_text(encoding='utf-8')
     assert 'PrivilegesRequired=lowest' in source
     assert 'Uninstallable=not PortableInstall' in source
-    icons = source.split('[Icons]', 1)[1].split('[Code]', 1)[0].strip().splitlines()
-    assert len(icons) == 3
-    assert all('Filename: "{app}\\{#AppName}.exe"' in line and 'Check: not PortableInstall' in line
+    parts = re.split(r'^\[(\w+)\]\s*$', source, flags=re.M)
+    sections = {name: [line for line in body.strip().splitlines() if line and not line.startswith(';')]
+                for name, body in zip(parts[1::2], parts[2::2])}
+    icons = sections['Icons']
+    assert len(icons) == 2
+    assert all('Filename: "{app}\\{#AppExe}"' in line and 'Check: not PortableInstall' in line
                for line in icons)
+    # Автозапуск - параметр Run профиля, его же переключает программа; ярлыка в автозагрузке больше нет.
+    assert '{userstartup}' not in '\n'.join(icons)
+    registry = sections['Registry']
+    assert len(registry) == 1 and 'Tasks: autostart' in registry[0] and '--autostart' in registry[0]
+    assert 'Check: not PortableInstall' in registry[0]
+    # Старые файлы программы удаляются до копирования новой версии.
+    assert sections['InstallDelete'] == ['Type: filesandordirs; Name: "{app}\\_internal"']
+    assert any('--uninstall' in line for line in sections['UninstallRun'])

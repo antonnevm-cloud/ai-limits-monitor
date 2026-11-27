@@ -40,6 +40,14 @@ def _run(args):
         return antigravity_statusline_main(args[1:])
     elif args == ["--backend"]:
         from claude_usage_manager.backend import main as run
+    elif args == ["--uninstall"]:
+        # Деинсталлятор: вернуть прежние строки состояния клиентов и снять автозапуск.
+        from claude_usage_manager.integrations import uninstall_main as run
+    elif args == ["--autostart"]:
+        # Запуск при входе в Windows: окно появляется без перехвата клавиатуры.
+        from claude_usage_manager.unified_monitor import main
+
+        return main(autostart=True)
     else:
         from claude_usage_manager.unified_monitor import main as run
     return run()
