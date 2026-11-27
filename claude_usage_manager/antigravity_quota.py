@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -16,7 +18,7 @@ from . import provider_settings
 from .models import QuotaSnapshot, QuotaWindow
 from .process_utils import run_hidden
 from .statusline_command import statusline_command
-from .utils import data_dir, parse_iso
+from .utils import client_workdir, data_dir, parse_iso
 
 
 CLI_SOURCE = "antigravity:cli-usage"
@@ -130,9 +132,19 @@ def _snapshot(source: str, buckets: dict, observed: dt.datetime, now: dt.datetim
     return result
 
 
+_MODEL_TURN_PAUSE = 30 * 60
+_paused_until = 0.0
+
+
 def _native_usage(executable: Path, now: dt.datetime | None = None) -> QuotaSnapshot:
+    global _paused_until
     result = QuotaSnapshot(provider="antigravity", source=CLI_SOURCE)
-    options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=data_dir())
+    if time.monotonic() < _paused_until:
+        result.error = ("agy передал /usage модели вместо служебной команды. "
+                        "Опрос приостановлен на 30 минут, чтобы не расходовать квоту.")
+        return result
+    options = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                   cwd=client_workdir(), env=provider_settings.provider_environment("antigravity"))
     try:
         version = run_hidden([str(executable), "--version"], timeout=5, **options)
         matched = re.fullmatch(rb"v?(\d{1,4})\.(\d{1,4})\.(\d{1,4})", version.stdout.strip())
@@ -147,6 +159,12 @@ def _native_usage(executable: Path, now: dt.datetime | None = None) -> QuotaSnap
         if len(report.stdout) > _MAX_INPUT:
             raise ValueError
         payload = json.loads(report.stdout)
+        if isinstance(payload, dict) and payload.get("num_turns") not in (0, None):
+            # Команда ушла модели: каждый повтор тратил бы квоту, поэтому опрос ставится на паузу.
+            _paused_until = time.monotonic() + _MODEL_TURN_PAUSE
+            result.error = ("agy передал /usage модели вместо служебной команды. "
+                            "Опрос приостановлен на 30 минут, чтобы не расходовать квоту.")
+            return result
         if not isinstance(payload, dict) or payload.get("status") != "SUCCESS" or payload.get("num_turns") != 0:
             raise ValueError
         command = payload.get("command")
@@ -256,6 +274,9 @@ def install_antigravity_statusline(*, profile: Path | None = None, cli_profile: 
         cli_profile = profile.parent / "antigravity-cli"
     profile = profile or provider_settings.provider_profile("antigravity")
     cli_profile = cli_profile or provider_settings.antigravity_cli_profile()
+    if not cli_profile.is_dir():
+        # Каталог настроек создает сам agy при первом запуске; выдуманный каталог он читать не будет.
+        return "missing"
     settings = (cli_profile / "settings.json").resolve()
     try:
         original = _read_limited(settings, 2_000_000)
@@ -275,22 +296,80 @@ def install_antigravity_statusline(*, profile: Path | None = None, cli_profile: 
     receipt = data_dir() / "antigravity-statusline" / f"installed-{directory_hash}.json"
     command_hash = hashlib.sha256(command.encode("utf-8")).hexdigest()
     existing = current.get("command")
+    installed = _read_receipt(receipt)
+    previous = installed.get("previous") if "previous" in installed else (None if existing is not None else (current or None))
     if existing == command:
-        _write_json(receipt, {"command_hash": command_hash})
+        _write_json(receipt, {"command_hash": command_hash, "settings": str(settings), "previous": previous})
         return "unchanged"
     if existing is not None:
-        try:
-            installed = json.loads(_read_limited(receipt, 512))
-        except (OSError, ValueError, RecursionError):
-            return "conflict"
-        if not isinstance(existing, str) or not isinstance(installed, dict):
-            return "conflict"
-        if hashlib.sha256(existing.encode("utf-8")).hexdigest() != installed.get("command_hash"):
+        known = isinstance(existing, str) and hashlib.sha256(existing.encode("utf-8")).hexdigest() == installed.get("command_hash")
+        if not (known or _owned_command(existing)):
             return "conflict"
     raw["statusLine"] = {**current, "type": "command", "command": command, "stack_with_default": True}
+    if original is not None:
+        backup = settings.with_name(settings.name + ".ai-limits-backup")
+        backup.write_bytes(original)
     _write_json(settings, raw, original=original, settings=True)
-    _write_json(receipt, {"command_hash": command_hash})
+    _write_json(receipt, {"command_hash": command_hash, "settings": str(settings), "previous": previous})
     return "installed"
+
+
+def _read_receipt(path: Path) -> dict:
+    try:
+        value = json.loads(_read_limited(path, 65536))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _owned_command(command: object) -> bool:
+    """Своя команда без квитанции: формы cmd (call "...exe" --antigravity-statusline) и PowerShell."""
+    if not isinstance(command, str):
+        return False
+    from .claude_local import _powershell_words
+
+    words = _powershell_words(command)
+    if words is None:
+        try:
+            words = shlex.split(command.replace("\\", "/"), posix=True)
+        except ValueError:
+            return False
+    if "--antigravity-statusline" not in words:
+        return False
+    at = words.index("--antigravity-statusline")
+    program = words[at - 1].replace("\\", "/").rsplit("/", 1)[-1].casefold() if at else ""
+    return program in {"ai limits monitor.exe", "ai limits monitor", "monitor.py"}
+
+
+def remove_antigravity_statusline(*, cli_profile: Path | None = None) -> str:
+    """Вернуть строку состояния agy, которая была до подключения монитора."""
+    cli_profile = cli_profile or provider_settings.antigravity_cli_profile()
+    settings = (cli_profile / "settings.json").resolve()
+    try:
+        original = _read_limited(settings, 2_000_000)
+        raw = json.loads(original.decode("utf-8-sig"))
+    except FileNotFoundError:
+        return "absent"
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise ValueError("Не удалось прочитать настройки agy. Проверь settings.json.") from exc
+    current = raw.get("statusLine") if isinstance(raw, dict) else None
+    existing = current.get("command") if isinstance(current, dict) else None
+    if not isinstance(existing, str):
+        return "absent"
+    directory_hash = hashlib.sha256(os.fsencode(os.path.normcase(str(settings)))).hexdigest()
+    receipt = data_dir() / "antigravity-statusline" / f"installed-{directory_hash}.json"
+    installed = _read_receipt(receipt)
+    known = hashlib.sha256(existing.encode("utf-8")).hexdigest() == installed.get("command_hash")
+    if not (known or _owned_command(existing)):
+        return "foreign"
+    previous = installed.get("previous")
+    if isinstance(previous, dict):
+        raw["statusLine"] = previous
+    else:
+        raw.pop("statusLine", None)
+    _write_json(settings, raw, original=original, settings=True)
+    receipt.unlink(missing_ok=True)
+    return "removed"
 
 
 def antigravity_statusline_main(args: Sequence[str]) -> int:
@@ -304,7 +383,10 @@ def antigravity_statusline_main(args: Sequence[str]) -> int:
         stream = getattr(sys.stdin, "buffer", sys.stdin)
         if stream is not None:
             raw = stream.read(_MAX_INPUT + 1)
-            if len(raw) <= _MAX_INPUT:
+            if directory is not None:
+                os.environ["AI_LIMITS_DATA_DIR"] = str(directory)
+            # Выключенный в подключениях источник замеры не сохраняет.
+            if len(raw) <= _MAX_INPUT and provider_settings.provider_enabled("antigravity"):
                 _ingest(json.loads(raw), args[0], _now(), directory)
     except (UnicodeError, OSError, ValueError, RecursionError):
         pass

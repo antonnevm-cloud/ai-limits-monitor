@@ -48,6 +48,16 @@ def test_analytics_refresh_preserves_expansion_sort_selection_and_filter(tmp_pat
     assert window.threads_table.item(0, 0).data(Qt.ItemDataRole.UserRole) == "s1"
     assert window.threads_table.horizontalHeader().sortIndicatorSection() == 0
     assert window.threads_table.selectionModel().selectedRows()
+    assert window.cards["weekly"].value.text() == "12%"
+
+    monkeypatch.setattr(window, "_cached_quota", lambda provider: QuotaSnapshot(
+        provider=provider, weekly=13 if provider == "codex" else 12,
+    ))
+    recalculations = []
+    monkeypatch.setattr(window, "_apply_quota_to_result", recalculations.append)
+    window.reload_cached_quotas()
+    assert recalculations == []
+    assert window._quota_cache["codex"].weekly == 13
     window.close(); db.close(); qapp.processEvents()
 
 
@@ -105,7 +115,9 @@ def test_qt_renders_project_hierarchy_and_pp(tmp_path):
             last_activity=result.threads[0].last_activity, member_ids=["s2"],
         ),
     ]
+    assert not window.export_button.isEnabled()
     window._analysis_finished(result)
+    assert window.export_button.isEnabled()
     assert window.overview_tree.topLevelItemCount() == 1
     project = window.overview_tree.topLevelItem(0)
     assert project.text(0) == "demo"

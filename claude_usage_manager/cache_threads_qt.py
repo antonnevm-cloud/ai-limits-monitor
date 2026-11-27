@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import html
 import time
 import weakref
+from collections import deque
 
 from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QResizeEvent
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QPainter, QPainterPath, QPen, QResizeEvent
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from .cache_threads import COLLAPSED_THREADS, CacheThread, cache_hue, format_remaining
 from .qt_theme import COLORS
@@ -19,7 +21,6 @@ from .thread_view import ThreadView
 CACHE_BLOCK_MIN_WIDTH = 250
 RING_SIZE = 46
 RING_WIDTH = 4.0
-LINK_INDENT = 12
 SCROLLBAR_WIDTH = 6  # ширина полосы прокрутки из стиля #CacheScroll
 CHIP_FILL = QColor(120, 140, 160, 38)
 GLUTTON_COLOR = "#E5675E"
@@ -30,15 +31,18 @@ ROW_HEIGHT = 66
 COMPACT_ROW_HEIGHT = 44
 COMPACT_RING_SIZE = 36
 COMPACT_RING_WIDTH = 3.0
-# Компактно: индикатор состояния треда внутри кольца над временем (решение владельца 12.11.2026)
+# Компактно: индикатор состояния треда внутри кольца над временем
 RING_STATE_SIZE = 6.0  # диаметр точки или бегущего кружка
 RING_STATE_PEN = 1.4
 RING_STATE_ABOVE = 6.0  # центр индикатора выше центра кольца
 RING_STATE_SHIFT = 3.0  # время ниже центра, чтобы пара стояла по центру
-COMPACT_RING_FONT = 5.0  # цифры в кольце мелкие и обычной жирности (выбор владельца 12.11.2026)
+COMPACT_RING_FONT = 5.0  # цифры в кольце мелкие и обычной жирности
 WARN_SECONDS = 120
 WARN_COLOR = "#E0B04A"
 MIN_VISIBLE_ROWS = 3
+ROWS_PER_BATCH = 12
+BATCHED_LIST_MIN = ROWS_PER_BATCH * 4
+ROWS_BATCH_DELAY_MS = 8
 DOT_COLUMN = 14
 HEAD_SPACING = 6  # между точкой состояния и названием
 DOT_SIZE = 10
@@ -85,6 +89,8 @@ class ElidedLabel(QLabel):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._full = ""
+        # Названия тредов приходят из журналов: только текст, без разметки HTML и загрузки картинок.
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.set_full_text(text)
 
@@ -106,26 +112,27 @@ class ElidedLabel(QLabel):
             self.setText(shown)
 
 
-class LinkLabel(QLabel):
-    """Подчёркнутая ссылка: по щелчку левой кнопкой подаёт сигнал clicked."""
-
-    clicked = Signal()
+class LinkButton(QPushButton):
+    """Компактная кнопка с названием действия для списка и панели вида."""
 
     def __init__(self, text: str, parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setObjectName("CacheLink")
+        self.setAccessibleName(text)
+        self.setAutoDefault(False)
+        self.setFlat(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(24)
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            if not event.isAutoRepeat():
+                self.click()
             event.accept()
-        else:
-            super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
+            return
+        super().keyPressEvent(event)
 
 
 class CacheRing(QWidget):
@@ -234,8 +241,13 @@ class CacheRing(QWidget):
 
 
 def explicitly_hidden(widget: QWidget) -> bool:
-    """Скрыт ли виджет явно (hide()); новый виджет до первого показа тоже isHidden(), но анимацию ему запускать надо."""
-    return widget.isHidden() and widget.testAttribute(Qt.WidgetAttribute.WA_WState_ExplicitShowHide)
+    """Скрыт ли явно (hide()) сам виджет или его окно; новый виджет до первого показа тоже isHidden(), но анимацию ему запускать надо.
+
+    Окно, спрятанное в область уведомлений, анимацию не запускает: при показе окна кольца получат showEvent.
+    """
+    explicit = Qt.WidgetAttribute.WA_WState_ExplicitShowHide
+    top = widget.window()
+    return any(item.isHidden() and item.testAttribute(explicit) for item in (widget, top))
 
 
 def spinner_angle(seconds: float) -> float:
@@ -570,7 +582,8 @@ class CacheThreadRow(QFrame):
         text.addWidget(self.warn_row)
         text.addStretch(1)
         box.addLayout(text, 1)
-        self.thread = thread
+        self.thread = None
+        self._spend_state = None
         self.update_thread(thread, now, spend, glutton)
 
     @property
@@ -580,17 +593,24 @@ class CacheThreadRow(QFrame):
 
     def update_thread(self, thread: CacheThread, now: dt.datetime, spend: ThreadSpend | None = None, glutton: bool = False) -> bool:
         """Обновляет строку; True, если изменилась ее раскладка (появились или пропали чипы, значок, предупреждение)."""
-        self.thread = thread
-        layout_changed = self._apply_spend(spend, glutton)
-        self.title.set_full_text(thread.title)
-        if self.compact:
-            self.project.set_full_text(thread.project)
-        else:
-            self.project.set_full_text(f"{thread.project} · {thread.environment}" if thread.environment else thread.project)
-        tip = tooltip_text(thread)
-        for widget in (self, self.title, self.project, self.ring, self.dot, self.warn_row):
-            if widget is not None:
-                widget.setToolTip(tip)
+        layout_changed = (spend, glutton) != self._spend_state
+        if layout_changed:
+            self._spend_state = spend, glutton
+            self._apply_spend(spend, glutton)
+        if thread != self.thread:
+            self.thread = thread
+            self.title.set_full_text(thread.title)
+            if self.compact:
+                self.project.set_full_text(thread.project)
+            else:
+                self.project.set_full_text(f"{thread.project} · {thread.environment}" if thread.environment else thread.project)
+            tip = tooltip_text(thread)
+            if "<" in tip or "&" in tip:
+                # Подсказка Qt тоже понимает HTML: название из журнала показывается как текст.
+                tip = "<p style='white-space:pre-wrap'>" + html.escape(tip).replace("\n", "<br>") + "</p>"
+            for widget in (self, self.title, self.project, self.ring, self.dot, self.warn_row):
+                if widget is not None:
+                    widget.setToolTip(tip)
         return self.refresh(now) or layout_changed
 
     def _apply_spend(self, spend: ThreadSpend | None, glutton: bool) -> bool:
@@ -669,6 +689,17 @@ class CacheThreadRow(QFrame):
         return True
 
 
+def invalidate_parent_layouts(widget: QWidget) -> None:
+    """Сразу пересчитывает размеры вложенного блока, карточки и окна."""
+    widget.updateGeometry()
+    parent = widget.parentWidget()
+    while parent is not None:
+        if parent.layout() is not None:
+            parent.layout().invalidate()
+        parent.updateGeometry()
+        parent = parent.parentWidget()
+
+
 class CacheThreadsBlock(QFrame):
     """Список тредов одного агента; строки обновляются по секундам без пересборки.
 
@@ -706,11 +737,16 @@ class CacheThreadsBlock(QFrame):
         self._scroll.setWidget(self._body)
         self._outer.addWidget(self._scroll)
         self.rows: list[CacheThreadRow] = []
-        self.link: LinkLabel | None = None
-        self.restore: LinkLabel | None = None
+        self.link: LinkButton | None = None
+        self.restore: LinkButton | None = None
         self.note: QLabel | None = None
         self._state: tuple | None = None
         self._cap: int | None = None
+        self._show_all = False
+        self._pending_rows = deque()
+        self._row_timer = QTimer(self)
+        self._row_timer.setSingleShot(True)
+        self._row_timer.timeout.connect(self._append_pending_rows)
 
     @property
     def thread_keys(self) -> list[str]:
@@ -718,7 +754,11 @@ class CacheThreadsBlock(QFrame):
 
     def natural_height(self) -> int:
         """Высота списка без ограничения."""
-        return self._box.sizeHint().height()
+        height = self._box.sizeHint().height()
+        if self._pending_rows:
+            row_height = COMPACT_ROW_HEIGHT if self._pending_rows[0][1].compact else ROW_HEIGHT
+            height += len(self._pending_rows) * row_height
+        return height
 
     def list_height(self) -> int:
         """Высота списка сейчас (с учетом ограничения)."""
@@ -729,23 +769,13 @@ class CacheThreadsBlock(QFrame):
         self._cap = cap
         natural = self.natural_height()
         height = natural if cap is None else max(min(natural, cap), min(natural, MIN_VISIBLE_ROWS * ROW_HEIGHT))
-        if self._scroll.minimumHeight() != height or self._scroll.maximumHeight() != height:
-            self._scroll.setFixedHeight(height)
+        if self._scroll.minimumHeight() == height and self._scroll.maximumHeight() == height:
+            return
+        self._scroll.setFixedHeight(height)
         # Размеры вложенных раскладок обновляются через очередь событий; окну нужна актуальная высота сразу.
         self._outer.invalidate()
         self._outer.activate()
-        self._invalidate_parents()
-
-    def _invalidate_parents(self) -> None:
-        """Сбрасывает запомненные размеры раскладок выше блока (карточка агента, окно), чтобы окно сразу увидело новую высоту."""
-        # updateGeometry сбрасывает размеры карточки, запомненные раскладкой окна; invalidate одной раскладки этого не делает.
-        self.updateGeometry()
-        parent = self.parentWidget()
-        while parent is not None:
-            if parent.layout() is not None:
-                parent.layout().invalidate()
-            parent.updateGeometry()
-            parent = parent.parentWidget()
+        invalidate_parent_layouts(self)
 
     def set_content(
         self,
@@ -762,8 +792,8 @@ class CacheThreadsBlock(QFrame):
     ) -> bool:
         """Обновляет список. Возвращает True, если состав строк изменился (нужна подгонка высоты).
 
-        `view` задает, что показывать в строках; `pinned` - ранее закрепленные треды;
-        `hidden_count` - сколько тредов владелец скрыл: под списком ссылка «скрыто N · вернуть».
+        Параметр view управляет составом строки. В pinned передаются закрепленные треды.
+        При ненулевом hidden_count под списком доступна кнопка возврата скрытых тредов.
         """
         view = view or ThreadView()
         spend = spend or {}
@@ -775,47 +805,105 @@ class CacheThreadsBlock(QFrame):
         shown_pinned = frozenset(t.session_id for t in visible if t.session_id in pinned)
         restorable = hidden_count if view.pin_hide else 0
         state = (tuple(t.session_id for t in visible), hidden, can_collapse, note, view, shown_pinned, restorable)
-        if state == self._state:
-            changed = [
-                row.update_thread(thread, now, spend.get(thread.session_id), thread.session_id == greedy)
-                for row, thread in zip(self.rows, visible)
-            ]
-            self._align_chips()
-            return self._fit_width() or any(changed)
-        self._clear()
-        for index, thread in enumerate(visible):
-            row = CacheThreadRow(
-                thread, now, view, thread.session_id in shown_pinned,
-                spend=spend.get(thread.session_id), glutton=thread.session_id == greedy,
-            )
-            row.setProperty("last", index == len(visible) - 1)
-            self.rows.append(row)
-            self._box.addWidget(row)
-        if note:
+        link_focused = self.link is not None and self.link.hasFocus()
+        restore_focused = self.restore is not None and self.restore.hasFocus()
+        changed = state != self._state
+        if changed:
+            # При раскрытии сохраняем уже видимые строки и их раскладку.
+            kept = 0
+            for row, thread in zip(self.rows, visible):
+                if (row.thread.session_id != thread.session_id or row.view != view
+                        or row.pinned != (thread.session_id in shown_pinned)):
+                    break
+                kept += 1
+            self._remove_rows_after(kept)
+        row_changed = False
+        for row, thread in zip(self.rows, visible):
+            row_changed |= row.update_thread(thread, now, spend.get(thread.session_id), thread.session_id == greedy)
+        self._pending_rows = deque(
+            (thread, view, thread.session_id in shown_pinned, spend.get(thread.session_id), thread.session_id == greedy)
+            for thread in visible[len(self.rows):]
+        )
+        if not changed and not row_changed:
+            return False
+        if note and self.note is None:
             self.note = QLabel(note)
             self.note.setObjectName("CacheMore")
             self.note.setWordWrap(True)
             self._box.addWidget(self.note)
-        elif hidden > 0:
-            self.link = LinkLabel(f"ещё {hidden}")
-            self.link.setIndent(LINK_INDENT)
-            self.link.clicked.connect(self.more_clicked)
-            self._outer.addWidget(self.link, 0, Qt.AlignmentFlag.AlignLeft)
-        elif can_collapse:
-            self.link = LinkLabel("свернуть")
-            self.link.setIndent(LINK_INDENT)
-            self.link.clicked.connect(self.less_clicked)
-            self._outer.addWidget(self.link, 0, Qt.AlignmentFlag.AlignLeft)
-        if restorable > 0:
-            self.restore = LinkLabel(f"скрыто {restorable} · вернуть")
-            self.restore.setIndent(LINK_INDENT)
-            self.restore.clicked.connect(self.restore_clicked)
-            self._outer.addWidget(self.restore, 0, Qt.AlignmentFlag.AlignLeft)
+        elif note:
+            self.note.setText(note)
+        elif self.note is not None:
+            self._remove_widget(self._box, self.note)
+            self.note = None
+        self._show_all = show_all
+        link_text = f"Показать еще {hidden}" if hidden else "Свернуть список" if can_collapse else ""
+        self.link = self._update_link(self.link, link_text, self._link_clicked)
+        restore_text = f"Вернуть скрытые ({restorable})" if restorable else ""
+        self.restore = self._update_link(self.restore, restore_text, self.restore_clicked)
+        if (link_focused or restore_focused) and changed:
+            action = self.restore if restore_focused and self.restore is not None else self.link
+            if action is not None and not action.hasFocus():
+                action.setFocus(Qt.FocusReason.OtherFocusReason)
         self._state = state
+        if changed:
+            if self._pending_rows:
+                count = ROWS_PER_BATCH if len(visible) > BATCHED_LIST_MIN else len(self._pending_rows)
+                self._append_rows(count, now)
+            else:
+                self._set_last_row(self.rows[-1] if self.rows else None, True)
         self._align_chips()
         self._fit_width()
         self.set_height_cap(self._cap)
         return True
+
+    def _link_clicked(self) -> None:
+        (self.less_clicked if self._show_all else self.more_clicked).emit()
+
+    def _update_link(self, link, text, clicked):
+        if not text:
+            if link is not None:
+                self._remove_widget(self._outer, link)
+            return None
+        if link is None:
+            link = LinkButton(text)
+            link.clicked.connect(clicked)
+            self._outer.insertWidget(1 if clicked == self._link_clicked else self._outer.count(),
+                                     link, 0, Qt.AlignmentFlag.AlignLeft)
+        elif link.text() != text:
+            link.setText(text)
+            link.setAccessibleName(text)
+        return link
+
+    def _append_pending_rows(self) -> None:
+        if not self._pending_rows:
+            return
+        self._append_rows(ROWS_PER_BATCH, dt.datetime.now(dt.timezone.utc))
+        self._align_chips()
+        self._fit_width()
+        self.set_height_cap(self._cap)
+        self.content_changed.emit()
+
+    def _append_rows(self, count: int, now: dt.datetime) -> None:
+        if self.rows:
+            self._set_last_row(self.rows[-1], False)
+        for _ in range(min(count, len(self._pending_rows))):
+            thread, view, pinned, spend, glutton = self._pending_rows.popleft()
+            row = CacheThreadRow(thread, now, view, pinned, self._body, spend, glutton)
+            self.rows.append(row)
+            self._box.addWidget(row)
+        self._set_last_row(self.rows[-1], True)
+        if self._pending_rows:
+            self._row_timer.start(ROWS_BATCH_DELAY_MS)
+        else:
+            self._row_timer.stop()
+
+    @staticmethod
+    def _set_last_row(row: CacheThreadRow | None, last: bool) -> None:
+        if row is not None and row.property("last") != last:
+            row.setProperty("last", last)
+            row.style().unpolish(row)
+            row.style().polish(row)
 
     def _align_chips(self) -> None:
         """Компактно: чипы одного вида одной ширины во всех строках, столбцы стоят ровно друг под другом.
@@ -829,11 +917,12 @@ class CacheThreadsBlock(QFrame):
             width = max((chip.sizeHint().width() for chip in shown), default=0)
             for chip in chips:
                 policy = chip.sizePolicy()
-                policy.setRetainSizeWhenHidden(bool(shown))
-                chip.setSizePolicy(policy)
-                if shown:
+                if policy.retainSizeWhenHidden() != bool(shown):
+                    policy.setRetainSizeWhenHidden(bool(shown))
+                    chip.setSizePolicy(policy)
+                if shown and (chip.minimumWidth() != width or chip.maximumWidth() != width):
                     chip.setFixedWidth(width)
-                else:
+                elif not shown and chip.maximumWidth() != QWIDGETSIZE_MAX:
                     chip.setMinimumWidth(0)
                     chip.setMaximumWidth(QWIDGETSIZE_MAX)
 
@@ -844,7 +933,7 @@ class CacheThreadsBlock(QFrame):
         if width == self.minimumWidth():
             return False
         self.setMinimumWidth(width)
-        self._invalidate_parents()
+        invalidate_parent_layouts(self)
         return True
 
     def tick(self, now: dt.datetime) -> None:
@@ -853,24 +942,17 @@ class CacheThreadsBlock(QFrame):
             self._box.invalidate()
             self._box.activate()
             self._outer.invalidate()
-            self._invalidate_parents()
+            invalidate_parent_layouts(self)
             self.content_changed.emit()
 
-    def _clear(self) -> None:
-        while self._box.count():
-            item = self._box.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.hide()
-                widget.setParent(None)
-                widget.deleteLater()
-        for link in (self.link, self.restore):
-            if link is not None:
-                self._outer.removeWidget(link)
-                link.hide()
-                link.setParent(None)
-                link.deleteLater()
-        self.rows = []
-        self.link = None
-        self.restore = None
-        self.note = None
+    def _remove_rows_after(self, count: int) -> None:
+        self._row_timer.stop()
+        for row in reversed(self.rows[count:]):
+            self._remove_widget(self._box, row)
+        del self.rows[count:]
+
+    @staticmethod
+    def _remove_widget(layout, widget) -> None:
+        layout.removeWidget(widget)
+        widget.hide()
+        widget.deleteLater()

@@ -3,7 +3,10 @@ import pathlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from claude_usage_manager.database import Database
 import claude_usage_manager.unified_monitor as unified_monitor
@@ -45,24 +48,32 @@ def test_unified_monitor_reuses_one_analytics_window(tmp_path, monkeypatch):
     class FakeAnalytics:
         def __init__(self, incoming_db):
             assert incoming_db is db
+            self.visible = False
             calls["created"] += 1
 
         def open_and_refresh(self):
+            self.visible = True
             calls["opened"] += 1
+
+        def isVisible(self):
+            return self.visible
 
         def reload_cached_quotas(self):
             calls["reloaded"] += 1
 
         def close(self):
+            self.visible = False
             calls["closed"] += 1
 
     monkeypatch.setattr(unified_monitor, "IntegratedAnalyticsWindow", FakeAnalytics)
     window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
     window.timer.stop()
+    window.show()
+    app.processEvents()
 
-    window.open_detail()
+    QTest.mouseClick(window.analytics_button, Qt.MouseButton.LeftButton)
     first = window._analytics_window
-    window.open_detail()
+    QTest.keyClick(window.analytics_button, Qt.Key.Key_Space)
     assert window._analytics_window is first
     assert calls["created"] == 1
     assert calls["opened"] == 2
@@ -70,9 +81,19 @@ def test_unified_monitor_reuses_one_analytics_window(tmp_path, monkeypatch):
     window._done(window.data)
     assert calls["reloaded"] == 1
 
+    first.close()
+    window._done(window.data)
+    assert calls["reloaded"] == 1
+
+    window.open_detail()
+    assert window._analytics_window is first
+    assert calls["opened"] == 3
+    window._done(window.data)
+    assert calls["reloaded"] == 2
+
     window.quit_monitor()
     app.processEvents()
-    assert calls["closed"] == 1
+    assert calls["closed"] == 2
     db.close()
 
 
@@ -81,13 +102,66 @@ def test_tray_has_separate_limits_and_usage_actions(tmp_path):
     db = Database(tmp_path / "ui.sqlite")
     window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
     window.timer.stop()
-    texts = [action.text() for action in window.tray.contextMenu().actions()]
+    assert window.menu_button.menu() is window.tray.contextMenu()
+    texts = [action.text() for action in window.menu_button.menu().actions()]
+    assert texts.count("Настроить вид") == 1
     assert "Подробно по лимитам" in texts
     assert "Детальная аналитика" in texts
     assert texts.index("Подробно по лимитам") < texts.index("Детальная аналитика")
     stop_window(window)
     app.processEvents()
     db.close()
+
+
+def test_help_from_shared_menu_and_keyboard_reuses_one_window(tmp_path):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    try:
+        window.show()
+        menu = window.menu_button.menu()
+        assert menu is window.tray.contextMenu()
+        action, = [item for item in menu.actions() if item.text() == "Справка"]
+        assert action.shortcut().toString() == "F1"
+        action.trigger()
+        dialog = window._help_dialog
+        assert dialog.isVisible() and not dialog.isModal()
+        dialog.close()
+        window.activateWindow()
+        app.processEvents()
+        QTest.keyClick(window, Qt.Key.Key_F1)
+        app.processEvents()
+        assert window._help_dialog is dialog and dialog.isVisible()
+    finally:
+        stop_window(window)
+        db.close()
+
+
+def test_widget_shows_author_and_opens_github_only_on_activation(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    db.set_setting("monitor_width", "316")
+    db.set_setting("monitor_thread_view", '{"font": "2"}')
+    websites = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: websites.append(url.toString()))
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    try:
+        window.show()
+        app.processEvents()
+        author = window.findChild(QLabel, "WidgetAuthor")
+        link = window.findChild(QPushButton, "WidgetAuthorLink")
+        assert author.isVisible() and author.text() == "by onetone"
+        assert link.isVisible() and link.text() == "GitHub"
+        assert window.width() == 316
+        QTest.mouseClick(author, Qt.MouseButton.LeftButton)
+        assert websites == []
+        QTest.mouseClick(link, Qt.MouseButton.LeftButton)
+        link.setFocus()
+        QTest.keyClick(link, Qt.Key.Key_Return)
+        assert websites == ["https://github.com/antonnevm-cloud/ai-limits-monitor"] * 2
+    finally:
+        stop_window(window)
+        db.close()
 
 
 def test_unified_monitor_reuses_one_limits_window(tmp_path, monkeypatch):
@@ -100,9 +174,10 @@ def test_unified_monitor_reuses_one_limits_window(tmp_path, monkeypatch):
             calls["stopped"] += 1
 
     class FakeLimits:
-        def __init__(self, incoming_db, *, auto_refresh=True):
+        def __init__(self, incoming_db, *, auto_refresh=True, refresh_handler=None):
             assert incoming_db is db
             assert auto_refresh is False
+            assert refresh_handler is not None
             calls["created"] += 1
             self.timer = FakeTimer()
             self.states = {}
@@ -167,6 +242,37 @@ def test_unchanged_limits_do_not_rebuild_details_on_each_poll(tmp_path):
     window.quit_monitor(); app.processEvents(); db.close()
 
 
+def test_quit_waits_for_usage_and_forecast_across_multiple_polls(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / "ui.sqlite")
+    window = unified_monitor.UnifiedMonitorWindow(db, auto_refresh=False)
+    callbacks = []
+    exits = []
+
+    class Timer:
+        @staticmethod
+        def singleShot(delay, callback):
+            assert delay == 50
+            callbacks.append(callback)
+
+    monkeypatch.setattr(unified_monitor, "QTimer", Timer)
+    monkeypatch.setattr(app, "quit", lambda: exits.append(True))
+    window._usage_worker = object()
+    window._forecast_workers["claude"] = object()
+    try:
+        window._finish_quit()
+        callbacks.pop(0)()
+        window._usage_worker = None
+        callbacks.pop(0)()
+        assert not exits
+        window._forecast_workers.clear()
+        callbacks.pop(0)()
+        assert exits == [True] and not callbacks
+    finally:
+        stop_window(window)
+        db.close()
+
+
 def test_monitor_entry_point_uses_unified_process():
     source = pathlib.Path("monitor.py").read_text(encoding="utf-8")
     assert "claude_usage_manager.unified_monitor import main" in source
@@ -195,23 +301,12 @@ def test_detailed_limits_window_has_clean_cyrillic():
     assert not any(0x2500 <= ord(char) <= 0x259F for char in source)
 
 
-def test_installer_creates_only_unified_application_shortcut():
-    source = pathlib.Path("install.ps1").read_text(encoding="utf-8")
-    assert "$AppScript" not in source
-    assert "AI Limits Monitor.lnk') -ScriptPath $MonitorScript" in source
-    assert "Claude Usage Manager.lnk') -ScriptPath" not in source
-
-def test_root_launchers_point_to_unified_monitor():
-    normal = pathlib.Path("Run AI Limits Monitor.cmd")
-    debug = pathlib.Path("Run AI Limits Monitor Debug.cmd")
-    assert normal.exists() and debug.exists()
-    assert "monitor.py" in normal.read_text(encoding="utf-8-sig")
-    assert "monitor.py" in debug.read_text(encoding="utf-8-sig")
-    assert not pathlib.Path("Run Claude Usage Manager.cmd").exists()
-    assert not pathlib.Path("Run Claude Usage Manager Debug.cmd").exists()
-
 def test_legacy_runtime_surface_is_removed():
     for obsolete in (
+        # Установка только штатным установщиком: прежние запускалки требовали несуществующую .venv.
+        "install.ps1",
+        "Run AI Limits Monitor.cmd",
+        "Run AI Limits Monitor Debug.cmd",
         "app.py",
         "monitor_detail.py",
         "legacy_reference.py",
@@ -243,7 +338,7 @@ def test_codex_native_app_server_is_live_in_unified_widget(tmp_path, monkeypatch
         "codex": {"source_state": "live", "source": snapshot.source},
     }}
     monkeypatch.setattr(
-        backend_client.urllib.request, "urlopen",
+        backend_client, "_open",
         lambda *_args, **_kwargs: io.BytesIO(json.dumps(response).encode("utf-8")),
     )
     result, connected = backend_client.read_monitor_data(db)

@@ -3,17 +3,24 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import socket
 import threading
+import time
 from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
 from .models import ManualResetCredits, QuotaSnapshot
+from .provider_settings import collection_profile_id
 
 API_SCHEMA_VERSION = 1
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 28765
+
+
+def profile_api_path(path: str) -> str:
+    return f"/profiles/{collection_profile_id()}{path}"
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -37,7 +44,7 @@ def manual_resets_payload(
     now: dt.datetime,
     provider: str = "",
 ) -> dict[str, Any]:
-    nearest = credits.nearest_expiry()
+    nearest = credits.nearest_expiry(now)
     owner = credits.provider or provider
     return {
         "state": credits.state,
@@ -125,7 +132,17 @@ def snapshot_payload(
 
 class _ApiServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Без повторной привязки: занятый другой программой порт дает ошибку запуска, а не два сервера.
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+_REFRESH_INTERVAL = 10.0
+_MAX_BODY = 4096
 
 
 class LocalApiServer:
@@ -149,6 +166,8 @@ class LocalApiServer:
         self._health_details = dict(health_details or {})
         self._server: _ApiServer | None = None
         self._thread: threading.Thread | None = None
+        self._refresh_lock = threading.Lock()
+        self._last_refresh = float("-inf")
 
     @property
     def address(self) -> tuple[str, int]:
@@ -184,8 +203,28 @@ class LocalApiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            def _path(self) -> str:
                 path = urlsplit(self.path).path
+                # Старый адрес сохранен для интеграций. Виджет использует адрес своего профиля.
+                return path.removeprefix(profile_api_path("")) if path.startswith("/profiles/") else path
+
+            def _allowed(self) -> bool:
+                """Только локальные программы: страница браузера (Origin) и чужое имя узла
+                (подмена DNS на 127.0.0.1) получают отказ."""
+                host = (self.headers.get("Host") or "").strip().casefold()
+                port = owner.address[1]
+                if host not in {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"}:
+                    self._send(403, {"error": "forbidden"})
+                    return False
+                if self.headers.get("Origin") is not None:
+                    self._send(403, {"error": "forbidden"})
+                    return False
+                return True
+
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                if not self._allowed():
+                    return
+                path = self._path()
                 if path == "/health":
                     self._send(200, {
                         "schema_version": API_SCHEMA_VERSION,
@@ -200,14 +239,34 @@ class LocalApiServer:
                 self._send(404, {"error": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-                path = urlsplit(self.path).path
+                # Тело запроса дочитывается: иначе клиент получает разрыв соединения вместо ответа.
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                if length > _MAX_BODY:
+                    self.close_connection = True
+                    self._send(413, {"error": "too_large"})
+                    return
+                if length > 0:
+                    self.rfile.read(length)
+                if not self._allowed():
+                    return
+                path = self._path()
                 if path != "/v1/refresh":
                     self._send(404, {"error": "not_found"})
                     return
                 if owner._refresh is None:
                     self._send(503, {"accepted": False})
                     return
-                owner._refresh()
+                # Частые запросы объединяются: каждый запуск обновления поднимает процессы клиентов.
+                with owner._refresh_lock:
+                    moment = time.monotonic()
+                    due = moment - owner._last_refresh >= _REFRESH_INTERVAL
+                    if due:
+                        owner._last_refresh = moment
+                if due:
+                    owner._refresh()
                 self._send(202, {"accepted": True})
 
             def log_message(self, _format: str, *args: Any) -> None:

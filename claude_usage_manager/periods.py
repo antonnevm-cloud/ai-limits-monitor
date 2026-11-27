@@ -29,8 +29,31 @@ def _end_of_day(value: dt.datetime) -> dt.datetime:
     return value.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 
+def _rezone(value: dt.datetime, now: dt.datetime) -> dt.datetime:
+    """Граница в местном поясе получает смещение своей даты, а не текущего момента.
+
+    Иначе после перевода часов начало прошлой недели или месяца сдвигается на час.
+    Если now задан в другом поясе (не системном), граница не меняется.
+    """
+    if now.tzinfo is None:
+        return value
+    try:
+        if now.replace(tzinfo=None).astimezone().utcoffset() != now.utcoffset():
+            return value
+        return value.replace(tzinfo=None).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return value
+
+
 def build_period(key: str, now: dt.datetime) -> Period:
     """Строит период по ключу пресета относительно локального времени now."""
+    period = _build_period(key, now)
+    if key in ("last_5h", "last_24h", "last_7d"):
+        return period
+    return Period(period.key, period.label, _rezone(period.start_local, now), _rezone(period.end_local, now))
+
+
+def _build_period(key: str, now: dt.datetime) -> Period:
     label = PRESET_LABELS.get(key, key)
     day_start = _start_of_day(now)
 
@@ -93,7 +116,7 @@ def parse_custom(start_text: str, end_text: str, now: dt.datetime) -> Period:
         value = value.replace(tzinfo=tz)
         if is_end:
             value = value.replace(second=59, microsecond=999999)
-        return value
+        return _rezone(value, now)
 
     start = _parse(start_text, is_end=False)
     end = _parse(end_text, is_end=True)

@@ -1,6 +1,6 @@
 """Цены API: во сколько обошлись бы токены, если бы шли через API, а не по подписке.
 
-Цифры взяты только с официальных страниц на 12.11.2026:
+Цифры взяты только с официальных страниц на 12.11.2026 (GPT-6.2 - на 27.11.2026):
 - Claude: https://platform.claude.com/docs/en/about-claude/pricing
 - OpenAI: https://developers.openai.com/api/docs/pricing (Standard, короткий контекст).
 Модели, которых нет в таблицах, цены не получают: вызывающий код пишет «нет цены», а не подставляет похожую.
@@ -73,6 +73,10 @@ CLAUDE_PRICES: dict[str, ClaudePrice] = {
 }
 
 CODEX_PRICES: dict[str, CodexPrice] = {
+    # GPT-6.2 (страница цен OpenAI и запись о выпуске, 27.11.2026): Sol сохраняет цены GPT-6.1 Sol;
+    # у Astra цена записи кэша не опубликована, длинный контекст (больше 272K) - вход и кэш x2, выход x1,5.
+    "gpt-6.2-astra": CodexPrice(8, 0.40, 40, None, 16, 0.80, 60),
+    "gpt-6.2-sol": CodexPrice(2, 0.10, 10, 2.5),
     "gpt-6-astra": CodexPrice(10, 1, 50, 12.5),
     "gpt-6.1-sol": CodexPrice(2, 0.10, 10, 2.5),
     "gpt-6.1-terra": CodexPrice(1, 0.05, 5, 1.25),

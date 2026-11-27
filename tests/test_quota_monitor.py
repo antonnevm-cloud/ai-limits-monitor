@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 
 from PySide6.QtCore import QPoint,QRect,Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication,QDialog,QDialogButtonBox,QLabel,QMessageBox
+from PySide6.QtWidgets import QApplication,QDialog,QDialogButtonBox,QLabel,QMessageBox,QSystemTrayIcon
 from claude_usage_manager.database import Database
 from claude_usage_manager.models import ManualResetCredits,ManualResetItem,QuotaSnapshot,QuotaWindow
 from claude_usage_manager.qt_theme import build_stylesheet
@@ -324,7 +324,7 @@ def test_cached_snapshot_skips_antigravity_offline_placeholder(tmp_path):
     assert not state.live
     assert state.snapshot.main_window_id=="ag-group:gemini:weekly"
     assert selected=="ag-group:gemini:weekly"
-    assert compact[-1].short.remaining==96
+    assert compact[-1].short is None and compact[-1].long.remaining==96
     db.close()
 
 def test_cached_antigravity_reset_stays_factual():
@@ -337,30 +337,33 @@ def test_cached_antigravity_reset_stays_factual():
     assert normalize_cached_reset(reset,"codex",False,updated,now)==reset
 
 
-def test_antigravity_compact_shows_both_weekly_groups(tmp_path):
+def test_antigravity_compact_shows_both_windows_of_the_fixed_group(tmp_path):
     db=Database(tmp_path/"q.db")
+    db.set_setting("monitor_ag_mode", "fixed")
+    db.set_setting("monitor_ag_fixed_model", "ag-group:gemini:weekly")
+    short_reset_at=dt.datetime(2026,8,13,15,6,tzinfo=dt.timezone.utc)
     gemini_reset=dt.datetime(2026,8,15,20,21,tzinfo=dt.timezone.utc)
     other_reset=dt.datetime(2026,8,20,14,59,tzinfo=dt.timezone.utc)
     state=ProviderState("antigravity",snap("antigravity",[
         QuotaWindow("ag-group:gemini:weekly","Gemini Models",4.12,resets_at=gemini_reset,window_minutes=10080,role="group"),
-        QuotaWindow("ag-group:gemini:5h","Gemini Models",1.48,resets_at=dt.datetime(2026,8,13,15,6,tzinfo=dt.timezone.utc),window_minutes=300,role="group"),
+        QuotaWindow("ag-group:gemini:5h","Gemini Models",1.48,resets_at=short_reset_at,window_minutes=300,role="group"),
         QuotaWindow("ag-group:claude-gpt:weekly","Claude and GPT models",12,resets_at=other_reset,window_minutes=10080,role="group"),
     ]),True)
     rows=build_rows({"antigravity":state})["antigravity"]
     assert [row.name for row in rows]==["Gemini Models","Claude and GPT models"]
     compact,selected=build_compact_rows(db,{"antigravity":state})
     row=compact[-1]
-    assert selected==""
-    assert row.short.label=="Gemini Models"
-    assert row.short.remaining==95.88
-    assert row.short.resets_at==gemini_reset
-    assert row.long.label=="Claude and GPT models"
-    assert row.long.remaining==88
-    assert row.long.resets_at==other_reset
+    assert selected=="ag-group:gemini:weekly"
+    assert row.short.label=="5 ч"
+    assert row.short.remaining==98.52
+    assert row.short.resets_at==short_reset_at
+    assert row.long.label=="Неделя"
+    assert row.long.remaining==95.88
+    assert row.long.resets_at==gemini_reset
     db.close()
 
 
-def test_grouped_antigravity_compact_ignores_old_single_group_setting(tmp_path):
+def test_antigravity_compact_chooses_lowest_weekly_remaining_in_auto_mode(tmp_path):
     db=Database(tmp_path/"q.db")
     db.set_setting("monitor_ag_mode","most_consumed")
     state=ProviderState("antigravity",snap("antigravity",[
@@ -369,12 +372,59 @@ def test_grouped_antigravity_compact_ignores_old_single_group_setting(tmp_path):
     ]),True)
     compact,selected=build_compact_rows(db,{"antigravity":state})
     row=compact[-1]
-    assert selected==""
-    assert row.short.label=="Gemini Models"
-    assert row.short.remaining==96
-    assert row.long.label=="Claude and GPT models"
+    assert selected=="ag-group:claude-gpt:weekly"
+    assert row.short is None
+    assert row.long.label=="Неделя"
     assert row.long.remaining==88
     db.close()
+
+def test_antigravity_group_setting_keeps_a_short_only_group_and_the_old_model_setting(tmp_path, monkeypatch):
+    from claude_usage_manager.quota_monitor import SettingsDialog
+
+    app = qapp()
+    db = Database(tmp_path / 'antigravity-settings.db')
+    db.set_setting('monitor_ag_mode', 'fixed')
+    db.set_setting('monitor_ag_fixed_model', 'model-b')
+    now = dt.datetime.now(dt.timezone.utc)
+    states = _four_agents(now, now + dt.timedelta(hours=2))
+    windows = states['antigravity'].snapshot.windows
+    windows[0] = QuotaWindow('ag-group:gemini:5h', 'Gemini Models', 12, window_minutes=300, role='group')
+    window = _countdown_window(app, db, states)
+
+    def save_group(dialog):
+        assert dialog.fixed.currentData() == ''
+        dialog.fixed.setCurrentIndex(dialog.fixed.findData('ag-group:gemini'))
+        dialog.accept()
+        return dialog.result()
+
+    def save_while_group_is_unavailable(dialog):
+        assert dialog.fixed.currentData() == 'ag-group:gemini'
+        dialog.accept()
+        return dialog.result()
+
+    try:
+        assert window.header_rows['antigravity'].summary_text == 'нед 80%'
+        monkeypatch.setattr(SettingsDialog, 'exec', save_group)
+        window.open_settings()
+        assert window.header_rows['antigravity'].summary_text == '5 ч 88%'
+        assert db.get_setting('monitor_ag_fixed_group') == 'ag-group:gemini'
+        assert db.get_setting('monitor_ag_mode') == 'fixed'
+        assert db.get_setting('monitor_ag_fixed_model') == 'model-b'
+
+        gemini = windows.pop(0)
+        window.data.rows = build_rows(states)
+        monkeypatch.setattr(SettingsDialog, 'exec', save_while_group_is_unavailable)
+        window.open_settings()
+        assert window.header_rows['antigravity'].summary_text == 'нед 80%'
+        assert db.get_setting('monitor_ag_fixed_group') == 'ag-group:gemini'
+
+        windows.insert(0, gemini)
+        _, selected = build_compact_rows(db, states)
+        assert selected == gemini.id
+    finally:
+        window.quit_monitor()
+        app.processEvents()
+        db.close()
 
 def test_compact_window_defaults_and_settings(tmp_path):
     app=qapp();db=Database(tmp_path/"ui.db");db.set_setting("monitor_refresh_seconds","120");db.set_setting("monitor_always_on_top","1");db.set_setting("monitor_opacity","20");db.set_setting("monitor_compact_visibility",'{"compact:claude": false}')
@@ -386,18 +436,44 @@ def test_compact_window_defaults_and_settings(tmp_path):
     assert w.visibility["compact:claude"] is False
     assert bool(w.windowFlags() & Qt.WindowType.FramelessWindowHint)
     assert bool(w.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
-    assert w.actions.isVisible() is False
+    w.show()
+    assert w.actions.isVisible()
     w.quit_monitor();app.processEvents();db.close()
 
-def test_compact_actions_remain_visible_over_header_and_hide_outside(tmp_path):
-    app=qapp();db=Database(tmp_path/"ui-hover.db")
-    w=MonitorWindow(db,auto_refresh=False);w.timer.stop();w.show();app.processEvents()
-    w._update_actions_visibility(w.frameGeometry().topLeft())
-    assert w.actions.isVisible()
-    outside=w.frameGeometry().bottomRight()+QPoint(20,20)
-    w._update_actions_visibility(outside)
-    assert not w.actions.isVisible()
-    w.quit_monitor();app.processEvents();db.close()
+def test_command_bar_is_stable_and_works_with_mouse_and_keyboard(tmp_path, monkeypatch):
+    app = qapp()
+    db = Database(tmp_path / 'commands.db')
+    calls = []
+    monkeypatch.setattr(MonitorWindow, 'refresh_now', lambda self: calls.append('refresh'))
+    monkeypatch.setattr(MonitorWindow, 'open_detail', lambda self: calls.append('analytics'))
+    w = MonitorWindow(db, auto_refresh=False)
+    w.timer.stop()
+    w.show()
+    w.activateWindow()
+    app.processEvents()
+    buttons = (w.refresh_button, w.analytics_button, w.menu_button)
+    assert [b.text() for b in buttons] == ['Обновить', 'Аналитика', 'Меню']
+    assert all(b.isFlat() and not b.icon().isNull() for b in (*buttons, w.hide_button))
+    before = [b.geometry() for b in buttons]
+    for pos in (QPoint(-4, -4), w.rect().center(), w.rect().bottomRight() + QPoint(5, 5)):
+        QTest.mouseMove(w.windowHandle(), pos)
+        assert all(b.isVisible() and b.toolTip() and b.accessibleName() for b in buttons)
+        assert [b.geometry() for b in buttons] == before
+    pos = w.refresh_button.mapTo(w, w.refresh_button.rect().center())
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
+    w.refresh_button.setFocus()
+    QTest.keyClick(w.refresh_button, Qt.Key.Key_Tab)
+    app.processEvents()
+    assert w.analytics_button.hasFocus()
+    QTest.keyClick(w.analytics_button, Qt.Key.Key_Return)
+    assert calls == ['refresh', 'analytics']
+    QTest.mouseClick(w.hide_button, Qt.MouseButton.LeftButton)
+    assert not w.isVisible()
+    w.tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+    assert w.isVisible()
+    w.quit_monitor()
+    app.processEvents()
+    db.close()
 
 def test_compact_window_reapplies_transparency_surface(tmp_path):
     app=qapp();db=Database(tmp_path/"ui-opacity.db");db.set_setting("monitor_opacity","20")
@@ -499,9 +575,10 @@ def test_compact_ui_shows_agent_cards_by_name_like_the_mockup(tmp_path):
     assert by_provider["claude"].summary_text=="5 ч 97% · нед 56%"
     assert by_provider["codex"].summary_text=="нед 8%/2"
     assert by_provider["grok"].summary_text=="нед 49%"
-    # у Antigravity названия моделей не пишутся: основная модель и прочие, только проценты (названия в подсказке)
-    assert by_provider["antigravity"].summary_text=="100% · 80%"
-    assert "Gemini Models" in by_provider["antigravity"].quota_columns.toolTip()
+    assert by_provider["antigravity"].summary_text=="нед 80%"
+    assert "нед" in by_provider["antigravity"].quota_columns.headlines[0].text()
+    assert by_provider["antigravity"].quota_columns.headlines[1].isHidden()
+    assert "Claude and GPT models" in by_provider["antigravity"].quota_columns.toolTip()
     assert all(row.icon.pixmap() is not None and row.icon.width()==18 for row in rows)
     assert by_provider["grok"].row.long.window_id=="grok:weekly"
     assert "сброс" in by_provider["claude"].quota_columns.toolTip()
@@ -556,12 +633,14 @@ with tempfile.TemporaryDirectory() as temp:
             no_clip=no_clip and row_rect.contains(QRect(label.mapTo(w,QPoint(0,0)),label.size())) and label.sizeHint().width()<=label.width()
         no_clip=no_clip and row.payment_label.text()=='09.01 · 20 $'
         no_clip=no_clip and row.name_label.mapTo(w,QPoint(0,row.name_label.height())).y()<=row.payment_label.mapTo(w,QPoint(0,0)).y()
-        no_clip=no_clip and row.payment_label.mapTo(w,QPoint(row.payment_label.width(),0)).x()<=row.quota_columns.mapTo(w,QPoint(0,0)).x()
+        payment_rect = QRect(row.payment_label.mapTo(w,QPoint()), row.payment_label.size())
+        quota_rect = QRect(row.quota_columns.mapTo(w,QPoint()), row.quota_columns.size())
+        no_clip = no_clip and not payment_rect.intersects(quota_rect)
     print(json.dumps({'screen_dpr':app.primaryScreen().devicePixelRatio(),'rows':len(rows),'no_overlap':all(left.bottom()<right.top() for left,right in zip(row_rects,row_rects[1:])),'no_clip':no_clip,'width':w.width(),'height':w.height()}))
     w.quit_monitor();app.processEvents();db.close()
 """
     env=os.environ.copy();env['QT_QPA_PLATFORM']='offscreen';env['QT_SCALE_FACTOR']='1.5'
-    env['LOCALAPPDATA']=str(tmp_path)  # журнал и данные приложения подпроцесса - не в живом каталоге виджета (CLA-8)
+    env['LOCALAPPDATA']=str(tmp_path)  # журнал и данные приложения подпроцесса - не в живом каталоге виджета
     result=subprocess.run([sys.executable,'-c',code],cwd=pathlib.Path.cwd(),env=env,capture_output=True,text=True,check=True,timeout=30)
     payload=json.loads(result.stdout)
     assert payload['screen_dpr']>=1.5 and payload['rows']==2
@@ -705,16 +784,17 @@ def test_header_countdown_follows_font_delta_suffix_and_groups(tmp_path):
     columns = codex_row.quota_columns
     assert codex_row.summary_text=="нед 58%/2" and ">58%/2<" in columns.headlines[0].text()
     assert columns.countdowns[0].text() == "3д 8ч"
-    # Antigravity: под каждой группой свой срок
+    # Antigravity: под каждым периодом выбранной группы свой срок
     ag_state=ProviderState("antigravity",snap("antigravity",[
         QuotaWindow("ag-group:gemini:weekly","Gemini Models",0,resets_at=now+dt.timedelta(days=1,minutes=5),window_minutes=10080,role="group"),
+        QuotaWindow("ag-group:claude-gpt:5h","Claude and GPT models",22,resets_at=now+dt.timedelta(hours=4),window_minutes=300,role="group"),
         QuotaWindow("ag-group:claude-gpt:weekly","Claude and GPT models",20,resets_at=now+dt.timedelta(days=6,hours=23,minutes=59),window_minutes=10080,role="group"),
     ]),True)
     compact,_=build_compact_rows(db,{"antigravity":ag_state})
     ag_row=CompactRow(compact[0],ag_state,now=now)
     columns = ag_row.quota_columns
-    assert ag_row.summary_text=="100% · 80%"
-    assert [label.text() for label in columns.countdowns] == ["1д 0ч", "6д 23ч"]
+    assert ag_row.summary_text=="5 ч 78% · нед 80%"
+    assert [label.text() for label in columns.countdowns] == ["4ч 0м", "6д 23ч"]
     db.close()
 
 
@@ -766,6 +846,90 @@ def _four_agents(now,claude_short_reset):
 
 
 @pytest.mark.parametrize('font_delta', [0, 2])
+def test_antigravity_quota_details_follow_refresh_in_the_316_widget(tmp_path, font_delta):
+    from claude_usage_manager.quota_monitor_model import MonitorData
+
+    app = qapp()
+    db = Database(tmp_path / 'antigravity-details.db')
+    db.set_setting('monitor_width', '316')
+    db.set_setting('monitor_thread_view', json.dumps({'font': f'+{font_delta}' if font_delta else '0'}))
+    db.set_setting('monitor_ag_fixed_group', 'ag-group:gemini')
+    now = dt.datetime.now(dt.timezone.utc)
+    states = _four_agents(now, now + dt.timedelta(hours=2))
+    reset = now + dt.timedelta(hours=3)
+    windows = states['antigravity'].snapshot.windows
+    windows[0].resets_at = now + dt.timedelta(days=3)
+    windows.append(QuotaWindow('ag-group:gemini:5h', 'Gemini Models', 28, reset, 300, 'group'))
+    w = _countdown_window(app, db, states)
+    try:
+        header = w.header_rows['antigravity']
+        claude = w.header_rows['claude']
+        assert w.width() == 316
+        assert header.summary_text == '5 ч 72% · нед 100%'
+        assert header.height() == claude.height()
+        assert header.quota_columns.height() == claude.quota_columns.height()
+        assert all('<br>' not in label.text() for label in header.quota_columns.headlines)
+        if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
+            assert w.grab().save(str(pathlib.Path(out) / f'antigravity-{font_delta}-closed.png'))
+        button = w.header_rows['antigravity'].disclosure
+        button.setFocus()
+        QTest.keyClick(button, Qt.Key.Key_Return)
+        QTest.qWait(80)
+        panel = w.header_rows['antigravity'].parentWidget().block
+
+        def contents():
+            return [label.text() for label in panel.findChildren(QLabel) if label.isVisible()]
+
+        assert [label.text() for label in panel.findChildren(QLabel, 'QuotaGroup')] == ['Gemini', 'Claude и GPT']
+        assert {'5 ч', 'Неделя', '72%', '100%', '80%', short_reset(reset), 'нет даты'} <= set(contents())
+        assert w.width() == 316
+        for command in (w.refresh_button, w.analytics_button, w.menu_button):
+            assert command.width() >= command.sizeHint().width()
+        if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
+            assert w.grab().save(str(pathlib.Path(out) / f'antigravity-{font_delta}.png'))
+
+        def refresh():
+            compact, selected = build_compact_rows(db, states)
+            w._done(MonitorData(states, build_rows(states), compact, selected))
+            app.processEvents()
+            assert w.header_rows['antigravity'].parentWidget().block is panel and button.hasFocus()
+
+        windows[-1].used_percent = 100
+        refresh()
+        assert '0%' in contents() and '72%' not in contents()
+        windows[:] = [QuotaWindow('ag-group:custom:weekly', 'Новая группа', 24, window_minutes=10080, role='group')]
+        refresh()
+        assert {'Новая группа', '76%'} <= set(contents())
+        assert w.header_rows['antigravity'].summary_text == 'нед 76%'
+        windows[:] = [QuotaWindow('model-a', 'Gemini Pro', 17, role='model'),
+                      QuotaWindow('model-b', 'Gemini Flash', 2, role='model')]
+        refresh()
+        assert {'Gemini Pro', 'Gemini Flash', '83%', '98%'} <= set(contents())
+        assert 'Claude и GPT' not in contents()
+        windows[:] = [QuotaWindow(f'model-{i}', f'Модель {i}', i, role='model') for i in range(50)]
+        refresh()
+        QTest.qWait(80)
+        assert 0 < panel.verticalScrollBar().maximum() and w.height() <= w.screen().availableGeometry().height()
+        panel.setFocus()
+        QTest.keyClick(panel, Qt.Key.Key_PageDown)
+        assert panel.verticalScrollBar().value() > 0
+        button.setFocus()
+        windows[:] = [QuotaWindow('console', 'Лимит консоли', 67, window_minutes=10080)]
+        refresh()
+        assert {'Лимит консоли', '33%'} <= set(contents())
+        windows.clear()
+        refresh()
+        assert panel.findChild(QLabel, 'QuotaEmpty').isVisible()
+        assert short_reset(reset) not in contents()
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        assert not button.isChecked() and w.header_rows['antigravity'].parentWidget().block is None
+    finally:
+        w.quit_monitor()
+        app.processEvents()
+        db.close()
+
+
+@pytest.mark.parametrize('font_delta', [0, 2])
 def test_payments_reset_notice_and_forecast_have_room_in_both_states(tmp_path, font_delta):
     from claude_usage_manager.cache_threads import CacheThread
     from claude_usage_manager.quota_monitor import PAYMENTS_SETTING
@@ -775,32 +939,45 @@ def test_payments_reset_notice_and_forecast_have_room_in_both_states(tmp_path, f
     now = dt.datetime.now(dt.timezone.utc)
     states = _four_agents(now, now + dt.timedelta(hours=4))
     states['claude'] = _claude_state(now, now + dt.timedelta(hours=4), now + dt.timedelta(days=2))
+    states['grok'] = ProviderState('grok', states['grok'].snapshot, False)
+    states['antigravity'].snapshot.fallback_source = 'Локальная история'
+    states['antigravity'] = ProviderState('antigravity', states['antigravity'].snapshot, False)
     codex = states['codex'].snapshot
     codex.windows[0].resets_at = now + dt.timedelta(days=4)
     codex.manual_resets = ManualResetCredits(provider='codex', state='available', available_count=2,
         items=[ManualResetItem('credit', 'codex', now + dt.timedelta(days=6))])
     db.set_setting(PAYMENTS_SETTING, json.dumps({p: {'date': '2026-12-01', 'amount': '20 $'} for p in states}))
     db.set_setting('monitor_thread_view', json.dumps({'font': f'+{font_delta}' if font_delta else '0'}))
-    db.set_setting('monitor_width', '310')
+    db.set_setting('monitor_width', '316')
     w = _countdown_window(app, db, states)
-    w.cache_threads['claude'] = [CacheThread('claude', 'test', 'Пример задачи', 'Проект',
-                                             'Desktop', now, 3600)]
+    w._cache_scanned({'claude': [CacheThread('claude', 'test', 'Пример задачи', 'Проект',
+                                             'Desktop', now, 3600)], 'codex': [], 'grok': []})
     original_headers = dict(w.header_rows)
     try:
         assert w.font_delta() == font_delta
         for stage in ('collapsed', 'expanded', 'collapsed-again'):
             if stage != 'collapsed':
-                header = w.header_rows['claude']
-                QTest.mouseClick(w, Qt.MouseButton.LeftButton, pos=header.mapTo(w, header.rect().center()))
+                QTest.mouseClick(w.header_rows['claude'].disclosure, Qt.MouseButton.LeftButton)
             QTest.qWait(160)
             assert w.header_rows == original_headers
+            if font_delta == 0 or app.platformName() == 'windows':
+                assert w.width() == 316
+            before = w.geometry()
+            w._render()
+            app.processEvents()
+            assert w.geometry() == before
             for header in w.header_rows.values():
+                quota_rect = QRect(header.quota_columns.mapTo(header, QPoint()), header.quota_columns.size())
+                for label in (header.name_label, header.payment_label):
+                    assert not quota_rect.intersects(QRect(label.mapTo(header, QPoint()), label.size()))
                 assert header.quota_columns.height() >= header.quota_columns.sizeHint().height()
                 for label in header.quota_columns.headlines + header.quota_columns.countdowns:
                     if label.isVisible():
                         assert label.height() >= label.sizeHint().height()
-                        assert label.width() >= label.sizeHint().width()
-                assert header.payment_label.height() >= header.payment_label.sizeHint().height()
+                        assert label.width() >= label.sizeHint().width(), (stage, header.agent_name, label.text(),
+                            label.geometry(), header.quota_columns.size(), header.quota_columns.sizeHint(), w.width())
+                assert header.payment_label.height() >= header.payment_label.sizeHint().height(), (stage,
+                    header.agent_name, header.size(), header.heightForWidth(header.width()), w.size())
             notice = w.header_rows['codex'].reset_notice
             assert notice.height() >= notice.heightForWidth(notice.width())
             if stage == 'expanded':
@@ -811,15 +988,19 @@ def test_payments_reset_notice_and_forecast_have_room_in_both_states(tmp_path, f
             if out := os.environ.get('QUOTA_LAYOUT_CAPTURES'):
                 assert w.grab().save(str(pathlib.Path(out) / f'{stage}-{font_delta}.png'))
             initial_width = w.width()
+            w.move(w.screen().availableGeometry().center().x() - initial_width // 2, w.y())
+            edge = 'left' if stage == 'expanded' else 'right'
             w._grip_started()
-            w._grip_dragged('right', 120)
+            w._grip_dragged(edge, -64 if edge == 'left' else 64)
             app.processEvents()
-            assert w.width() > initial_width
+            assert w.width() == initial_width + 64
             assert notice.height() >= notice.heightForWidth(notice.width())
-            w._grip_dragged('right', 0)
+            if out:
+                assert w.grab().save(str(pathlib.Path(out) / f'{stage}-{font_delta}-wide.png'))
+            w._grip_dragged(edge, 0)
             w._grip_finished()
             app.processEvents()
-            assert w.width() == initial_width
+            assert w.width() == initial_width, (stage, w.minimumWidth(), w.user_width, w.geometry())
             assert notice.height() >= notice.heightForWidth(notice.width())
     finally:
         w.quit_monitor()

@@ -8,7 +8,6 @@ from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QSizePolicy
 from .qt_theme import COLORS
 
 
-REMAINING_COLORS = ((20, '#E07A70'), (50, '#D9B36A'))
 TIME_LABELS = {'5 ч': '5 ч', 'День': 'день', 'Неделя': 'нед'}
 
 
@@ -71,6 +70,7 @@ class QuotaColumns(QFrame):
         for column in range(2):
             headline = QLabel()
             headline.setTextFormat(Qt.TextFormat.RichText)
+            headline.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             countdown = QLabel()
             countdown.setObjectName('QuotaCountdown')
             countdown.setStyleSheet(f"color:{COLORS['muted']};font-size:{8 + delta:g}pt;")
@@ -118,7 +118,18 @@ class QuotaColumns(QFrame):
         return changed
 
 
-def remaining_color(value):
+REMAINING_LEVELS = ((20, 'danger'), (50, 'warning'))
+LEVEL_COLORS = {'danger': '#E07A70', 'warning': '#D9B36A', 'ok': '#DCE3EA'}
+
+
+def remaining_level(value):
+    """Уровень остатка по показанному числу: цвет "19%" и "20%" не зависит от скрытых долей процента."""
     if value is None:
-        return COLORS['muted']
-    return next((color for limit, color in REMAINING_COLORS if value < limit), '#DCE3EA')
+        return None
+    shown = round(float(value))
+    return next((level for limit, level in REMAINING_LEVELS if shown < limit), 'ok')
+
+
+def remaining_color(value):
+    level = remaining_level(value)
+    return COLORS['muted'] if level is None else LEVEL_COLORS[level]

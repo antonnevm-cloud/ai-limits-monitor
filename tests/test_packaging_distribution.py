@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import runpy
 import sys
 from types import SimpleNamespace
@@ -27,8 +28,7 @@ def test_release_bundles_only_the_application_and_public_assets(system, tmp_path
     runpy.run_path(str(PACKAGING / 'monitor.spec'), init_globals={**namespace, 'SPECPATH': PACKAGING})
     args, options = calls['Analysis']
     assert args == ([str(PACKAGING.parent / 'monitor.py')],)
-    assert {'claude_usage_manager.cursor_provider',
-            'claude_usage_manager.windows_credential'} <= set(options['excludes'])
+    assert {'pytest', 'tkinter'} <= set(options['excludes'])
     resources = [(Path(src), dest) for src, dest in options['datas']]
     assert all(p.exists() for p, _ in resources)
     assert {dest for _, dest in resources} == {'assets', 'assets/providers', 'licenses'}
@@ -36,7 +36,9 @@ def test_release_bundles_only_the_application_and_public_assets(system, tmp_path
         'claude', 'codex', 'grok', 'antigravity',
     }
     assert calls['EXE'][1]['name'] == APP_NAME
-    assert calls['EXE'][1]['console'] == (system == 'win32')
+    # Консольный EXE открывает окно терминала при запуске по ярлыку и закрывается вместе с ним.
+    assert calls['EXE'][1]['console'] is False
+    assert not calls['EXE'][1].get('hide_console')
     if system == 'darwin':
         assert calls['BUNDLE'][1]['name'] == f'{APP_NAME}.app'
         assert calls['BUNDLE'][1]['info_plist']['CFBundleShortVersionString'] == APP_VERSION
@@ -48,7 +50,53 @@ def test_portable_installer_skips_registration_and_all_shortcuts():
     source = (PACKAGING / 'windows.iss').read_text(encoding='utf-8')
     assert 'PrivilegesRequired=lowest' in source
     assert 'Uninstallable=not PortableInstall' in source
-    icons = source.split('[Icons]', 1)[1].split('[Code]', 1)[0].strip().splitlines()
-    assert len(icons) == 3
-    assert all('Filename: "{app}\\{#AppName}.exe"' in line and 'Check: not PortableInstall' in line
+    parts = re.split(r'^\[(\w+)\]\s*$', source, flags=re.M)
+    sections = {name: [line for line in body.strip().splitlines() if line and not line.startswith(';')]
+                for name, body in zip(parts[1::2], parts[2::2])}
+    icons = sections['Icons']
+    assert len(icons) == 2
+    assert all('Filename: "{app}\\{#AppExe}"' in line and 'Check: not PortableInstall' in line
                for line in icons)
+    # Автозапуск - параметр Run профиля, его же переключает программа; ярлыка в автозагрузке больше нет.
+    assert '{userstartup}' not in '\n'.join(icons)
+    registry = sections['Registry']
+    assert len(registry) == 1 and 'Tasks: autostart' in registry[0] and '--autostart' in registry[0]
+    assert 'Check: not PortableInstall' in registry[0]
+    # Старые файлы программы удаляются до копирования новой версии.
+    assert sections['InstallDelete'] == ['Type: filesandordirs; Name: "{app}\\_internal"',
+                                         'Type: files; Name: "{app}\\portable.txt"; Check: not PortableInstall']
+    assert any('--uninstall' in line for line in sections['UninstallRun'])
+    # Переносимая копия требует своей папки и получает признак хранения данных рядом с программой.
+    assert "ExpandConstant('{param:dir|}') = ''" in source
+    assert "{app}\\portable.txt" in source
+
+
+def test_source_archive_check_finds_private_paths_and_forbidden_words(tmp_path):
+    import zipfile
+
+    check = runpy.run_path(str(PACKAGING / 'check_distribution.py'))
+    archive = tmp_path / 'source.zip'
+
+    def pack(text):
+        with zipfile.ZipFile(archive, 'w') as bundle:
+            bundle.writestr('project/tests/sample.py', text)
+
+    pack('path = "C:/Users/test/x" + "/home/demo" + r"C:\\Users\\<имя>"')
+    check['check_source_archive'](archive, ['secret_client'])
+    for text, word in (('p = r"C:\\Users\\ivanov\\AppData"', None), ('project = "secret_client_db"', 'secret_client')):
+        pack(text)
+        with pytest.raises(ValueError):
+            check['check_source_archive'](archive, [word] if word else [])
+
+
+def test_portable_marker_moves_data_next_to_program(tmp_path, monkeypatch):
+    from claude_usage_manager import utils
+
+    monkeypatch.delenv('AI_LIMITS_DATA_DIR', raising=False)
+    program = tmp_path / 'Копия программы'
+    program.mkdir()
+    monkeypatch.setattr(utils.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(utils.sys, 'executable', str(program / 'AI Limits Monitor.exe'))
+    assert utils.portable_data_dir() is None
+    (program / utils.PORTABLE_MARKER).write_text('portable', encoding='utf-8')
+    assert utils.data_dir() == program.resolve() / 'data'

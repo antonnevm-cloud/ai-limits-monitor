@@ -16,9 +16,23 @@ from .models import ManualResetCredits, ManualResetItem, QuotaSnapshot, QuotaWin
 from .provider_settings import provider_config_key
 from .utils import database_path, get_logger, parse_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _MIN_QUOTA_INTERVAL = dt.timedelta(minutes=10)
+_QUOTA_SOURCES = {
+    "claude": ("codexbar:claude", "claude-code:statusline", "claude-code:official-mod"),
+    "codex": ("codexbar:codex", "codex-app-server:account/ratelimits/read"),
+    "grok": ("grok:local-billing-log",),
+    "antigravity": ("codexbar:antigravity", "antigravity:language-server",
+                    "antigravity:cli-usage", "antigravity:statusline"),
+}
+_QUOTA_COLUMNS = ("id,ts_utc,five_hour,weekly,fable_weekly,source,windows_json,"
+                  "main_window_id,login_method,manual_resets_json")
+_HAS_QUOTA = ("five_hour IS NOT NULL OR weekly IS NOT NULL OR fable_weekly IS NOT NULL "
+              "OR windows_json NOT IN ('[]', '')")
+_HAS_MANUAL_RESETS = ("CASE WHEN json_valid(manual_resets_json) "
+                      "THEN json_extract(manual_resets_json, '$.state') "
+                      "END NOT IN ('unknown', '', 0)")
 
 
 class Database:
@@ -48,6 +62,12 @@ class Database:
     def _migrate(self) -> None:
         with self._lock:
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                self._log.warning("База создана более новой версией программы (схема %s, эта версия знает %s). "
+                                  "Обнови программу, иначе часть данных может отображаться неверно.",
+                                  version, SCHEMA_VERSION)
+            if version >= SCHEMA_VERSION:
+                return
             if version < 1:
                 self._create_v1()
                 version = 1
@@ -82,6 +102,15 @@ class Database:
                 columns = {row[1] for row in self._conn.execute("PRAGMA table_info(quota_samples)")}
                 if "profile_key" not in columns:
                     self._conn.execute("ALTER TABLE quota_samples ADD COLUMN profile_key TEXT NOT NULL DEFAULT ''")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quota_source_profile_ts "
+                "ON quota_samples(LOWER(source),profile_key,ts_utc DESC,id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_quota_manual_source_profile_ts "
+                "ON quota_samples(LOWER(source),profile_key,ts_utc DESC,id DESC) "
+                "WHERE " + _HAS_MANUAL_RESETS
+            )
             self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._conn.commit()
             self._log.info("База готова, версия схемы %s", SCHEMA_VERSION)
@@ -196,7 +225,8 @@ class Database:
         if not isinstance(payload, dict):
             payload = {}
         items: list[ManualResetItem] = []
-        for item in payload.get("items") or []:
+        stored_items = payload.get("items")
+        for item in stored_items if isinstance(stored_items, list) else ():
             if not isinstance(item, dict):
                 continue
             items.append(ManualResetItem(
@@ -229,8 +259,12 @@ class Database:
         credits.items = credits.sorted_items()
         return credits
 
-    def record_quota(self, snapshot: QuotaSnapshot, *, profile_key: str | None = None) -> bool:
-        """Пишет provider-specific snapshot; arbitrary windows сохраняются JSON-ом."""
+    def record_quota(self, snapshot: QuotaSnapshot, *, profile_key: str | None = None,
+                     observed_at: dt.datetime | None = None) -> bool:
+        """Пишет provider-specific snapshot; arbitrary windows сохраняются JSON-ом.
+
+        ``observed_at`` - время измерения для запасного снимка: запись получает его, а не время записи.
+        """
         with self._lock:
             source = snapshot.source or (f"unknown:{snapshot.provider}" if snapshot.provider else "")
             if profile_key is None:
@@ -242,77 +276,127 @@ class Database:
                 "FROM quota_samples WHERE source = ? AND profile_key = ? ORDER BY id DESC LIMIT 1", (source, profile_key),
             ).fetchone()
             now = dt.datetime.now(dt.timezone.utc)
+            if observed_at is not None and observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
             if row is not None:
-                previous_windows = row["windows_json"] or "[]"
-                comparison_windows = windows_json
-                if source == "grok:local-billing-log":
-                    def without_observation(value):
-                        try:
-                            windows = json.loads(value)
-                            for window in windows:
-                                if isinstance(window, dict) and isinstance(window.get("details"), dict):
-                                    window["details"].pop("observed_at", None)
-                            return windows
-                        except (ValueError, TypeError):
-                            return value
-                    previous_windows = without_observation(previous_windows)
-                    comparison_windows = without_observation(windows_json)
+                # Время наблюдения, время сбора кредитов и срок сброса, пересчитанный из "через N секунд",
+                # меняются на каждом опросе при тех же лимитах. Иначе каждый опрос Codex и Antigravity
+                # добавлял бы строку истории.
                 same = (_close(row["five_hour"],snapshot.five_hour) and _close(row["weekly"],snapshot.weekly)
-                        and _close(row["fable_weekly"],snapshot.fable_weekly) and previous_windows == comparison_windows
+                        and _close(row["fable_weekly"],snapshot.fable_weekly)
+                        and _same_windows(row["windows_json"] or "[]", windows_json)
                         and (row["main_window_id"] or "") == snapshot.main_window_id and (row["login_method"] or "") == snapshot.login_method
-                        and (row["manual_resets_json"] or "{}") == manual_resets_json)
+                        and _same_manual_resets(row["manual_resets_json"] or "{}", manual_resets_json))
                 last_ts=parse_iso(row["ts_utc"]) or now
                 if same and (now-last_ts) < _MIN_QUOTA_INTERVAL: return False
+                if observed_at is not None and observed_at <= last_ts: return False
+            stamp = observed_at if observed_at is not None and observed_at < now else now
             self._conn.execute(
                 "INSERT INTO quota_samples (ts_utc,five_hour,weekly,fable_weekly,source,windows_json,main_window_id,login_method,manual_resets_json,profile_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (now.isoformat(), snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly, source, windows_json, snapshot.main_window_id, snapshot.login_method, manual_resets_json, profile_key),
+                (stamp.astimezone(dt.timezone.utc).isoformat(), snapshot.five_hour, snapshot.weekly, snapshot.fable_weekly, source, windows_json, snapshot.main_window_id, snapshot.login_method, manual_resets_json, profile_key),
             )
             self._conn.commit(); return True
 
-    def quota_samples(self, start_utc: dt.datetime | None = None, end_utc: dt.datetime | None = None, provider: str | None = None) -> list[dict[str, Any]]:
+    def migrate_profile_keys(self) -> int:
+        """Перенести историю, записанную с ключом прежних версий (в нем были пути к программам)."""
+        from .provider_settings import legacy_provider_config_key, load_connections
+
+        moved = 0
         with self._lock:
-            query="SELECT ts_utc,five_hour,weekly,fable_weekly,source,windows_json,main_window_id,login_method,manual_resets_json FROM quota_samples"; params=[]; clauses=[]
-            if provider:
-                provider_key = provider.casefold()
-                if provider_key in ("claude", "codex", "grok", "antigravity"):
-                    clauses.append("profile_key = ?")
-                    params.append(provider_config_key(provider_key))
-                if provider_key == "cursor":
-                    clauses.append("(LOWER(source) = ? OR LOWER(source) LIKE ?)")
-                    params.extend(["codexbar:cursor", "cursor:%"])
-                elif provider_key == "grok":
-                    # Current Grok Build source; preserve legacy Grok rows only for history.
-                    clauses.append("LOWER(source) = ?")
-                    params.append("grok:local-billing-log")
-                elif provider_key == "claude":
-                    # Keep historical rows for analytics; cache chooses new source only.
-                    clauses.append("LOWER(source) IN (?, ?, ?)")
-                    params.extend([
-                        "codexbar:claude", "claude-code:statusline",
-                        "claude-code:official-mod",
-                    ])
-                elif provider_key == "codex":
-                    # Native Codex app-server samples are first-class cache/history.
-                    clauses.append("LOWER(source) IN (?, ?)")
-                    params.extend([
-                        "codexbar:codex",
-                        "codex-app-server:account/ratelimits/read",
-                    ])
-                elif provider_key == "antigravity":
-                    # Legacy samples are retained for historical comparisons.
-                    clauses.append("LOWER(source) IN (?, ?, ?, ?)")
-                    params.extend(["codexbar:antigravity", "antigravity:language-server", "antigravity:cli-usage", "antigravity:statusline"])
-                else:
-                    clauses.append("LOWER(source) = ?")
-                    params.append(f"codexbar:{provider_key}")
-            if start_utc is not None: clauses.append("ts_utc >= ?"); params.append(start_utc.astimezone(dt.timezone.utc).isoformat())
-            if end_utc is not None: clauses.append("ts_utc <= ?"); params.append(end_utc.astimezone(dt.timezone.utc).isoformat())
-            if clauses: query += " WHERE " + " AND ".join(clauses)
-            query += " ORDER BY ts_utc ASC"
-            rows=[]
-            for raw in self._conn.execute(query,params).fetchall():
-                row=dict(raw); row["windows"]=self._decode_windows(row.get("windows_json")); row["manual_resets"]=self._decode_manual_resets(row.get("manual_resets_json"), provider or ""); rows.append(row)
-            return rows
+            for provider, connection in load_connections().items():
+                sources = _QUOTA_SOURCES.get(provider)
+                if not sources:
+                    continue
+                old = legacy_provider_config_key(provider, connection)
+                new = provider_config_key(provider, connection)
+                if old == new:
+                    continue
+                placeholders = ", ".join("?" for _ in sources)
+                cursor = self._conn.execute(
+                    f"UPDATE quota_samples SET profile_key = ? WHERE profile_key = ? AND LOWER(source) IN ({placeholders})",
+                    (new, old, *sources),
+                )
+                moved += cursor.rowcount
+            self._conn.commit()
+        if moved:
+            self._log.info("История квот перенесена на новый ключ профиля: %s строк", moved)
+        return moved
+
+    @staticmethod
+    def _quota_source_filter(provider: str | None, source: str | None = None) -> tuple[list[str], list[str]]:
+        clauses: list[str] = []
+        params: list[str] = []
+        if provider:
+            key = provider.casefold()
+            if key in _QUOTA_SOURCES:
+                clauses.append("profile_key = ?")
+                params.append(provider_config_key(key))
+            if key == "cursor" and source is None:
+                clauses.append("(LOWER(source) = ? OR LOWER(source) LIKE ?)")
+                params.extend(("codexbar:cursor", "cursor:%"))
+            else:
+                sources = (source.casefold(),) if source else _QUOTA_SOURCES.get(key, (f"codexbar:{key}",))
+                placeholders = ", ".join("?" for _ in sources)
+                clauses.append(f"LOWER(source) IN ({placeholders})")
+                params.extend(sources)
+        return clauses, params
+
+    def _decode_quota_row(self, raw: sqlite3.Row, provider: str) -> dict[str, Any]:
+        row = dict(raw)
+        row.pop("id", None)
+        row["windows"] = self._decode_windows(row["windows_json"])
+        row["manual_resets"] = self._decode_manual_resets(row["manual_resets_json"], provider)
+        return row
+
+    def quota_samples(self, start_utc: dt.datetime | None = None, end_utc: dt.datetime | None = None,
+                      provider: str | None = None) -> list[dict[str, Any]]:
+        clauses, params = self._quota_source_filter(provider)
+        for column, stamp in (("ts_utc >= ?", start_utc), ("ts_utc <= ?", end_utc)):
+            if stamp is not None:
+                clauses.append(column)
+                params.append(stamp.astimezone(dt.timezone.utc).isoformat())
+        query = f"SELECT {_QUOTA_COLUMNS} FROM quota_samples"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            rows = self._conn.execute(query + " ORDER BY ts_utc, id", params).fetchall()
+        return [self._decode_quota_row(row, provider or "") for row in rows]
+
+    def latest_quota_rows(self, provider: str, *, source: str | None = None,
+                          include_manual: bool = True) -> tuple[dict | None, dict | None]:
+        """Читает последние пригодные квоты и сбросы независимо, без загрузки истории."""
+        key = provider.casefold()
+        sources = ((source,) if source else _QUOTA_SOURCES.get(key, (None,)))
+        quota = manual = None
+        quota_order = manual_order = None
+        with self._lock:
+            for provider_source in sources:
+                clauses, params = self._quota_source_filter(provider, provider_source)
+                where = " AND ".join(clauses)
+                query = f"SELECT {_QUOTA_COLUMNS} FROM quota_samples WHERE {where}"
+                order = " ORDER BY ts_utc DESC, id DESC"
+                for predicate, for_manual in ((_HAS_QUOTA, False), (_HAS_MANUAL_RESETS, True)):
+                    if for_manual and not include_manual:
+                        continue
+                    cursor = self._conn.execute(f"{query} AND ({predicate}){order}", params)
+                    try:
+                        for raw in cursor:
+                            recency = (raw["ts_utc"], raw["id"])
+                            previous = manual_order if for_manual else quota_order
+                            if previous is not None and recency <= previous:
+                                break
+                            row = self._decode_quota_row(raw, provider)
+                            if for_manual:
+                                if row["manual_resets"].state != "unknown":
+                                    manual, manual_order = row, recency
+                                    break
+                            elif (any(row[field] is not None for field in ("five_hour", "weekly", "fable_weekly"))
+                                  or any(w.used_percent is not None and not w.informational for w in row["windows"])):
+                                quota, quota_order = row, recency
+                                break
+                    finally:
+                        cursor.close()
+        return quota, manual
 
     # ------------------------------------------------------------------ #
     # Правила тредов
@@ -445,6 +529,52 @@ class Database:
                 (key, value),
             )
             self._conn.commit()
+
+
+_RESET_JITTER = dt.timedelta(minutes=2)
+
+
+def _load_list(raw: str) -> list | None:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, list) else None
+
+
+def _same_windows(previous: str, current: str) -> bool:
+    """Одинаковые окна: без времени наблюдения, срок сброса с допуском на пересчет из оставшихся секунд."""
+    left, right = _load_list(previous), _load_list(current)
+    if left is None or right is None or len(left) != len(right):
+        return previous == current
+    for a, b in zip(left, right):
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return previous == current
+        a, b = dict(a), dict(b)
+        for item in (a, b):
+            if isinstance(item.get("details"), dict):
+                item["details"] = {k: v for k, v in item["details"].items() if k != "observed_at"}
+        reset_a, reset_b = parse_iso(a.pop("resets_at", None)), parse_iso(b.pop("resets_at", None))
+        if (reset_a is None) != (reset_b is None):
+            return False
+        if reset_a is not None and abs(reset_a - reset_b) > _RESET_JITTER:
+            return False
+        if a != b:
+            return False
+    return True
+
+
+def _same_manual_resets(previous: str, current: str) -> bool:
+    try:
+        left, right = json.loads(previous), json.loads(current)
+    except (TypeError, ValueError):
+        return previous == current
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return previous == current
+    # Время сбора кредитов Codex ставится на каждом опросе.
+    left.pop("updated_at", None)
+    right.pop("updated_at", None)
+    return left == right
 
 
 def _close(left: float | None, right: float | None, tol: float = 1e-6) -> bool:

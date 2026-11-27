@@ -3,7 +3,16 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from typing import Any
+
+
+def keep_tool_window_visible(widget: Any) -> None:
+    """macOS прячет окна типа Qt.Tool, когда программа неактивна; виджету, панели вида и окну расхода это не нужно."""
+    if sys.platform == "darwin":
+        from PySide6.QtCore import Qt
+
+        widget.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
 
 _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
 _PROCESS_PER_MONITOR_DPI_AWARE = 2

@@ -145,3 +145,32 @@ def test_widget_uses_grok_backend_observation_instead_of_older_database(tmp_path
     finally:
         server.stop()
         db.close()
+
+
+def test_widget_checks_the_collector_profile_on_every_request(tmp_path, monkeypatch):
+    from claude_usage_manager import backend_client, local_api
+    from claude_usage_manager.utils import data_dir, data_store_id
+
+    (data_dir() / "backend-control.json").write_text('{"desired_running":true}', encoding="utf-8")
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "first account"))
+    first = local_api.profile_api_path("")
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "other account"))
+    assert local_api.profile_api_path("") != first
+    calls = []
+    server = LocalApiServer(lambda: {}, lambda: calls.append("refresh"), port=0,
+                            health_details={"mode": "backend", "connections_schema": 1, "data_store": data_store_id()})
+    server.start()
+    db = Database(tmp_path / "widget.db")
+    try:
+        monkeypatch.setattr(backend_client, "DEFAULT_PORT", server.address[1])
+        assert backend_client.existing_backend_available()
+        assert backend_client.read_monitor_data(db, base_url=server.base_url)[1]
+        assert backend_client.request_backend_refresh(base_url=server.base_url)
+        monkeypatch.setattr(backend_client, "profile_api_path", lambda path: first + path)
+        assert not backend_client.existing_backend_available()
+        assert not backend_client.read_monitor_data(db, base_url=server.base_url)[1]
+        assert not backend_client.request_backend_refresh(base_url=server.base_url)
+        assert calls == ["refresh"]
+    finally:
+        server.stop()
+        db.close()

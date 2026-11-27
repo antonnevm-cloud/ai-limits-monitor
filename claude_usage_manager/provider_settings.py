@@ -77,11 +77,20 @@ def load_connections(*, strict: bool = False) -> dict[str, Connection]:
         return {key: _from_dict(key, raw.get(key, {})) for key in PROVIDER_NAMES}
     except FileNotFoundError:
         return {key: Connection() for key in PROVIDER_NAMES}
-    except (OSError, ValueError, RecursionError):
+    except (OSError, ValueError, RecursionError) as error:
         if strict:
             raise ValueError("Не удалось прочитать connections.json. Проверь настройки подключения.") from None
+        global _DAMAGED_REPORTED
+        if not _DAMAGED_REPORTED:
+            _DAMAGED_REPORTED = True
+            utils.get_logger().warning(
+                "Не удалось прочитать %s (%s): все источники выключены до исправления в окне \"Подключения\".",
+                utils.data_dir() / "connections.json", error)
         # Поврежденный файл не должен самовольно запускать отключенные клиенты.
         return {key: Connection(enabled=False) for key in PROVIDER_NAMES}
+
+
+_DAMAGED_REPORTED = False
 
 
 def validate_connection(provider: str, connection: Connection) -> Connection:
@@ -132,8 +141,33 @@ def provider_enabled(provider: str) -> bool:
     return load_connections()[provider].enabled
 
 
-def provider_config_key(provider: str) -> str:
-    connection = load_connections()[provider]
+def _normalized(path: Path | str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.expanduser(str(path))))
+
+
+def provider_config_key(provider: str, connection: Connection | None = None) -> str:
+    """Ключ истории квот: зависит только от каталога данных клиента, а не от пути к программе.
+
+    Выбор той же программы или явное указание стандартного каталога историю не прячет.
+    """
+    connection = connection or load_connections()[provider]
+    try:
+        profile = _normalized(provider_profile(provider, connection))
+    except ValueError:
+        profile = _normalized(connection.profile)
+    standard = Path.home() / _PROFILES[provider]
+    paths = ["" if profile == _normalized(standard) else profile]
+    if provider == "antigravity":
+        cli = _normalized(antigravity_cli_profile(connection))
+        paths.append("" if cli == _normalized(standard.parent / "antigravity-cli") else cli)
+    if not any(paths):
+        return ""
+    return hashlib.sha256(json.dumps(paths, ensure_ascii=True).encode("ascii")).hexdigest()[:20]
+
+
+def legacy_provider_config_key(provider: str, connection: Connection | None = None) -> str:
+    """Ключ версий до 2.0.6: в него входили пути к программе и приложению."""
+    connection = connection or load_connections()[provider]
     profile = connection.profile
     if not profile:
         effective = os.path.normpath(provider_profile(provider, connection))
@@ -166,6 +200,16 @@ def antigravity_cli_profile(connection: Connection | None = None) -> Path:
     return _absolute(selected.cli_profile) or provider_profile("antigravity", selected).parent / "antigravity-cli"
 
 
+def collection_profile_id() -> str:
+    """Сборщик и виджет могут получить разные каталоги клиентов из своего окружения."""
+    connections = load_connections()
+    paths = [utils.data_dir()]
+    paths.extend(provider_profile(key, connection) for key, connection in connections.items())
+    paths.append(antigravity_cli_profile(connections["antigravity"]))
+    normalized = [os.path.normcase(os.path.normpath(path)) for path in paths]
+    return hashlib.sha256(json.dumps(normalized, ensure_ascii=True).encode("ascii")).hexdigest()
+
+
 def provider_environment(provider: str, connection: Connection | None = None) -> dict[str, str]:
     selected = _selection(provider, connection)
     env = os.environ.copy()
@@ -189,7 +233,8 @@ def binary_name(provider: str) -> str:
 def _valid_binary_name(provider: str, path: Path) -> bool:
     name = path.name.lower() if sys.platform == "win32" else path.name
     if provider == "codex":
-        if sys.platform == "win32" and name == "codex-x86_64-pc-windows-msvc.exe":
+        if sys.platform == "win32" and name in {"codex-x86_64-pc-windows-msvc.exe",
+                                                 "codex-aarch64-pc-windows-msvc.exe"}:
             return True
         if sys.platform == "darwin" and name in {"codex-x86_64-apple-darwin", "codex-aarch64-apple-darwin"}:
             return True
@@ -198,6 +243,55 @@ def _valid_binary_name(provider: str, path: Path) -> bool:
 
 def _can_run(path: Path) -> bool:
     return path.is_absolute() and path.is_file() and (sys.platform == "win32" or os.access(path, os.X_OK))
+
+
+def _windows_npm_binaries(provider: str, name: str) -> Iterator[Path]:
+    # npm кладет файлы запуска в свой prefix, а программы под ним в node_modules.
+    # Файл .cmd только указывает расположение пакета. Запускается его штатный .exe.
+    prefixes = []
+    preset = _absolute(os.environ.get("NPM_CONFIG_PREFIX", ""))
+    if preset:
+        prefixes.append(preset)
+    for entry in os.get_exec_path():
+        directory = _absolute(entry)
+        if directory is not None and (directory / f"{provider}.cmd").is_file():
+            prefixes.append(directory)
+    configured = _npmrc_prefix()
+    if configured is not None:
+        prefixes.append(configured)
+    roaming = _absolute(os.environ.get("APPDATA", "")) or Path.home() / "AppData/Roaming"
+    prefixes.append(roaming / "npm")
+    module_roots = [prefix / "node_modules" for prefix in dict.fromkeys(prefixes)]
+    # pnpm хранит глобальные пакеты в PNPM_HOME\global\<версия>\node_modules.
+    local = _absolute(os.environ.get("LOCALAPPDATA", "")) or Path.home() / "AppData/Local"
+    pnpm = _absolute(os.environ.get("PNPM_HOME", "")) or local / "pnpm"
+    try:
+        module_roots.extend(sorted((pnpm / "global").glob("*/node_modules"), reverse=True))
+    except OSError:
+        pass
+    for modules in dict.fromkeys(module_roots):
+        if provider == "claude":
+            yield modules / "@anthropic-ai/claude-code/bin" / name
+        else:
+            package = modules / "@openai/codex"
+            for arch, triple in (("x64", "x86_64-pc-windows-msvc"), ("arm64", "aarch64-pc-windows-msvc")):
+                native = package / f"node_modules/@openai/codex-win32-{arch}"
+                for root in (native, package, package.parent / f"codex-win32-{arch}"):
+                    for layout in ("bin", f"vendor/{triple}/bin", f"vendor/{triple}/codex"):
+                        yield root / layout / name
+
+
+def _npmrc_prefix() -> Path | None:
+    """prefix из пользовательского .npmrc: npm ставит туда глобальные пакеты вместо %APPDATA%\\npm."""
+    try:
+        with (Path.home() / ".npmrc").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                key, _, value = line.partition("=")
+                if key.strip().casefold() == "prefix":
+                    return _absolute(os.path.expandvars(value.strip().strip('"')))
+    except OSError:
+        pass
+    return None
 
 
 def _binary_candidates(provider: str) -> Iterator[Path]:
@@ -229,15 +323,7 @@ def _binary_candidates(provider: str) -> Iterator[Path]:
             for root in (home / "Applications", Path("/Applications")):
                 yield root / "Codex.app/Contents/Resources" / name
     if sys.platform == "win32" and provider in {"claude", "codex"}:
-        roaming = _absolute(os.environ.get("APPDATA", "")) or home / "AppData/Roaming"
-        if provider == "claude":
-            yield roaming / "npm/node_modules/@anthropic-ai/claude-code/bin" / name
-            return
-        package = roaming / "npm/node_modules/@openai/codex"
-        native = package / "node_modules/@openai/codex-win32-x64"
-        for root in (native, package, package.parent / "codex-win32-x64"):
-            for layout in ("bin", "vendor/x86_64-pc-windows-msvc/bin", "vendor/x86_64-pc-windows-msvc/codex"):
-                yield root / layout / name
+        yield from _windows_npm_binaries(provider, name)
 
 
 def provider_executable(provider: str, connection: Connection | None = None) -> Path | None:

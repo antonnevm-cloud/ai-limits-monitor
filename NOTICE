@@ -1,0 +1,13 @@
+AI Limits Monitor
+Copyright 2026 onetone
+
+Original project: https://github.com/antonnevm-cloud/ai-limits-monitor
+Maintainer: https://github.com/antonnevm-cloud
+
+License: Apache License 2.0 subject to Commons Clause License Condition v1.0.
+See the accompanying LICENSE for the full license text.
+
+Third-party marks: the Claude, Codex, Grok and Antigravity icons in assets/providers
+only identify the corresponding clients. They are trademarks of Anthropic PBC, OpenAI,
+xAI and Google LLC respectively, belong to their owners and are not covered by the
+license of this project.

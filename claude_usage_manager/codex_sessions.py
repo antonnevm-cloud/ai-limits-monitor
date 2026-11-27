@@ -81,7 +81,11 @@ def session_metadata(profile: Path, ids: set[str]) -> dict[str, SessionMeta]:
     if path is None:
         return meta
     try:
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)
+        # Пока Codex закрыт, файла -wal нет: чтение без блокировок не создает в профиле -shm и -wal.
+        # Когда Codex работает, эти файлы уже есть, и обычное чтение видит его последние записи.
+        wal = path.with_name(path.name + "-wal")
+        query = "mode=ro" if wal.exists() else "mode=ro&immutable=1"
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?{query}", uri=True, timeout=1)
         try:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
             if "id" not in columns:
@@ -128,8 +132,11 @@ class UsageRecords:
     seen_ids: set[str] = field(default_factory=set)
     last_total: dict[str, Any] | None = None
     last_usage: tuple[str, tuple[int, ...], dt.datetime, bool] | None = None
+    recent_ids: dict[str, float] = field(default_factory=dict)
 
-    def read(self, item: dict[str, Any], payload: dict[str, Any]) -> tuple[str, dt.datetime, dict[str, Any]] | None:
+    def read(
+        self, item: dict[str, Any], payload: dict[str, Any], keep_since: float | None = None,
+    ) -> tuple[str, dt.datetime, dict[str, Any]] | None:
         kind = item.get("type", "")
         if isinstance(payload.get("model"), str) and payload["model"]:
             self.model = payload["model"]
@@ -153,9 +160,16 @@ class UsageRecords:
             self.last_total = total
         response_id = payload.get("response_id")
         key = str(response_id or f"{self.turn}:{stamp.isoformat()}")
-        if key in self.seen_ids:
-            return None
-        self.seen_ids.add(key)
+        if keep_since is None:
+            if key in self.seen_ids:
+                return None
+            self.seen_ids.add(key)
+        else:
+            if key in self.recent_ids:
+                return None
+            epoch = stamp.timestamp()
+            if epoch >= keep_since:
+                self.recent_ids[key] = epoch
         parts = pricing.codex_usage_parts(usage)
         previous = self.last_usage
         if previous and previous[3] != explicit and previous[:2] == (self.turn, parts):
@@ -166,3 +180,7 @@ class UsageRecords:
                 return None
         self.last_usage = self.turn, parts, stamp, explicit
         return key, stamp, usage
+
+    def discard_before(self, cutoff: float) -> None:
+        if any(stamp < cutoff for stamp in self.recent_ids.values()):
+            self.recent_ids = {key: stamp for key, stamp in self.recent_ids.items() if stamp >= cutoff}

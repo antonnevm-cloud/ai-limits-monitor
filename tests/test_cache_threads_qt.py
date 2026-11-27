@@ -1,16 +1,17 @@
 import datetime as dt
 import json
 import os
+from threading import Event
 from dataclasses import replace
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QToolButton, QWidget
 
 from claude_usage_manager.cache_threads import CacheThread, ThreadScanner
 from claude_usage_manager.cache_threads_qt import (
@@ -48,7 +49,7 @@ def utcnow():
 
 def thread(session, started_ago, ttl=3600, agent="claude", estimated=False, title=None):
     return CacheThread(
-        agent=agent, session_id=session, title=title or f"Тред {session}", project="ut_bestparts",
+        agent=agent, session_id=session, title=title or f"Тред {session}", project="demo_shop",
         environment="Desktop", started_at=utcnow() - dt.timedelta(seconds=started_ago),
         ttl_seconds=ttl, estimated=estimated,
     )
@@ -105,14 +106,14 @@ def test_block_shows_first_three_with_link_and_expands_and_collapses():
     now = utcnow()
     threads = many(8)
     assert block.set_content(threads, now) is True
-    assert len(block.rows) == 3 and block.link is not None and block.link.text() == "ещё 5"
+    assert len(block.rows) == 3 and block.link is not None and block.link.text() == "Показать еще 5"
     expanded = []
     block.more_clicked.connect(lambda: expanded.append(1))
     block.show()
     QTest.mouseClick(block.link, Qt.MouseButton.LeftButton)
     assert expanded == [1]
     assert block.set_content(threads, now, show_all=True) is True
-    assert len(block.rows) == 8 and block.link.text() == "свернуть"
+    assert len(block.rows) == 8 and block.link.text() == "Свернуть список"
     collapsed = []
     block.less_clicked.connect(lambda: collapsed.append(1))
     QTest.mouseClick(block.link, Qt.MouseButton.LeftButton)
@@ -152,9 +153,9 @@ def test_block_row_text_and_estimated_marker():
     block.set_content([thread("a", 100, ttl=300, agent="codex", estimated=True)], now)
     chip_text = block.rows[0].ring.text
     assert chip_text.startswith("~") and chip_text[1:].count(":") == 1
-    assert block.rows[0].project._full == "ut_bestparts"  # компактно: среда в подсказке
+    assert block.rows[0].project._full == "demo_shop"  # компактно: среда в подсказке
     block.set_content([thread("a", 100, ttl=300, agent="codex", estimated=True)], now, view=ThreadView(compact=False))
-    assert block.rows[0].project._full == "ut_bestparts · Desktop"
+    assert block.rows[0].project._full == "demo_shop · Desktop"
 
 
 # ------------------------------- Окно -------------------------------------- #
@@ -167,14 +168,19 @@ def test_default_window_is_collapsed_like_before_even_with_threads(tmp_path):
     close(app, db, w)
 
 
-def test_click_on_agent_row_expands_and_collapses_and_state_survives_restart(tmp_path):
+def test_disclosure_expands_and_collapses_and_state_survives_restart(tmp_path):
     app, db, w = window(tmp_path)
     w.cache_threads = {"claude": many(3)}
     w.show()
     app.processEvents()
-    pos = center_in_window(w, provider_row(w, "claude"))
-    w._click_at(pos)
+    button = provider_row(w, "claude").disclosure
+    assert button.isVisible() and button.arrowType() == Qt.ArrowType.RightArrow
+    assert "Развернуть" in button.accessibleName()
+    pos = center_in_window(w, button)
+    assert w.childAt(pos) is button
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
     app.processEvents()
+    assert button.isChecked() and button.arrowType() == Qt.ArrowType.DownArrow
     assert set(w.cache_blocks) == {"claude"} and w.cache_blocks["claude"].thread_keys == ["t0", "t1", "t2"]
     assert w.minimumWidth() >= CACHE_BLOCK_MIN_WIDTH
     assert json.loads(db.get_setting("monitor_cache_expanded", "{}")) == {"claude": True}
@@ -189,26 +195,34 @@ def test_click_on_agent_row_expands_and_collapses_and_state_survives_restart(tmp
     w2.show()
     app.processEvents()
     assert "claude" in w2.cache_blocks
-    w2._click_at(center_in_window(w2, provider_row(w2, "claude")))
+    button = provider_row(w2, "claude").disclosure
+    assert "Свернуть" in button.toolTip()
+    button.setFocus()
+    QTest.keyClick(button, Qt.Key.Key_Return)
     app.processEvents()
     assert w2.cache_blocks == {} and json.loads(db2.get_setting("monitor_cache_expanded", "{}")) == {}
+    assert not button.isChecked() and button.arrowType() == Qt.ArrowType.RightArrow
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert "claude" in w2.cache_blocks
     close(app, db2, w2)
 
 
-def test_real_mouse_click_on_row_toggles_but_drag_does_not(tmp_path):
+def test_click_on_quota_or_name_keeps_card_state_and_drag_moves_the_window(tmp_path):
     app, db, w = window(tmp_path)
     w.show()
     app.processEvents()
     row = provider_row(w, "claude")
-    pos = center_in_window(w, row)
-    QTest.mouseClick(w, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
+    for label in (row.name_label, row.dot, row.icon, row.quota_columns.headlines[0]):
+        QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=center_in_window(w, label))
+        assert not w.cache_blocks
+    old_pos = w.pos()
+    pos = center_in_window(w, w.findChild(QLabel, 'WidgetTitle'))
+    offset = QPoint(30, 8)
+    QTest.mousePress(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
+    QTest.mouseMove(w.windowHandle(), pos + offset)
+    QTest.mouseRelease(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
     app.processEvents()
-    assert "claude" in w.cache_blocks
-    pos = center_in_window(w, provider_row(w, "claude"))
-    QTest.mousePress(w, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos)
-    QTest.mouseRelease(w, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, pos + QPoint(30, 0))
-    app.processEvents()
-    assert "claude" in w.cache_blocks
+    assert w.pos() == old_pos + offset and not w.cache_blocks
     close(app, db, w)
 
 
@@ -217,15 +231,16 @@ def test_more_link_shows_all_threads_and_collapsing_row_resets_it(tmp_path):
     w.cache_threads = {"claude": many(8)}
     w.toggle_cache_provider("claude")
     block = w.cache_blocks["claude"]
-    assert len(block.rows) == 3 and block.link.text() == "ещё 5"
-    block.link.clicked.emit()
+    w.show()
+    assert len(block.rows) == 3 and block.link.text() == "Показать еще 5"
+    QTest.mouseClick(block.link, Qt.MouseButton.LeftButton)
     app.processEvents()
     block = w.cache_blocks["claude"]
-    assert len(block.rows) == 8 and block.link.text() == "свернуть"
-    block.link.clicked.emit()
+    assert len(block.rows) == 8 and block.link.text() == "Свернуть список"
+    QTest.keyClick(block.link, Qt.Key.Key_Space)
     app.processEvents()
     assert len(w.cache_blocks["claude"].rows) == 3
-    w.cache_blocks["claude"].link.clicked.emit()
+    QTest.mouseClick(w.cache_blocks["claude"].link, Qt.MouseButton.LeftButton)
     w.toggle_cache_provider("claude")
     w.toggle_cache_provider("claude")
     assert len(w.cache_blocks["claude"].rows) == 3
@@ -244,17 +259,35 @@ def test_every_agent_shows_its_threads_or_the_empty_note(tmp_path):
     close(app, db, w)
 
 
-def test_antigravity_row_is_not_a_cache_toggle(tmp_path):
+def test_antigravity_opens_quota_with_cache_timers_disabled(tmp_path):
     app, db, w = window(tmp_path)
     w.show()
     app.processEvents()
     row = provider_row(w, "antigravity")
-    w._click_at(center_in_window(w, row))
+    QTest.mouseClick(row.name_label, Qt.MouseButton.LeftButton)
     app.processEvents()
     assert "antigravity" not in w.cache_blocks and not w.cache_expanded
     assert row.cursor().shape() != Qt.CursorShape.PointingHandCursor
-    assert provider_row(w, "grok").cursor().shape() == Qt.CursorShape.PointingHandCursor
+    assert all(h.disclosure.cursor().shape() == Qt.CursorShape.PointingHandCursor for h in w.header_rows.values())
+    assert len({h.name_label.mapTo(w, QPoint()).x() for h in w.header_rows.values()}) == 1
+    assert len({h.disclosure.mapTo(w, QPoint()).x() for h in w.header_rows.values()}) == 1
+    w.set_cache_enabled(False)
+    button = row.disclosure
+    assert button.isVisible() and button.accessibleName() == "Развернуть лимиты Antigravity"
+    assert provider_row(w, "grok").disclosure.isHidden()
+    button.setFocus()
+    QTest.keyClick(button, Qt.Key.Key_Right)
+    assert button.isChecked() and not w.cache_blocks
+    assert row.parentWidget().block.findChild(QLabel, "QuotaEmpty").text()
+    QTest.keyClick(button, Qt.Key.Key_Left)
+    assert not button.isChecked() and row.parentWidget().block is None
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert db.get_setting("monitor_ag_quota_expanded") == "1"
     close(app, db, w)
+    app, db, reopened = window(tmp_path)
+    assert provider_row(reopened, "antigravity").disclosure.isChecked()
+    assert not reopened.cache_blocks
+    close(app, db, reopened)
 
 
 def test_stored_antigravity_expansion_is_ignored(tmp_path):
@@ -298,7 +331,7 @@ def place_bottom_right(w):
 
 def test_expanding_grows_up_and_left_keeping_bottom_right_corner(tmp_path):
     app, db, w = window(tmp_path)
-    w.cache_threads = {"claude": many(5)}
+    w._cache_scanned({"claude": many(5)})
     w.show()
     app.processEvents()
     w._fit_to_content()  # до показа окно берет запас под невидимую раскладку (HIDDEN_LAYOUT_RESERVE)
@@ -376,7 +409,9 @@ def test_toggle_in_tray_disables_blocks_and_clicks_and_saves_setting(tmp_path):
     assert w.cache_action.isChecked() is False
     w.show()
     app.processEvents()
-    w._click_at(center_in_window(w, provider_row(w, "claude")))
+    row = provider_row(w, "claude")
+    assert row.disclosure.isHidden()
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=center_in_window(w, row.name_label))
     assert w.cache_blocks == {}
     close(app, db, w)
     db2 = Database(tmp_path / "cache.db")
@@ -420,7 +455,8 @@ def test_background_scan_reads_local_logs_end_to_end(tmp_path):
     assert w._cache_worker is None
     # тред Claude Code из терминала по умолчанию скрыт и не входит в счетчик работающих
     assert w.cache_blocks["claude"].rows == [] and [t.session_id for t in w.cache_threads["claude"]] == ["s"]
-    w._set_thread_view("terminal", True)
+    w.toggle_drawer()
+    QTest.mouseClick(w.view_switches["terminal"], Qt.MouseButton.LeftButton)
     app.processEvents()
     row = w.cache_blocks["claude"].rows[0]
     assert row.thread.project == "demo" and row.thread.environment == "терминал"
@@ -442,9 +478,13 @@ def test_claude_terminal_threads_hidden_by_switch_but_codex_and_grok_stay(tmp_pa
     app.processEvents()
     assert w.cache_blocks["claude"].thread_keys == ["d"] and w.running_count("claude") == 1
     assert w.cache_blocks["codex"].thread_keys == ["c"] and w.cache_blocks["grok"].thread_keys == ["g"]
-    w._set_thread_view("terminal", True)
+    w.toggle_drawer()
+    QTest.mouseClick(w.view_switches["terminal"], Qt.MouseButton.LeftButton)
     app.processEvents()
     assert w.cache_blocks["claude"].thread_keys == ["d", "t", "s"] and w.running_count("claude") == 2
+    QTest.keyClick(w.view_switches["terminal"], Qt.Key.Key_Space)
+    assert w.cache_blocks["claude"].thread_keys == ["d"]
+    assert w.cache_blocks["codex"].thread_keys == ["c"] and w.cache_blocks["grok"].thread_keys == ["g"]
     for block in w.cache_blocks.values():  # бегущие точки отключить: общий таймер анимации проверяется в других тестах
         for row in block.rows:
             row.dot.set_state("")
@@ -733,7 +773,8 @@ def test_width_cannot_go_below_content_or_beyond_the_screen(tmp_path):
     minimum = w.minimumWidth()
     w._grip_started()
     w._grip_dragged("left", 5000)
-    assert w.geometry().width() == minimum and w.user_width == minimum
+    assert w.width() == w.user_width == w.minimumWidth()
+    assert w.width() <= minimum
     w._grip_dragged("left", -50000)
     area = w.screen().availableGeometry()
     assert w.geometry().left() >= area.left() and w.geometry().right() == before.right()
@@ -809,7 +850,7 @@ def test_invalid_saved_width_is_ignored(tmp_path):
     db.close()
 
 
-# ------------------- Этап 1 CLA-6: карточки, вид, закрепить и скрыть ------------ #
+# ------------------- Карточки, вид, закрепить и скрыть ------------ #
 def test_toggle_switch_toggles_and_emits():
     qapp()
     switch = ToggleSwitch(True)
@@ -860,7 +901,7 @@ def test_block_passes_view_pins_and_restore_link():
     block.restore_clicked.connect(lambda: events.append("restore"))
     assert block.set_content(threads, now, view=ThreadView(), pinned={"t1"}, hidden_count=2) is True
     assert block.rows[1].pinned is True and block.rows[0].pinned is False
-    assert block.restore is not None and block.restore.text() == "скрыто 2 · вернуть"
+    assert block.restore is not None and block.restore.text() == "Вернуть скрытые (2)"
     block.show()
     QTest.mouseClick(block.restore, Qt.MouseButton.LeftButton)
     assert events == ["restore"]
@@ -888,43 +929,50 @@ def test_removed_thread_rows_are_hidden_before_deferred_deletion():
     assert block.thread_keys == ["new"]
 
 
-def test_gear_button_opens_the_drawer_with_view_switches(tmp_path):
+def test_menu_opens_the_drawer_with_view_switches(tmp_path):
     app, db, w = window(tmp_path, "drawer.db")
     w.show()
     app.processEvents()
-    assert w.drawer.isVisible() is False
-    assert not [b for b in w.actions.findChildren(QPushButton) if b.toolTip().startswith("Вид тредов")]
-    gear = [w.gear_button]
-    assert w.gear_button.toolTip().startswith("Вид тредов")
-    w._set_actions_visible(False)
-    assert w.gear_button.isVisible()  # шестеренка видна всегда, не только при наведении
+    assert not w.drawer.isVisible()
+    menu = w.menu_button.menu()
+    assert menu is w.tray.contextMenu()
+    action = next(a for a in menu.actions() if a.text() == "Настроить вид")
     geometry_closed = w.geometry()
-    height_closed = w.height()
-    gear[0].click()
+    QTimer.singleShot(0, lambda: QTest.mouseClick(menu, Qt.MouseButton.LeftButton,
+                                                pos=menu.actionGeometry(action).center()))
+    QTest.mouseClick(w.menu_button, Qt.MouseButton.LeftButton)
     app.processEvents()
-    # панель - отдельное окно рядом с виджетом: виджет не меняет размер, шестеренка остается на месте
     assert w.drawer.isVisible() is True and w.drawer.isWindow() and w.geometry() == geometry_closed
     assert not w.drawer.geometry().intersects(w.frameGeometry())
     assert set(w.view_switches) == {"compact", "timer", "title", "project", "rewrite", "warning", "glutton", "pin_hide", "terminal", "forecast"}
     assert all(switch.isChecked() for name, switch in w.view_switches.items() if name != "terminal")
     assert not w.view_switches["terminal"].isChecked()
-    assert {name: combo.currentData() for name, combo in w.view_combos.items()} == {"usage": "both", "chart": "hover", "font": "0"}
-    gear[0].click()
+    assert {name: combo.currentData() for name, combo in w.view_combos.items()} == {"usage": "both", "chart": "click", "font": "0"}
+    chart = w.view_combos["chart"]
+    assert chart.accessibleName() == "График расхода"
+    assert [chart.itemText(i) for i in range(chart.count())] == ["по щелчку", "выключен"]
+    QTest.mouseClick(w.drawer.findChild(QToolButton, "PopupClose"), Qt.MouseButton.LeftButton)
     app.processEvents()
-    assert w.drawer.isVisible() is False and w.height() == height_closed
+    assert not w.drawer.isVisible() and w.geometry() == geometry_closed
     close(app, db, w)
 
 
-def test_hover_buttons_do_not_shift_the_header(tmp_path):
-    app, db, w = window(tmp_path, "hover.db")
+def test_menu_opens_and_closes_with_the_keyboard(tmp_path):
+    app, db, w = window(tmp_path, "menu.db")
     w.show()
     app.processEvents()
-    w._set_actions_visible(False)
+    menu = w.menu_button.menu()
+    opened = []
+
+    def dismiss():
+        opened.append(menu.isVisible())
+        QTest.keyClick(menu, Qt.Key.Key_Escape)
+
+    w.menu_button.setFocus()
+    QTimer.singleShot(0, dismiss)
+    QTest.keyClick(w.menu_button, Qt.Key.Key_Space)
     app.processEvents()
-    before = w.gear_button.mapTo(w, QPoint(0, 0))
-    w._set_actions_visible(True)
-    app.processEvents()
-    assert w.gear_button.mapTo(w, QPoint(0, 0)) == before
+    assert opened == [True] and not menu.isVisible()
     close(app, db, w)
 
 
@@ -952,15 +1000,16 @@ def test_view_switches_change_rows_and_survive_restart(tmp_path):
     app.processEvents()
     rows = lambda: w.cache_blocks["claude"].rows
     assert all(row.ring is not None and not row.title.isHidden() for row in rows())
-    w.view_switches["timer"].setChecked(False)
+    w.toggle_drawer()
+    QTest.mouseClick(w.view_switches["timer"], Qt.MouseButton.LeftButton)
     app.processEvents()
     assert w.thread_view.timer is False and all(row.ring is None for row in rows())
-    w.view_switches["title"].setChecked(False)
-    w.view_switches["project"].setChecked(False)
+    QTest.keyClick(w.view_switches["title"], Qt.Key.Key_Space)
+    QTest.mouseClick(w.view_switches["project"], Qt.MouseButton.LeftButton)
     app.processEvents()
     assert all(row.title.isHidden() and row.project.isHidden() for row in rows())
     assert json.loads(db.get_setting("monitor_thread_view")) == {
-        "chart": "hover", "compact": True, "font": "0", "forecast": True, "glutton": True, "pin_hide": True, "project": False, "rewrite": True,
+        "chart": "click", "compact": True, "font": "0", "forecast": True, "glutton": True, "pin_hide": True, "project": False, "rewrite": True,
         "terminal": False, "timer": False, "title": False, "usage": "both", "warning": True,
     }
     w.quit_monitor()
@@ -990,7 +1039,7 @@ def test_existing_pin_and_hide_rules_are_preserved_and_restorable(tmp_path):
     db.set_hidden("t0", True)
     w._reload_thread_rules()
     app.processEvents()
-    assert block().thread_keys == ["t2", "t1"] and block().restore.text() == "скрыто 1 · вернуть"
+    assert block().thread_keys == ["t2", "t1"] and block().restore.text() == "Вернуть скрытые (1)"
     assert db.thread_rules()["t0"]["hidden"] is True
     # выключенная функция правила не применяет, но и не стирает их
     w.view_switches["pin_hide"].setChecked(False)
@@ -1022,7 +1071,7 @@ def test_pinned_thread_stays_visible_beyond_the_short_list_and_rules_survive_res
     w._reload_thread_rules()
     app.processEvents()
     assert w.cache_blocks["claude"].thread_keys[0] == "t7" and "t0" not in w.cache_blocks["claude"].thread_keys
-    assert w.cache_blocks["claude"].link.text() == "ещё 4"
+    assert w.cache_blocks["claude"].link.text() == "Показать еще 4"
     w.quit_monitor()
     app.processEvents()
     w2 = MonitorWindow(db, auto_refresh=False)
@@ -1030,7 +1079,7 @@ def test_pinned_thread_stays_visible_beyond_the_short_list_and_rules_survive_res
     w2.cache_threads = {"claude": many(8)}
     w2._render()
     app.processEvents()
-    assert w2.cache_blocks["claude"].thread_keys[0] == "t7" and w2.cache_blocks["claude"].restore.text() == "скрыто 1 · вернуть"
+    assert w2.cache_blocks["claude"].thread_keys[0] == "t7" and w2.cache_blocks["claude"].restore.text() == "Вернуть скрытые (1)"
     w2.quit_monitor()
     app.processEvents()
     db.close()
@@ -1041,9 +1090,9 @@ def test_row_shows_project_and_environment_in_one_line_without_pill():
     qapp()
     detailed = ThreadView(compact=False)
     row = CacheThreadRow(thread("a", 100), utcnow(), detailed)
-    assert row.project._full == "ut_bestparts · Desktop" and not hasattr(row, "env")
+    assert row.project._full == "demo_shop · Desktop" and not hasattr(row, "env")
     bare = CacheThreadRow(replace(thread("a", 100), environment=""), utcnow(), detailed)
-    assert bare.project._full == "ut_bestparts"
+    assert bare.project._full == "demo_shop"
 
 
 def test_row_warns_shortly_before_the_cache_goes_cold():
@@ -1103,7 +1152,7 @@ def test_window_grows_when_a_warning_row_appears_and_shrinks_back(tmp_path):
 
 
 def test_window_is_never_shorter_than_its_content_after_expanding(tmp_path):
-    """Находка по снимку владельца: нижняя строка (подвал) обрезалась на 8 пикселей после первого разворачивания."""
+    """Находка по снимку экрана: нижняя строка (подвал) обрезалась на 8 пикселей после первого разворачивания."""
     app, db, w = window(tmp_path, "short.db")
     w.show()
     app.processEvents()
@@ -1155,7 +1204,7 @@ def test_compact_row_is_two_lines_with_project_and_short_chips():
     assert row.compact and row.ring.width() == COMPACT_RING_SIZE and row.minimumHeight() == COMPACT_ROW_HEIGHT
     assert row.ring._font_pt == 5.0 and row.ring._bold is False  # цифры в кольце мелкие и не жирные
     # проект без среды стоит в строке чипов, перед ними; среда и пояснения в подсказке
-    assert row.project.parentWidget() is row.chips_row and row.project._full == "ut_bestparts"
+    assert row.project.parentWidget() is row.chips_row and row.project._full == "demo_shop"
     assert "Desktop" in row.toolTip()
     assert chips(row) == ["~2,1%", "$3,40", "$0,74"]
     assert "перезапис" in row.rewrite_chip.toolTip()
@@ -1230,14 +1279,90 @@ def forecast_window(tmp_path, name="forecast.db"):
     w.data = MonitorData(states, w.rows, compact, selected)
     w.cache_threads = {"claude": many(2)}
     w._spend = {"claude": {"t0": ThreadSpend(3.4, 10, 0, 2.1, 0.74), "t1": ThreadSpend(1.0, 5, 0, 0.6, 0.12)}}
+    w._render()
     w.show()
     w.toggle_cache_provider("claude")
     app.processEvents()
     return app, db, w
 
 
+def wait_for(condition, timeout=2000):
+    for _ in range(timeout // 10):
+        if condition():
+            return
+        QTest.qWait(10)
+    assert condition()
+
+
+def test_large_thread_list_keeps_visible_rows_and_keyboard_focus(tmp_path):
+    app, db, w = window(tmp_path)
+    w.cache_threads = {"claude": many(150), "codex": many(3, "codex")}
+    w.show()
+    w.toggle_cache_provider("claude")
+    w.toggle_cache_provider("codex")
+    app.processEvents()
+    block = w.cache_blocks["claude"]
+    first_rows = block.rows[:]
+    neighbor_rows = w.cache_blocks["codex"].rows[:]
+    link = block.link
+    link.setFocus()
+    QTest.keyClick(link, Qt.Key.Key_Space)
+    assert 3 < len(block.rows) < 150
+    assert block.rows[:3] == first_rows and link.hasFocus()
+    wait_for(lambda: len(block.rows) == 150)
+    assert block.thread_keys == [f"t{i}" for i in range(150)]
+    assert block._scroll.verticalScrollBar().maximum() > 0
+    assert w.height() <= w.screen().availableGeometry().height()
+    assert w.cache_blocks["codex"].rows == neighbor_rows
+
+    QTest.keyClick(link, Qt.Key.Key_Return)
+    assert block.rows == first_rows and link.hasFocus()
+    QTest.keyClick(link, Qt.Key.Key_Space)
+    QTest.keyClick(link, Qt.Key.Key_Return)
+    QTest.qWait(80)
+    assert block.rows == first_rows and link.hasFocus()
+    close(app, db, w)
+
+
+def test_disclosure_remains_usable_while_forecast_history_is_loading(tmp_path, monkeypatch):
+    app, db, w = window(tmp_path)
+    states = week_states()
+    compact, selected = build_compact_rows(db, states)
+    w.data = MonitorData(states, build_rows(states), compact, selected)
+    w._render()
+    w.show()
+    w.activateWindow()
+    app.processEvents()
+    started, release = Event(), Event()
+    original = db.quota_samples
+
+    def load_samples(**kwargs):
+        started.set()
+        if not release.wait(3):
+            raise RuntimeError("Загрузка истории не была разблокирована")
+        return original(**kwargs)
+
+    monkeypatch.setattr(db, "quota_samples", load_samples)
+    disclosure = w.header_rows["claude"].disclosure
+    try:
+        QTest.mouseClick(disclosure, Qt.MouseButton.LeftButton)
+        assert started.wait(1)
+        assert w.forecast_bars["claude"].forecast.method == "average"
+        assert "claude" in w._forecast_workers and "claude" not in w._forecasts
+        disclosure.setFocus()
+        QTest.keyClick(disclosure, Qt.Key.Key_Space)
+        assert "claude" not in w.cache_blocks and disclosure.hasFocus()
+    finally:
+        release.set()
+    wait_for(lambda: "claude" in w._forecasts)
+    assert "claude" not in w.forecast_bars
+    close(app, db, w)
+
+
 def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_path):
     app, db, w = forecast_window(tmp_path, "weighted.db")
+    bar = w.forecast_bars["claude"]
+    wait_for(lambda: "claude" in w._forecasts)
     window = w.weekly_of("claude")
     start = window.resets_at.astimezone(dt.timezone.utc) - dt.timedelta(days=7)
     for hours, used in ((24, 10), (72, 20), (95, 70)):
@@ -1247,13 +1372,14 @@ def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_p
             ((start + dt.timedelta(hours=hours)).isoformat(), used, "claude-code:official-mod", db._windows_json(snapshot)),
         )
     db._conn.commit()
-    assert w._forecast_for("claude").method == "average"  # замеры прочитаны до вставки и держатся FORECAST_SAMPLES_TTL
-    w._forecast_samples.clear()
-    forecast = w._forecast_for("claude")
-    assert forecast.method == "weighted" and forecast.rate_per_day > 17.5  # последние часы быстрее среднего
+    assert bar.forecast.method == "average"
+    w._forecasts.clear()
     w._refresh_forecasts()
-    assert "свежие часы весят больше" in w.forecast_bars["claude"].toolTip()
-    w._forecast_entered("claude")
+    wait_for(lambda: bar.forecast.method == "weighted")
+    forecast = bar.forecast
+    assert forecast.method == "weighted" and forecast.rate_per_day > 17.5  # последние часы быстрее среднего
+    assert "открыть расход за неделю по проектам" in w.forecast_bars["claude"].toolTip()
+    QTest.mouseClick(w.forecast_bars["claude"].chart_button, Qt.MouseButton.LeftButton)
     app.processEvents()
     assert w.forecast_popup.tiles[1][1].text().startswith("~") and "свежие часы весят больше" in w.forecast_popup.note.text()
     close(app, db, w)
@@ -1261,31 +1387,89 @@ def test_forecast_uses_week_samples_from_the_database_with_a_weighted_rate(tmp_p
 def test_expanded_card_has_forecast_and_spend_and_the_popup_follows_the_chart_mode(tmp_path):
     app, db, w = forecast_window(tmp_path)
     bar = w.forecast_bars["claude"]
-    assert isinstance(bar, ForecastBar) and "кончится" in bar.end_label.text() and "не хватит на 31 ч" in bar.toolTip()
+    wait_for(lambda: "claude" in w._forecasts)
+    assert isinstance(bar, ForecastBar) and "кончится" in bar.end_label.text()
+    assert "открыть расход за неделю по проектам" in bar.toolTip()
     assert not hasattr(bar, "status") and not hasattr(bar, "start_label")  # строки над полосой и дня начала недели нет
     rows = w.cache_blocks["claude"].rows
     assert chips(rows[0]) == ["~2,1%", "$3,40", "$0,74"]  # компактный вид по умолчанию
     assert not rows[0].glutton_mini.isHidden() and rows[1].glutton_mini.isHidden()
-    w._forecast_entered("claude")
+    button = bar.chart_button
+    pos = center_in_window(w, bar)
+    assert w.childAt(pos) is button
+    QTest.mouseMove(w.windowHandle(), pos)
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.RightButton, pos=pos)
+    QTest.mouseMove(w.windowHandle(), center_in_window(w, w.footer))
+    QTest.qWait(350)
+    assert w.forecast_popup is None
+
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=center_in_window(w, bar))
     app.processEvents()
-    assert w.forecast_popup is not None and w.forecast_popup.isVisible()
-    assert w.forecast_popup.tiles[0][1].text() == "70%" and w.forecast_popup.tiles[1][1].text() == "17,5% в сутки"
-    w._forecast_clicked("claude")
-    assert w._popup_pinned and not w.forecast_popup.pinned_chip.isHidden()
-    w._close_popup()
-    assert not w.forecast_popup.isVisible() and not w._popup_pinned
-    w._set_thread_view("chart", "off")
-    w._forecast_entered("claude")
-    assert not w.forecast_popup.isVisible()
-    w._set_thread_view("chart", "rclick")
-    w._forecast_entered("claude")
-    assert not w.forecast_popup.isVisible()
-    w._forecast_context("claude")
-    assert w.forecast_popup.isVisible()
-    w._forecast_context("claude")
-    assert not w.forecast_popup.isVisible()
+    popup = w.forecast_popup
+    assert popup.isVisible() and button.isChecked()
+    assert popup.tiles[0][1].text() == "70%" and popup.tiles[1][1].text() == "17,5% в сутки"
+    QTest.mouseMove(w.windowHandle(), center_in_window(w, w.footer))
+    QTest.qWait(350)
+    assert popup.isVisible()
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert not popup.isVisible() and not button.isChecked()
+
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert popup.isVisible()
+    QTest.keyClick(popup.close_button, Qt.Key.Key_Escape)
+    app.processEvents()
+    assert not popup.isVisible() and button.hasFocus()
+    QTest.keyClick(button, Qt.Key.Key_Return)
+    assert popup.isVisible()
+    QTest.mouseClick(popup.close_button, Qt.MouseButton.LeftButton)
+    assert not popup.isVisible()
+
+    w.toggle_drawer()
+    chart_mode = w.view_combos["chart"]
+    QTest.keyClick(chart_mode, Qt.Key.Key_End)
+    assert json.loads(db.get_setting("monitor_thread_view"))["chart"] == "off"
+    assert not button.isEnabled()
+    QTest.mouseMove(w.windowHandle(), pos)
+    QTest.mouseClick(w.windowHandle(), Qt.MouseButton.LeftButton, pos=pos)
+    QTest.keyClick(button, Qt.Key.Key_Space)
+    assert not popup.isVisible()
+    QTest.keyClick(chart_mode, Qt.Key.Key_Home)
+    assert w.thread_view.chart == "click" and button.isEnabled()
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert popup.isVisible()
+    QTest.keyClick(chart_mode, Qt.Key.Key_End)
+    assert not popup.isVisible() and not button.isChecked()
     w._set_thread_view("forecast", False)
     assert "claude" not in w.forecast_bars
+    close(app, db, w)
+
+
+def test_open_chart_follows_only_an_explicit_choice_of_agent(tmp_path):
+    app, db, w = forecast_window(tmp_path, "two-weeks.db")
+    states = dict(w.states)
+    weekly = replace(w.weekly_of("claude"), used_percent=42)
+    snapshot = QuotaSnapshot(provider="codex", windows=[weekly])
+    states["codex"] = ProviderState("codex", snapshot, True)
+    compact, selected = build_compact_rows(db, states)
+    w._done(MonitorData(states, build_rows(states), compact, selected))
+    QTest.mouseClick(w.header_rows["codex"].disclosure, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    claude = w.forecast_bars["claude"].chart_button
+    codex = w.forecast_bars["codex"].chart_button
+
+    QTest.mouseClick(claude, Qt.MouseButton.LeftButton)
+    popup = w.forecast_popup
+    QTest.mouseMove(w.windowHandle(), center_in_window(w, codex))
+    QTest.mouseClick(codex, Qt.MouseButton.RightButton)
+    assert popup.isVisible() and popup.tiles[0][1].text() == "70%"
+    assert claude.isChecked() and not codex.isChecked()
+    QTest.mouseClick(codex, Qt.MouseButton.LeftButton)
+    assert popup is w.forecast_popup and popup.tiles[0][1].text() == "42%"
+    assert not claude.isChecked() and codex.isChecked()
+    w._render()
+    assert popup.isVisible() and codex.isChecked()
+    QTest.mouseClick(w.header_rows["codex"].disclosure, Qt.MouseButton.LeftButton)
+    assert not popup.isVisible()
     close(app, db, w)
 
 

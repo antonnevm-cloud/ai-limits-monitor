@@ -201,7 +201,7 @@ def test_claude_project_and_environment_labels(dirs):
     write_lines(claude_file(dirs, "sess-1.jsonl", "p1"), [
         asst(-10, "m1", one_hour=10, cwd=r"C:\Users\x\AppData\Local\Claude-Data\scratch-workspaces\abc\scratch-2026"),
     ])
-    other = asst(-10, "m2", one_hour=10, cwd="C:/Workspace/sample-tools")
+    other = asst(-10, "m2", one_hour=10, cwd="C:/Workspace/scratch-workspaces/sample-tools")
     other["entrypoint"] = "cli"
     other["sessionId"] = "sess-2"
     write_lines(claude_file(dirs, "sess-2.jsonl", "p2"), [other])
@@ -716,7 +716,7 @@ def test_cache_hue_and_format():
     assert format_remaining(3600) == "60:00"
 
 
-# -------------------- Регрессии по ревью Fable 5.2 (CLA-5) ------------------ #
+# -------------------- Регрессии по ревью Fable 5.2 ------------------ #
 def test_fork_journal_takes_its_own_file_name_as_session_id_not_the_parents(dirs):
     """Журнал форка начинается с копии истории родителя: sessionId в ней принадлежит родителю."""
     write_lines(claude_file(dirs, "fork-1.jsonl", "p1"), [
@@ -777,3 +777,20 @@ def test_codex_logs_of_long_cooled_threads_are_not_read_for_the_model(dirs, monk
     write_lines(codex_file(dirs, name="live.jsonl"), codex_records(session="cx-live", model="gpt-6.1-sol", last_offset=-60))
     scanner(dirs).scan(NOW)
     assert calls == ["live.jsonl"]
+
+
+def test_replaced_codex_rollout_resets_model_offset(dirs):
+    path = codex_file(dirs)
+    old = codex_records(model="gpt-5.5")
+    old.insert(2, {"type": "tool", "payload": {"output": "old" * 100}})
+    write_lines(path, old)
+    scan = scanner(dirs)
+    assert scan.scan(NOW)["codex"][0].estimated
+
+    new = codex_records(model="gpt-6.1-sol")
+    new.insert(2, {"type": "tool", "payload": {"output": "new" * 300}})
+    replacement = write_lines(path.with_suffix(".tmp"), new)
+    replacement.replace(path)
+    thread = scan.scan(NOW)["codex"][0]
+    assert thread.ttl_seconds == ct.CODEX_TTL_DOCUMENTED
+    assert not thread.estimated

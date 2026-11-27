@@ -168,11 +168,19 @@ class ManualResetCredits:
             key=expiry_key,
         )
 
-    def nearest_expiry(self) -> dt.datetime | None:
+    def nearest_expiry(self, now: dt.datetime | None = None) -> dt.datetime | None:
+        """Ближайший срок еще действующего кредита: истекший первый не скрывает следующий."""
+        current = now or dt.datetime.now(dt.timezone.utc)
         for item in self.sorted_items():
-            if item.expires_at is not None:
+            # Использованный или отозванный кредит не считается доступным.
+            if item.status.casefold() not in {"available", "unknown", ""}:
+                continue
+            if item.expires_at is not None and item.remaining_seconds(current):
                 return item.expires_at
-        return self.nearest_expiry_hint
+        hint = self.nearest_expiry_hint
+        if hint is not None and ManualResetItem(expires_at=hint).remaining_seconds(current):
+            return hint
+        return None
 
 
 @dataclass

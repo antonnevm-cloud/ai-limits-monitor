@@ -11,7 +11,7 @@ from claude_usage_manager import provider_settings as settings
 
 @pytest.fixture
 def empty_user(tmp_path, monkeypatch):
-    for key in (*settings.PROFILE_VARIABLES.values(), "GROK_BIN_DIR", "CODEX_INSTALL_DIR"):
+    for key in (*settings.PROFILE_VARIABLES.values(), "GROK_BIN_DIR", "CODEX_INSTALL_DIR", "NPM_CONFIG_PREFIX"):
         monkeypatch.delenv(key, raising=False)
     home = tmp_path / "home"
     home.mkdir()
@@ -93,6 +93,22 @@ def test_profile_selection_does_not_implicitly_install_a_client(empty_user, tmp_
     assert settings.provider_executable("grok") == installed
     assert settings.provider_executable("grok", settings.Connection(executable=str(tmp_path / name))) is None
     assert settings.provider_executable("grok", settings.Connection(executable=str(_program(tmp_path / "other.cmd")))) is None
+
+
+@pytest.mark.parametrize("source", ["PATH", "NPM_CONFIG_PREFIX"])
+def test_windows_clients_in_custom_global_npm_folder(empty_user, tmp_path, monkeypatch, source):
+    monkeypatch.setattr(settings.sys, "platform", "win32")
+    prefix = tmp_path / "Инструменты npm"
+    modules = prefix / "node_modules"
+    claude = _program(modules / "@anthropic-ai/claude-code/bin/claude.exe")
+    codex = _program(modules / "@openai/codex/node_modules/@openai/codex-win32-x64"
+                     / "vendor/x86_64-pc-windows-msvc/codex/codex.exe")
+    if source == "PATH":
+        _program(prefix / "claude.cmd")
+        _program(prefix / "codex.cmd")
+    monkeypatch.setenv(source, str(prefix))
+    assert settings.provider_executable("claude") == claude
+    assert settings.provider_executable("codex") == codex
 
 
 def test_paths_checked_before_writing_and_failed_replace_is_atomic(empty_user, tmp_path, monkeypatch):

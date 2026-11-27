@@ -8,25 +8,39 @@ metadata = runpy.run_path(str(root / 'claude_usage_manager' / '__init__.py'))
 name = metadata['APP_NAME']
 version = metadata['APP_VERSION']
 icon = str(root / 'assets' / 'icon.ico')
-assets = [(icon, 'assets'), (os.environ['AI_LIMITS_BUILD_LICENSES'], 'licenses')]
-for filename in ('claude.svg', 'claude.png', 'codex.svg', 'codex.png',
-                 'grok.png', 'antigravity.svg', 'antigravity.png'):
+assets = [(icon, 'assets'), (str(root / 'assets' / 'r1.svg'), 'assets'),
+          (os.environ['AI_LIMITS_BUILD_LICENSES'], 'licenses')]
+for filename in ('claude.svg', 'codex.svg', 'grok.png', 'antigravity.svg'):
     assets.append((str(root / 'assets' / 'providers' / filename), 'assets/providers'))
 
 analysis = Analysis(
     [str(root / 'monitor.py')], pathex=[str(root)], datas=assets,
     hiddenimports=['PySide6.support.deprecated'],
-    excludes=['claude_usage_manager.cursor_provider', 'claude_usage_manager.windows_credential',
-              'pytest', 'tkinter'],
+    excludes=['pytest', 'tkinter'],
 )
 # Виджеты рисуются QPainter. Программный OpenGL из необязательной поставки Qt им не нужен.
 if sys.platform == 'win32':
     analysis.binaries = [entry for entry in analysis.binaries if Path(entry[0]).name.lower() != 'opengl32sw.dll']
 archive = PYZ(analysis.pure)
+version_info = None
+if sys.platform == 'win32':
+    from PyInstaller.utils.win32 import versioninfo as vi
+
+    numbers = tuple(int(part) for part in version.split('.')) + (0,) * (4 - len(version.split('.')))
+    strings = [vi.StringStruct(key, value) for key, value in (
+        ('CompanyName', 'onetone'), ('FileDescription', name), ('FileVersion', version),
+        ('InternalName', name), ('LegalCopyright', 'Copyright 2026 onetone'),
+        ('OriginalFilename', f'{name}.exe'), ('ProductName', name), ('ProductVersion', version))]
+    version_info = vi.VSVersionInfo(
+        ffi=vi.FixedFileInfo(filevers=numbers, prodvers=numbers),
+        kids=[vi.StringFileInfo([vi.StringTable('040904B0', strings)]),
+              vi.VarFileInfo([vi.VarStruct('Translation', [0x0409, 1200])])],
+    )
+# Подсистема Windows без консоли: консольный EXE открывает окно терминала и завершается вместе с ним.
+# Обработчики строки состояния и служебные режимы получают потоки от вызывающего процесса.
 exe = EXE(
     archive, analysis.scripts, [], name=name, exclude_binaries=True, icon=icon,
-    console=sys.platform == 'win32', hide_console='hide-early' if sys.platform == 'win32' else None,
-    upx=False,
+    console=False, upx=False, version=version_info,
 )
 payload = COLLECT(exe, analysis.binaries, analysis.datas, name=name, upx=False)
 if sys.platform == 'darwin':

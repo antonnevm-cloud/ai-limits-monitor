@@ -145,6 +145,22 @@ def test_claude_spend_counts_each_answer_once_and_includes_subagents(journals):
     assert daily["trade_demo"][1] == pytest.approx(opus_1000 + cost_of(50_000, 0.20) + opus_1000 + cost_of(1000, 2))
 
 
+def test_claude_spend_includes_workflow_agents(journals):
+    claude, _codex, week_start, _main, _rollout, _now = journals
+    scanner = UsageScanner(claude, None)
+    now = week_start + dt.timedelta(days=3)
+    before = scanner.scan({"claude": week_start}, {"claude": 30.0}, now=now).spend("claude", "s1").cost
+    # Агенты инструмента Workflow пишут журналы глубже обычных субагентов: subagents/workflows/<запуск>/.
+    run = claude / "C--Workspace-Clients-Example-trade-demo" / "s1" / "subagents" / "workflows" / "wf_demo-1"
+    run.mkdir(parents=True)
+    (run / "agent-w.jsonl").write_text(
+        claude_line("wf1", week_start + dt.timedelta(days=2), USAGE, model="claude-sonnet-5-5", sidechain=True),
+        encoding="utf-8")
+    report = scanner.scan({"claude": week_start}, {"claude": 30.0}, now=now)
+    assert report.spend("claude", "s1").cost == pytest.approx(before + cost_of(1000, 2))
+    assert report.spend("claude", "agent-w") is None and report.spend("claude", "wf_demo-1") is None
+
+
 def test_rescan_reads_only_new_complete_lines(journals):
     claude, _codex, week_start, main, _rollout, _now = journals
     scanner = UsageScanner(claude, None)
@@ -181,6 +197,34 @@ def test_unknown_model_is_counted_as_unpriced_not_guessed(tmp_path):
     assert not spend.priced
 
 
+def test_fork_copy_of_parent_history_is_counted_once(tmp_path):
+    project = tmp_path / "p"
+    project.mkdir()
+    start = utc(2026, 11, 9)
+    first, second = start + dt.timedelta(hours=1), start + dt.timedelta(hours=2)
+    (project / "parent.jsonl").write_text(claude_line("m1", first, USAGE), encoding="utf-8")
+    # Ответвление начинается с копии истории родителя (тот же message.id) и продолжается своим ответом.
+    (project / "fork.jsonl").write_text(claude_line("m1", first, USAGE) + claude_line("m2", second, USAGE),
+                                        encoding="utf-8")
+    report = UsageScanner(tmp_path, None).scan({"claude": start}, {"claude": 10.0}, now=start + dt.timedelta(days=1))
+    parent, fork = report.spend("claude", "parent"), report.spend("claude", "fork")
+    assert parent.tokens == 1000 and fork.tokens == 1000  # cache#3
+    assert parent.share == pytest.approx(5.0) and fork.share == pytest.approx(5.0)
+
+
+def test_unpriced_thread_does_not_inflate_the_share_of_priced_ones(tmp_path):
+    project = tmp_path / "p"
+    project.mkdir()
+    start = utc(2026, 11, 9)
+    (project / "priced.jsonl").write_text(claude_line("a", start + dt.timedelta(hours=1), USAGE), encoding="utf-8")
+    (project / "other.jsonl").write_text(
+        claude_line("b", start + dt.timedelta(hours=2), USAGE, model="claude-new-9"), encoding="utf-8")
+    report = UsageScanner(tmp_path, None).scan({"claude": start}, {"claude": 10.0}, now=start + dt.timedelta(days=1))
+    # Токены без цены оцениваются по средней цене агента: доля делится поровну, а не 10 к 0 (cache#2).
+    assert report.spend("claude", "priced").share == pytest.approx(5.0)
+    assert report.spend("claude", "other").share == pytest.approx(5.0)
+
+
 def test_missing_directories_give_an_empty_report(tmp_path):
     report = UsageScanner(tmp_path / "нет", tmp_path / "тоже нет").scan({}, {})
     assert report.threads == {} and report.daily == {}
@@ -206,3 +250,68 @@ def test_weekly_scanner_changes_profile_without_reusing_former_spend(tmp_path, m
     assert scanner.scan({}, {}, now=stamp).spend("codex", "shared").tokens == 100
     monkeypatch.setattr(provider_settings, "provider_enabled", lambda _: False)
     assert scanner.scan({}, {}, now=stamp).threads == {}
+
+
+def test_large_assistant_record_is_processed_only_after_its_newline(tmp_path, monkeypatch):
+    from claude_usage_manager import history_jsonl
+
+    monkeypatch.setattr(history_jsonl, "CHUNK_BYTES", 64)
+    project = tmp_path / "project"
+    project.mkdir()
+    path = project / "session.jsonl"
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+    row = json.loads(claude_line("large", start, USAGE))
+    row["message"] = {
+        "content": [{"text": '"quote" \\ text' * 50}, {"items": [1, {"text": "text" * 100}]}],
+        **row["message"],
+    }
+    serialized = json.dumps(row, ensure_ascii=False)
+    path.write_text(serialized, encoding="utf-8")
+    scanner = UsageScanner(tmp_path, None)
+    assert scanner.scan({"claude": start}, {}).spend("claude", "session") is None
+
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+        stream.write('{"bad": [' + "9" * 300 + '}\n')
+        stream.write(claude_line("normal", start, USAGE))
+    spend = scanner.scan({"claude": start}, {}).spend("claude", "session")
+    assert spend.tokens == 2000
+
+
+def test_replaced_claude_file_removes_retained_usage_and_keeps_subagent_usage(journals):
+    claude, _, start, main, _, _ = journals
+    now = start + dt.timedelta(days=3)
+    scanner = UsageScanner(claude, None)
+    first = scanner.scan({"claude": start}, {}, now).spend("claude", "s1")
+    replacement = main.with_suffix(".tmp")
+    replacement.write_text(claude_line("new", now, USAGE), encoding="utf-8")
+    replacement.replace(main)
+
+    updated = scanner.scan({"claude": start}, {}, now).spend("claude", "s1")
+    assert first.tokens > updated.tokens == 2000  # один основной ответ и один ответ субагента
+    main.unlink()
+    assert scanner.scan({"claude": start}, {}, now).spend("claude", "s1").tokens == 1000
+
+
+def test_codex_period_prunes_previous_usage_and_rewinds_to_earlier_start(tmp_path):
+    import os
+
+    profile = tmp_path / "profile"
+    archived = profile / "archived_sessions"
+    archived.mkdir(parents=True)
+    path = archived / "rollout.jsonl"
+    start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+    recent = start + dt.timedelta(hours=1)
+    path.write_text(codex_lines("session", "gpt-6.1-sol", [
+        ("earlier", recent - dt.timedelta(days=4), {"input_tokens": 100}),
+        ("recent", recent, {"input_tokens": 1000}),
+    ]), encoding="utf-8")
+    os.utime(path, (recent.timestamp(), recent.timestamp()))
+    scanner = UsageScanner(None, profile / "sessions")
+
+    assert scanner.scan({"codex": start}, {}).spend("codex", "session").tokens == 1000
+    assert scanner.scan({"codex": start - dt.timedelta(days=5)}, {}).spend("codex", "session").tokens == 1100
+    assert scanner.scan({"codex": start + dt.timedelta(days=2)}, {}).threads == {}
+    assert not scanner._history["codex"].files
+    assert not scanner._history["codex"].sessions
+    assert scanner.scan({"codex": start}, {}).spend("codex", "session").tokens == 1000

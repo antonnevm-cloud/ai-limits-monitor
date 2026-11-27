@@ -1,45 +1,38 @@
-"""Генерация значка приложения средствами Pillow (без внешних файлов)."""
+"""Значок приложения на основе фирменного знака R1."""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QImage, QPainter
+from PySide6.QtSvg import QSvgRenderer
 
 from .utils import app_root
 
 
-def _draw(size: int) -> Image.Image:
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    margin = max(1, size // 16)
-    # Круглый фон с фирменным оранжевым.
-    draw.ellipse(
-        [margin, margin, size - margin, size - margin],
-        fill=(215, 131, 79, 255),
-    )
-    # Простая «свеча»/столбик расхода в центре.
-    bar_w = size // 6
-    gap = size // 12
-    base_y = size - margin * 3
-    heights = [size // 3, size // 2, int(size / 1.7)]
-    start_x = (size - (bar_w * 3 + gap * 2)) // 2
-    for index, height in enumerate(heights):
-        x0 = start_x + index * (bar_w + gap)
-        draw.rounded_rectangle(
-            [x0, base_y - height, x0 + bar_w, base_y],
-            radius=max(1, bar_w // 3),
-            fill=(255, 255, 255, 235),
-        )
-    return image
+def brand_svg() -> Path:
+    return app_root() / "assets" / "r1.svg"
 
 
 def build_icon(target: Path | None = None) -> Path:
-    """Создаёт assets/icon.ico с набором размеров. Возвращает путь."""
+    """Создает ICO с набором размеров для окна, области уведомлений и установщика."""
     target = target or (app_root() / "assets" / "icon.ico")
+    source = brand_svg()
+    renderer = QSvgRenderer(str(source))
+    if not renderer.isValid():
+        raise ValueError(f"Не удалось загрузить знак R1: {source}")
+
+    size = 256
+    image = QImage(size, size, QImage.Format.Format_RGBA8888)
+    image.fill(Qt.GlobalColor.transparent)
+    with QPainter(image) as painter:
+        renderer.render(painter)
+    raster = Image.frombytes("RGBA", (size, size), bytes(image.constBits()))
+
     target.parent.mkdir(parents=True, exist_ok=True)
-    base = _draw(256)
-    sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    base.save(target, format="ICO", sizes=sizes)
+    sizes = [(side, side) for side in (16, 24, 32, 48, 64, 128, size)]
+    raster.save(target, format="ICO", sizes=sizes)
     return target
 
 
@@ -48,7 +41,6 @@ def ensure_icon() -> Path:
     if not target.exists():
         return build_icon(target)
     return target
-
 
 
 if __name__ == "__main__":

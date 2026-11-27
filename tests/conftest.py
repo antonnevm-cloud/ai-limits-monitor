@@ -45,8 +45,8 @@ def _app_log_in_session_temp(tmp_path_factory):
 
     Иначе `get_logger()` (его зовут `Database`, сканеры и окна) открывал
     %LOCALAPPDATA%\\ClaudeUsageManager\\app.log работающего виджета, и туда попадали нарочные
-    ошибки тестов с путями `.pytest_tmp` (CLA-8). Журнал настраивается один раз за процесс,
-    поэтому достаточно настроить его первым; файл остается в `.pytest_tmp/app-log0` до следующего прогона.
+    ошибки тестов. Журнал настраивается один раз за процесс.
+    Файл создается в отдельном временном каталоге pytest.
     """
     from claude_usage_manager import utils
 
@@ -63,7 +63,7 @@ def _app_log_in_session_temp(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _destroy_qt_windows_after_test():
-    """После теста удаляет все окна Qt, которые он оставил, пока жив QApplication (CLA-8).
+    """После теста удаляет все окна Qt, которые он оставил, пока жив QApplication.
 
     Тесты создают окна (`MonitorWindow`, строки тредов, всплывающие панели) и не удаляют их:
     `quit_monitor()` только прячет окно, и оно живет после теста (`gc.collect()` его не находит,
@@ -100,10 +100,40 @@ def _isolate_desktop_and_statusline_quota(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _never_start_live_agent_clis(monkeypatch):
-    """Тесты не запускают боевые `grok agent stdio` и `codex app-server` (регрессия по ревью CLA-5).
+def _isolate_client_profiles(monkeypatch, tmp_path):
+    """Каталоги клиентов и профиля Windows ведут во временную папку: тесты не читают журналы Grok,
+    Codex, Claude и историю Claude Desktop пользователя, в том числе в дочерних процессах."""
+    from claude_usage_manager import grok_provider
 
-    Без подмены `refresh_states` и `fetch_quota` шли в настоящие CLI владельца: медленно и с побочными
+    clients = tmp_path / "client-profiles"
+    # Переменные каталогов клиентов не задаются: от них зависит ключ истории квот в тестах.
+    for variable, name in (("APPDATA", "AppData/Roaming"), ("LOCALAPPDATA", "AppData/Local")):
+        monkeypatch.setenv(variable, str(clients / name))
+    monkeypatch.setattr(grok_provider, "log_path", lambda: clients / ".grok" / "logs" / "unified.jsonl")
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_autostart(monkeypatch):
+    """Переключатель автозапуска в тестах не пишет в раздел Run настоящего профиля."""
+    from claude_usage_manager import autostart, quota_monitor
+
+    state = {"value": None}
+    monkeypatch.setattr(autostart, "registered", lambda: state["value"])
+
+    def set_enabled(enabled):
+        state["value"] = autostart.command() if enabled else None
+
+    monkeypatch.setattr(autostart, "set_enabled", set_enabled)
+    # В закадровой платформе Qt нет области уведомлений; окна в тестах ведут себя как при видимом значке.
+    monkeypatch.setattr(quota_monitor.MonitorWindow, "_tray_ready", lambda self: True)
+    return state
+
+
+@pytest.fixture(autouse=True)
+def _never_start_live_agent_clis(monkeypatch):
+    """Тесты не запускают боевые `grok agent stdio` и `codex app-server`.
+
+    Без подмены `refresh_states` и `fetch_quota` шли в настоящие CLI пользователя: медленно и с побочными
     запросами. Тесты, которым нужен запуск, подменяют `Popen` и пути сами (они сильнее этой фикстуры).
     """
     from claude_usage_manager import antigravity_quota, grok_provider, quota, quota_monitor_model
@@ -115,6 +145,7 @@ def _never_start_live_agent_clis(monkeypatch):
 
     monkeypatch.setattr(grok_provider, "grok_cli", lambda: None)
     monkeypatch.setattr(quota, "codex_cli", lambda: None)
+    monkeypatch.setattr(quota, "_CODEX_LAST_OK", True)
 
     def reset():
         grok_provider.reset_cli_cache()

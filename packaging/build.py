@@ -19,12 +19,16 @@ PACKAGING = ROOT / 'packaging'
 APP = runpy.run_path(str(ROOT / 'claude_usage_manager' / '__init__.py'))
 NAME = APP['APP_NAME']
 VERSION = APP['APP_VERSION']
-WHEELS = ('Pillow', 'openpyxl', 'et-xmlfile', 'packaging', 'PySide6-Essentials', 'shiboken6',
+WHEELS = ('Pillow', 'openpyxl', 'et-xmlfile', 'PySide6-Essentials', 'shiboken6',
           'PyInstaller', 'pyinstaller-hooks-contrib')
+# В колесах Qt for Python лежит только коммерческая отсылка: рядом кладется указатель на LGPL v3.
+LGPL_WHEELS = ('PySide6-Essentials', 'shiboken6')
 
 
 def write_licenses(directory: Path, compiler: Path | None) -> None:
     shutil.copytree(PACKAGING / 'licenses', directory)
+    shutil.copyfile(ROOT / 'LICENSE', directory / 'AI-Limits-Monitor-LICENSE.txt')
+    shutil.copyfile(ROOT / 'NOTICE', directory / 'AI-Limits-Monitor-NOTICE.txt')
     python_license = next((p for p in (Path(sys.base_prefix) / 'LICENSE.txt',
                                        Path(sysconfig.get_path('stdlib')) / 'LICENSE.txt')
                            if p.is_file()), None)
@@ -42,6 +46,10 @@ def write_licenses(directory: Path, compiler: Path | None) -> None:
                 shutil.copyfile(dist.locate_file(path), target / path.name)
         if not any(target.iterdir()):
             raise FileNotFoundError(f'В поставке {name} {dist.version} отсутствует лицензия')
+        if name in LGPL_WHEELS:
+            (target / 'LGPL-3.0-only-USED.txt').write_text(
+                f'{name} {dist.version} is used in this program under the GNU Lesser General Public License '
+                'version 3 (see ../LGPL-3.0-only.txt), not under a commercial Qt license.\n', encoding='utf-8')
     if compiler:
         shutil.copyfile(compiler.with_name('license.txt'), directory / 'Inno-Setup.txt')
 
@@ -70,6 +78,12 @@ def build(output: Path, work: Path, compiler: Path | None) -> Path:
         environment.update(PYTHONNOUSERSITE='1', PYINSTALLER_CONFIG_DIR=str(stage / 'cache'),
                            AI_LIMITS_BUILD_LICENSES=str(notices), TEMP=str(stage), TMP=str(stage),
                            TMPDIR=str(stage))
+        if sys.platform == 'win32':
+            # PyInstaller добирает DLL из каталогов PATH: из Git, JDK и других программ машины сборки
+            # в поставку попадали посторонние UCRT и OpenSSL. Оставляем только окружение сборки и Windows.
+            system = Path(os.environ.get('SystemRoot', r'C:\Windows'))
+            environment['PATH'] = os.pathsep.join(
+                [str(Path(sys.executable).parent), str(system / 'System32'), str(system)])
         subprocess.run([sys.executable, '-m', 'PyInstaller', '--log-level', 'WARN',
                         '--distpath', str(stage / 'dist'), '--workpath', str(stage / 'work'),
                         str(PACKAGING / 'monitor.spec')], cwd=ROOT, env=environment, check=True)

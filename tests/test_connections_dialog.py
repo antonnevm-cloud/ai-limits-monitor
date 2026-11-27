@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from itertools import combinations
 from pathlib import Path
 
@@ -104,7 +105,9 @@ def test_manual_statusline_uses_unsaved_profile_and_preserves_existing_handler(d
     existing.write_text(body, encoding="utf-8")
     page.inputs["profile"].setText(str(first))
     page.statusline.click()
-    assert "другая настройка" in page.result.text()
+    assert "своя строка состояния" in page.result.text()
+    # Команду монитора можно вызвать из своей строки состояния: она показана и скопирована.
+    assert "--claude-statusline" in page.result.text()
     assert existing.read_text(encoding="utf-8") == body
     second = tmp_path / "second"
     page.inputs["profile"].setText(str(second))
@@ -117,6 +120,27 @@ def test_manual_statusline_uses_unsaved_profile_and_preserves_existing_handler(d
     assert not page.statusline.isEnabled()
     page.statusline.click()
     assert not (settings.provider_profile("claude") / "settings.json").exists()
+
+
+def test_statusline_can_be_disconnected_even_for_a_disabled_source(dialog, tmp_path):
+    page = dialog.pages["claude"]
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    previous = {"type": "command", "command": "my-old-line"}
+    (profile / "settings.json").write_text(json.dumps({"statusLine": previous}), encoding="utf-8")
+    page.inputs["profile"].setText(str(profile))
+    page.statusline.click()
+    assert "своя строка состояния" in page.result.text()  # чужая команда не заменяется
+    (profile / "settings.json").write_text("{}", encoding="utf-8")
+    page.statusline.click()
+    assert "подключена" in page.result.text()
+    page.enabled.setChecked(False)
+    assert page.statusline_off.isEnabled()
+    page.statusline_off.click()
+    assert "отключена" in page.result.text()
+    assert "statusLine" not in json.loads((profile / "settings.json").read_text(encoding="utf-8"))
+    page.statusline_off.click()
+    assert "не настроена" in page.result.text()
 
 
 def test_cancel_discards_changes_and_save_round_trips(dialog, tmp_path):
@@ -162,9 +186,23 @@ def test_check_discards_all_client_output_and_uses_exit_status(dialog, tmp_path,
     process = page.pending
     assert process.program() == str(program)
     assert process.arguments() == ["login", "status"]
-    assert len(called) == 3 and set(called.values()) == {os.devnull}
+    assert len(called) == 3 and set(called.values()) == {QProcess.nullDevice()}
     process.finished.emit(0, QProcess.ExitStatus.NormalExit)
     assert page.result.text() == "Клиент подтвердил вход."
+
+
+@pytest.mark.parametrize("code, expected", [(0, "Клиент подтвердил вход."), (1, "Клиент не подтвердил вход.")])
+def test_check_starts_a_process_and_discards_both_streams(dialog, monkeypatch, code, expected):
+    page = dialog.pages["codex"]
+    monkeypatch.setattr(settings, "provider_executable", lambda *_: Path(sys.executable))
+    script = ("import sys; assert sys.stdin.read() == ''; print('private out'); "
+              f"print('private err', file=sys.stderr); sys.exit({code})")
+    monkeypatch.setitem(ui._CHECK_ARGS, "codex", ("-I", "-c", script))
+    page.check.click()
+    if page.pending is not None:
+        assert page.pending.waitForFinished(5000)
+    assert page.result.text() == expected
+    assert page.check.isEnabled()
 
 
 def test_antigravity_statusline_receives_both_unsaved_roots(dialog, tmp_path, monkeypatch):

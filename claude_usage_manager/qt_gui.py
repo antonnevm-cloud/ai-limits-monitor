@@ -62,7 +62,7 @@ from .periods import PRESETS, build_period, parse_custom
 from .providers import AGENTS, AGENT_LABELS, MultiAgentAnalyzer
 from .qt_chart import TimelineChart
 from .qt_theme import COLORS, build_stylesheet
-from .quota import fetch_quota, quota_consumed, quota_window_consumed, weekly_consumed
+from .quota import fetch_quota, quota_windows_consumed
 from .quota_monitor_model import cached_snapshot
 from .utils import (
     estimate_project_weekly_pp,
@@ -76,6 +76,7 @@ from .utils import (
 )
 
 USER_ROLE = int(Qt.ItemDataRole.UserRole)
+_EPOCH = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
 
 
 class SortItem(QTableWidgetItem):
@@ -91,6 +92,30 @@ class SortItem(QTableWidgetItem):
                 return self.sort_value < other.sort_value
             except TypeError:
                 return str(self.sort_value) < str(other.sort_value)
+        return super().__lt__(other)
+
+    def with_data(self, value: Any) -> "SortItem":
+        # Данные строки задаются до заполнения таблицы: после сортировки номер строки уже другой.
+        self.setData(USER_ROLE, value)
+        return self
+
+
+class SortTreeItem(QTreeWidgetItem):
+    """Строка дерева "Обзор", которая сортирует числовые столбцы по числу, а не по тексту."""
+
+    def __init__(self, texts: list[str], sort_values: list[Any]) -> None:
+        super().__init__(texts)
+        self.sort_values = sort_values
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else 0
+        if isinstance(other, SortTreeItem):
+            mine, theirs = self.sort_values[column], other.sort_values[column]
+            try:
+                return mine < theirs
+            except TypeError:
+                return str(mine) < str(theirs)
         return super().__lt__(other)
 
 
@@ -193,6 +218,8 @@ class DetailDialog(QDialog):
         layout.setSpacing(14)
 
         title = QLabel(row.title)
+        # Название и проект берутся из журналов: показываются как текст, а не как разметка HTML.
+        title.setTextFormat(Qt.TextFormat.PlainText)
         title.setObjectName("PageTitle")
         title.setWordWrap(True)
         layout.addWidget(title)
@@ -216,6 +243,7 @@ class DetailDialog(QDialog):
             key = QLabel(name)
             key.setObjectName("Muted")
             val = QLabel(value)
+            val.setTextFormat(Qt.TextFormat.PlainText)
             val.setWordWrap(True)
             info.addWidget(key, index, 0, Qt.AlignmentFlag.AlignTop)
             info.addWidget(val, index, 1)
@@ -766,27 +794,25 @@ class MainWindow(QMainWindow):
         now_utc = dt.datetime.now(dt.timezone.utc)
         includes_now = result.period.start_utc <= now_utc <= result.period.end_utc
         windows = snapshot.windows
+        current_percents = {window.id: window.used_percent if includes_now else None for window in windows}
         if result.agent == "claude":
-            current = snapshot.weekly if includes_now else None
-            calculated = weekly_consumed(result.period, self.db, current, current_source=snapshot.source)
+            current_percents["secondary"] = snapshot.weekly if includes_now else None
+        elif not windows and snapshot.weekly is not None:
+            current_percents["primary"] = snapshot.weekly if includes_now else None
+        consumed_by_window = quota_windows_consumed(
+            result.period, self.db, current_percents, result.agent, current_source=snapshot.source,
+        )
+        if result.agent == "claude":
+            calculated = consumed_by_window.pop("secondary", None)
             if calculated is not None:
                 result.weekly_consumed_pp = calculated
             if result.weekly_consumed_pp is not None:
                 result.quota_consumed_by_window["secondary"] = result.weekly_consumed_pp
         elif not windows and snapshot.weekly is not None:
-            current = snapshot.weekly if includes_now else None
-            calculated = quota_consumed(result.period, self.db, current, result.agent)
+            calculated = consumed_by_window.pop("primary", None)
             if calculated is not None:
                 result.weekly_consumed_pp = calculated
-        for window in windows:
-            if result.agent == "claude" and window.id == "secondary":
-                continue
-            current = window.used_percent if includes_now else None
-            consumed = quota_window_consumed(
-                result.period, self.db, current, result.agent, window.id, current_source=snapshot.source,
-            )
-            if consumed is not None:
-                result.quota_consumed_by_window[window.id] = consumed
+        result.quota_consumed_by_window.update(consumed_by_window)
         main_id = snapshot.main_window_id
         if result.agent != "claude" and main_id in result.quota_consumed_by_window:
             result.weekly_consumed_pp = result.quota_consumed_by_window[main_id]
@@ -864,10 +890,11 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _analysis_finished(self, result: AnalysisResult) -> None:
-        self._finish_busy()
         if self._quit_requested:
+            self._finish_busy()
             return
         self.result = result
+        self._finish_busy()
         self._apply_quota_to_result(result)
         source_rows = result.all_threads or result.threads
         self._thread_by_id = {row.session_id: row for row in source_rows}
@@ -938,6 +965,9 @@ class MainWindow(QMainWindow):
         for row in result.threads:
             rows_by_project.setdefault(row.project or "Без проекта", []).append(row)
         projects = {row.project: row for row in result.projects}
+        if "" in projects:
+            # Треды без проекта показаны под "Без проекта": доля берется из той же строки проектов.
+            projects.setdefault("Без проекта", projects[""])
         ordered = sorted(
             rows_by_project,
             key=lambda name: (
@@ -964,23 +994,21 @@ class MainWindow(QMainWindow):
                 default=None,
             )
             models = sorted({model for row in rows for model in row.models})
-            parent = QTreeWidgetItem(
+            tokens = project.total_tokens if project else sum(row.total_tokens for row in rows)
+            cost = project.cost if project else sum(row.cost for row in rows)
+            parent = SortTreeItem(
                 [
                     project_name,
                     ", ".join(models[:3]) + ("…" if len(models) > 3 else ""),
                     str(len(rows)),
-                    format_tokens(
-                        project.total_tokens
-                        if project
-                        else sum(row.total_tokens for row in rows)
-                    ),
-                    format_cost(
-                        project.cost if project else sum(row.cost for row in rows)
-                    ),
+                    format_tokens(tokens),
+                    format_cost(cost),
                     format_percent(share),
                     (project.limit_pp_text or format_pp(weekly_pp)) if project else format_pp(weekly_pp),
                     local_dt_text(last),
-                ]
+                ],
+                [project_name.casefold(), ", ".join(models).casefold(), len(rows), tokens, cost, share,
+                 weekly_pp if weekly_pp is not None else -1, last or _EPOCH],
             )
             parent.setData(0, USER_ROLE, ("project", project_name))
             font = parent.font(0)
@@ -995,7 +1023,7 @@ class MainWindow(QMainWindow):
                 title = ("★ " if row.pinned else "") + row.title
                 if row.subagents:
                     title += f"  (+{row.subagents})"
-                child = QTreeWidgetItem(
+                child = SortTreeItem(
                     [
                         title,
                         ", ".join(row.models),
@@ -1005,11 +1033,16 @@ class MainWindow(QMainWindow):
                         format_percent(row.share),
                         row.limit_pp_text or format_pp(row.weekly_pp),
                         local_dt_text(row.last_activity),
-                    ]
+                    ],
+                    [title.casefold(), ", ".join(row.models).casefold(), 0, row.total_tokens, row.cost,
+                     row.share, row.weekly_pp if row.weekly_pp is not None else -1,
+                     row.last_activity or _EPOCH],
                 )
                 child.setData(0, USER_ROLE, ("thread", row.session_id))
                 parent.addChild(child)
         tree.setSortingEnabled(True)
+        # По умолчанию сначала самые дорогие проекты и треды, а не обратный алфавит.
+        tree.sortItems(4, Qt.SortOrder.DescendingOrder)
 
     def _render_threads(
         self, result: AnalysisResult, rows: list[ThreadRow] | None = None
@@ -1039,7 +1072,7 @@ class MainWindow(QMainWindow):
                     or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
                 ),
             ]
-            values[0].setData(USER_ROLE, row.session_id)
+            values[0].with_data(row.session_id)
             rendered.append(values)
         fill_table(self.threads_table, rendered)
         self.threads_table.sortItems(4, Qt.SortOrder.DescendingOrder)
@@ -1049,7 +1082,7 @@ class MainWindow(QMainWindow):
             self.projects_table,
             [
                 [
-                    SortItem(project.project),
+                    SortItem(project.project).with_data(project.project),
                     SortItem(str(project.threads), project.threads),
                     SortItem(
                         format_tokens(project.total_tokens), project.total_tokens
@@ -1064,10 +1097,6 @@ class MainWindow(QMainWindow):
                 for project in result.projects
             ],
         )
-        for row_index, project in enumerate(result.projects):
-            item = self.projects_table.item(row_index, 0)
-            if item is not None:
-                item.setData(USER_ROLE, project.project)
         self.projects_table.sortItems(3, Qt.SortOrder.DescendingOrder)
 
     def _render_timeline(self, result: AnalysisResult) -> None:
@@ -1095,7 +1124,7 @@ class MainWindow(QMainWindow):
         fill_table(
             self.models_table,
             [[
-                SortItem(model.model), SortItem(format_tokens(model.input_tokens),model.input_tokens),
+                SortItem(model.model).with_data(model.model), SortItem(format_tokens(model.input_tokens),model.input_tokens),
                 SortItem(format_tokens(model.output_tokens),model.output_tokens), SortItem(format_tokens(model.cache_creation),model.cache_creation),
                 SortItem(format_tokens(model.cache_read),model.cache_read), SortItem(format_tokens(model.total_tokens),model.total_tokens),
                 SortItem(format_cost(model.cost),model.cost), SortItem(format_percent(model.share),model.share),
@@ -1104,10 +1133,6 @@ class MainWindow(QMainWindow):
                 SortItem(local_dt_text(model.quota_reset), model.quota_reset or dt.datetime.min.replace(tzinfo=dt.timezone.utc)),
             ] for model in result.model_rows],
         )
-        for row_index, model in enumerate(result.model_rows):
-            item = self.models_table.item(row_index, 0)
-            if item is not None:
-                item.setData(USER_ROLE, model.model)
         self.models_table.sortItems(5 if antigravity else 6, Qt.SortOrder.DescendingOrder)
 
     # ------------------------------- thread actions
@@ -1225,7 +1250,11 @@ class MainWindow(QMainWindow):
             text=row.title,
         )
         if accepted and text.strip():
-            self.db.set_title_override(row.session_id, text.strip())
+            if row.is_group:
+                # Название объединенной задачи - это имя группы всех ее тредов.
+                self.db.set_group(list(row.member_ids or [row.session_id]), text.strip())
+            else:
+                self.db.set_title_override(row.session_id, text.strip())
             self.calculate()
 
     def _set_hidden(self, rows: list[ThreadRow], hidden: bool) -> None:
@@ -1245,9 +1274,9 @@ class MainWindow(QMainWindow):
             self, "Объединить треды", "Название задачи"
         )
         if accepted and text.strip():
-            self.db.set_group(
-                [row.session_id for row in rows], text.strip()
-            )
+            # Уже объединенная задача входит в новую целиком, со всеми своими тредами.
+            members = [mid for row in rows for mid in (row.member_ids or [row.session_id])]
+            self.db.set_group(list(dict.fromkeys(members)), text.strip())
             self.calculate()
 
     def _ungroup_threads(self, rows: list[ThreadRow]) -> None:

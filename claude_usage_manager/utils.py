@@ -7,7 +7,6 @@ import logging
 import os
 import pathlib
 import re
-import shutil
 import sys
 from logging.handlers import RotatingFileHandler
 from typing import Any
@@ -22,10 +21,7 @@ SKIP_PREFIXES = (
     "caveat:",
     "base directory for this skill:",
     "this session is being continued",
-    "you have ",
     "stop hook feedback:",
-    "reply attach_session_ready only",
-    "read github issue ",
 )
 
 MONTHS_RU = (
@@ -42,13 +38,31 @@ def app_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
+PORTABLE_MARKER = "portable.txt"
+
+
+def portable_data_dir() -> pathlib.Path | None:
+    """Папка data рядом с программой, если установщик положил признак переносимой установки (/PORTABLE=1).
+
+    Тогда вторая копия рядом с обычной установкой не делит с ней историю, настройки и блокировку окна,
+    а перенос папки программы переносит и данные.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    folder = pathlib.Path(sys.executable).resolve().parent
+    return folder / "data" if (folder / PORTABLE_MARKER).is_file() else None
+
+
 def data_dir() -> pathlib.Path:
     """Личные настройки и история пользователя, общие для виджета и обработчиков."""
     override = os.environ.get("AI_LIMITS_DATA_DIR")
+    portable = None if override else portable_data_dir()
     if override:
         path = pathlib.Path(override).expanduser()
         if not path.is_absolute():
             raise ValueError("AI_LIMITS_DATA_DIR должен содержать абсолютный путь")
+    elif portable is not None:
+        path = portable
     elif sys.platform == "darwin":
         path = pathlib.Path.home() / "Library" / "Application Support" / APP_DIR_NAME
     elif os.name == "nt":
@@ -72,6 +86,16 @@ def data_store_id() -> str:
 
 def log_path() -> pathlib.Path:
     return data_dir() / "app.log"
+
+
+def client_workdir() -> pathlib.Path:
+    """Пустой рабочий каталог для запуска клиентов (agy, вход в Codex, Grok, Claude).
+
+    Клиент считает текущий каталог рабочей папкой проекта и не должен видеть историю и настройки монитора.
+    """
+    path = data_dir() / "client-workdir"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def claude_root() -> pathlib.Path:
@@ -129,22 +153,22 @@ def parse_iso(value: Any) -> dt.datetime | None:
 
 def to_utc(value: dt.datetime) -> dt.datetime:
     if value.tzinfo is None:
-        value = value.replace(tzinfo=local_tz())
+        # Наивное местное время переводится по правилам пояса на эту дату, а не по смещению сейчас.
+        return value.astimezone(dt.timezone.utc)
     return value.astimezone(dt.timezone.utc)
 
 
 def local_hm(value: dt.datetime | None, timezone: dt.tzinfo | None = None) -> str:
     if not value:
         return "—"
-    timezone = timezone or local_tz()
-    return value.astimezone(timezone).strftime("%H:%M")
+    # Без явного пояса смещение берется на сам момент: летнее и зимнее время не путаются.
+    return (value.astimezone(timezone) if timezone else value.astimezone()).strftime("%H:%M")
 
 
 def local_dt_text(value: dt.datetime | None, timezone: dt.tzinfo | None = None) -> str:
     if not value:
         return "—"
-    timezone = timezone or local_tz()
-    return value.astimezone(timezone).strftime("%Y-%m-%d %H:%M")
+    return (value.astimezone(timezone) if timezone else value.astimezone()).strftime("%Y-%m-%d %H:%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -196,13 +220,6 @@ def human_project(cwd: str | None, project_path: str) -> str:
     parts = [p for p in source.split("\\") if p and not re.match(r"^[A-Za-z]:$", p)]
     if not parts:
         return project_path
-    lower = [p.casefold() for p in parts]
-    if "clients" in lower:
-        tail = parts[lower.index("clients") + 1:]
-        if len(tail) >= 2:
-            return f"{tail[0]} / {tail[-1]}"
-        if tail:
-            return tail[0]
     return parts[-1]
 
 
@@ -243,19 +260,3 @@ def estimate_project_weekly_pp(
 
 def format_pp(value: float | None) -> str:
     return "н/д" if value is None else "≈" + f"{value:.2f}".replace(".", ",") + " п.п."
-
-
-# --------------------------------------------------------------------------- #
-# Поиск ccusage
-# --------------------------------------------------------------------------- #
-def find_ccusage() -> pathlib.Path:
-    candidates = [shutil.which(name) for name in ("ccusage", "ccusage.exe", "ccusage.cmd", "ccusage.ps1")]
-    if os.name == "nt" and os.environ.get("APPDATA"):
-        npm_dir = pathlib.Path(os.environ["APPDATA"]) / "npm"
-        candidates.extend([npm_dir / "ccusage.cmd", npm_dir / "ccusage.ps1"])
-    for candidate in candidates:
-        if candidate and pathlib.Path(candidate).exists():
-            return pathlib.Path(candidate)
-    raise RuntimeError(
-        "Дополнительная утилита ccusage не найдена."
-    )

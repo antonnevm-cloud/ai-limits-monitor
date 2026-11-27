@@ -9,6 +9,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 
 from .database import Database
 from .models import QuotaSnapshot
@@ -62,6 +63,13 @@ class BackendService:
             }
 
     def request_refresh(self):
+        # Явное обновление (кнопка, сохранение подключений) спрашивает клиентов заново,
+        # а не отдает запомненный ответ или запомненный отказ.
+        from .grok_provider import reset_cli_cache
+        from .quota import reset_codex_rate_limits_cache
+
+        reset_cli_cache()
+        reset_codex_rate_limits_cache()
         self._requested.set()
         for pending in self._provider_requests.values():
             self._wake_provider(pending)
@@ -147,17 +155,26 @@ class BackendService:
             self._wake_provider(pending)
         if self.api is not None:
             self.api.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-        for thread in self._provider_threads:
-            thread.join(timeout=5)
+        # Клиент, который не отвечает, не держит выход: его процесс снимается сразу.
+        from .process_utils import stop_children
+
+        stop_children()
+        # Общий срок на все потоки: поток, ждущий ответа клиента, не должен задерживать выход на 5 с каждый.
+        deadline = time.monotonic() + 3
+        for thread in [self._thread, *self._provider_threads]:
+            if thread is not None:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def main() -> int:
+    """Отдельный сборщик для локальных интеграций. Запускается, только если разрешен в backend-control.json."""
     setup_logging(file_name="backend.log")
     control = data_dir() / "backend-control.json"
     if not read_control(control)["desired_running"]:
-        return 0
+        get_logger().warning("Отдельный сборщик не запущен: в %s нет \"desired_running\": true. "
+                             "Виджет собирает лимиты сам, отдельный сборщик нужен только локальным интеграциям.",
+                             control)
+        return 3
     mutex = None
     if sys.platform == "win32":
         kernel = ctypes.windll.kernel32

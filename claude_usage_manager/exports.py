@@ -17,7 +17,32 @@ from .utils import (
     format_tokens,
     local_dt_text,
 )
-from . import APP_VERSION
+from . import APP_NAME, APP_VERSION
+
+# Название треда без своего заголовка берется из начала первого запроса, поэтому отчет может его содержать.
+_PRIVACY_NOTE = ("Отчет создан локально. Переписка в него не выгружается, но название треда "
+                 "может быть началом запроса из журнала клиента.")
+# Строка, начинающаяся с этих знаков, в Excel становится формулой.
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_value(value):
+    """CSV для Excel с разделителем ";": дробная часть через запятую, текст не превращается в формулу."""
+    if isinstance(value, float):
+        return f"{value:.6g}".replace(".", ",") if abs(value) < 1e15 else str(value)
+    if isinstance(value, str) and value.startswith(_FORMULA_START):
+        return "'" + value
+    return value
+
+
+def _xlsx_append(ws, values) -> None:
+    """Строка листа без управляющих символов; текст, похожий на формулу, остается текстом."""
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+    ws.append([ILLEGAL_CHARACTERS_RE.sub("", value) if isinstance(value, str) else value for value in values])
+    for cell in ws[ws.max_row]:
+        if cell.data_type == "f":
+            cell.data_type = "s"
 
 
 def export(result: AnalysisResult, path: Path, fmt: str) -> Path:
@@ -127,7 +152,7 @@ def _result_to_dict(result: AnalysisResult) -> dict:
             f"Агент: {result.agent}.",
             "Стоимость — условный эквивалент локального источника, не является оплатой.",
             "Стоимость в разбивке по времени распределена пропорционально токенам (оценка).",
-            "Тексты переписки не сохраняются.",
+            _PRIVACY_NOTE,
         ],
     }
 
@@ -152,7 +177,7 @@ def export_csv(result: AnalysisResult, path: Path) -> Path:
             "Начало", "Конец", "Служебный", "Закреплён", "Session ID",
         ])
         for t in result.threads:
-            writer.writerow([
+            writer.writerow(_csv_value(value) for value in [
                 result.agent, t.title, t.project, ", ".join(display_model(m) for m in t.models),
                 t.total_tokens, round(t.cost, 4), round(t.share, 3),
                 t.limit_pp_text or ("" if t.weekly_pp is None else round(t.weekly_pp, 3)),
@@ -211,22 +236,22 @@ def export_xlsx(result: AnalysisResult, path: Path) -> Path:
         ("Расход основного лимита, п.п.", "нет данных" if result.weekly_consumed_pp is None else round(result.weekly_consumed_pp, 2)),
     ]
     for window in result.quota.windows:
-        rows.append((f"Лимит · {window.title}, %", window.used_percent if window.used_percent is not None else "нет данных"))
+        ro_xlsx_append(ws, (f"Лимит · {window.title}, %", window.used_percent if window.used_percent is not None else "нет данных"))
         if window.resets_at:
-            rows.append((f"Сброс · {window.title}", local_dt_text(window.resets_at)))
+            ro_xlsx_append(ws, (f"Сброс · {window.title}", local_dt_text(window.resets_at)))
     for row in rows:
-        ws.append(row)
+        _xlsx_append(ws, row)
     style_header(ws, 2)
     autosize(ws)
 
     # --- Threads ---
     ws = wb.create_sheet("Threads")
-    ws.append([
+    _xlsx_append(ws, [
         "Название", "Проект", "Модели", "Токены", "Стоимость (усл.)", "Доля %",
         "Лимит, п.п. (оценка)", "Субагенты", "Начало", "Конец", "Session ID",
     ])
     for t in result.threads:
-        ws.append([
+        _xlsx_append(ws, [
             t.title, t.project, ", ".join(display_model(m) for m in t.models),
             t.total_tokens, round(t.cost, 4), round(t.share, 3),
             t.limit_pp_text or (None if t.weekly_pp is None else round(t.weekly_pp, 3)), t.subagents,
@@ -238,9 +263,9 @@ def export_xlsx(result: AnalysisResult, path: Path) -> Path:
 
     # --- Projects ---
     ws = wb.create_sheet("Projects")
-    ws.append(["Проект", "Тредов", "Токены", "Стоимость (усл.)", "Доля %", "Лимит, п.п. (оценка)"])
+    _xlsx_append(ws, ["Проект", "Тредов", "Токены", "Стоимость (усл.)", "Доля %", "Лимит, п.п. (оценка)"])
     for p in result.projects:
-        ws.append([p.project, p.threads, p.total_tokens, round(p.cost, 4), round(p.share, 3),
+        _xlsx_append(ws, [p.project, p.threads, p.total_tokens, round(p.cost, 4), round(p.share, 3),
                    p.limit_pp_text or estimate_project_weekly_pp(p.share, result.weekly_consumed_pp)])
     _apply_formats(ws, {2: int_fmt, 3: int_fmt, 4: money_fmt, 5: pct_fmt, 6: pct_fmt})
     style_header(ws, 6)
@@ -248,18 +273,18 @@ def export_xlsx(result: AnalysisResult, path: Path) -> Path:
 
     # --- Timeline ---
     ws = wb.create_sheet("Timeline")
-    ws.append(["Интервал", "Токены", "Стоимость (оценка, усл.)"])
+    _xlsx_append(ws, ["Интервал", "Токены", "Стоимость (оценка, усл.)"])
     for b in result.timeline:
-        ws.append([b.label, b.total_tokens, round(b.estimated_cost, 4)])
+        _xlsx_append(ws, [b.label, b.total_tokens, round(b.estimated_cost, 4)])
     _apply_formats(ws, {2: int_fmt, 3: money_fmt})
     style_header(ws, 3)
     autosize(ws)
 
     # --- Models ---
     ws = wb.create_sheet("Models")
-    ws.append(["Модель", "Ввод", "Вывод", "Кэш (создание)", "Кэш (чтение)", "Токены", "Стоимость (усл.)", "Доля %", "Лимит %", "П.п. периода", "Сброс"])
+    _xlsx_append(ws, ["Модель", "Ввод", "Вывод", "Кэш (создание)", "Кэш (чтение)", "Токены", "Стоимость (усл.)", "Доля %", "Лимит %", "П.п. периода", "Сброс"])
     for m in result.model_rows:
-        ws.append([
+        _xlsx_append(ws, [
             display_model(m.model), m.input_tokens, m.output_tokens, m.cache_creation,
             m.cache_read, m.total_tokens, round(m.cost, 4), round(m.share, 3),
             m.quota_percent, m.quota_pp, local_dt_text(m.quota_reset),
@@ -366,7 +391,7 @@ def export_html(result: AnalysisResult, path: Path) -> Path:
     document = f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Claude Usage Manager — отчёт</title>
+<title>{esc(APP_NAME)} — отчет</title>
 <style>
 :root{{color-scheme:light dark;--bg:#0e1117;--panel:#171b23;--panel2:#1d2330;--text:#eef2f7;
 --muted:#9aa6b5;--line:#2c3442;--accent:#d7834f;--accent2:#f0a36f;--shadow:0 14px 40px rgba(0,0,0,.22)}}
@@ -389,7 +414,7 @@ td{{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
 footer{{color:var(--muted);font-size:12px;margin-top:20px;text-align:center}}
 @media(prefers-color-scheme:light){{:root{{--bg:#f3f5f8;--panel:#fff;--panel2:#f7f8fa;--text:#1c2430;--muted:#657183;--line:#dfe4ea;--shadow:0 10px 28px rgba(31,42,55,.09)}}.bar{{background:#e8ebef}}}}
 </style></head><body><main>
-<header><div><h1>AI Usage · {esc(result.agent)} · Claude Usage Manager</h1><div class="subtitle">{period_text}. Локальные данные выбранного AI-агента.</div></div>
+<header><div><h1>AI Usage · {esc(result.agent)} · {esc(APP_NAME)}</h1><div class="subtitle">{period_text}. Локальные данные выбранного AI-агента.</div></div>
 <div class="muted">Сформировано {local_dt_text(result.generated_at)}<br>Версия {APP_VERSION}</div></header>
 <section class="cards">
 <div class="card"><div class="card-label">Токены</div><div class="card-value">{format_tokens(result.total_tokens)}</div><div class="card-small">{result.work_threads} рабочих тредов</div></div>
@@ -410,7 +435,7 @@ footer{{color:var(--muted);font-size:12px;margin-top:20px;text-align:center}}
 <section class="panel"><h2>По времени</h2><p class="section-note">Токены точные, стоимость — оценка (распределена по токенам).</p>
 <div class="table-wrap"><table><thead><tr><th>Интервал</th><th>Токены</th><th>Стоимость</th></tr></thead>
 <tbody>{timeline_rows()}</tbody></table></div></section>
-<footer>Всё обрабатывается локально. Тексты переписки не сохраняются.</footer>
+<footer>{esc(_PRIVACY_NOTE)}</footer>
 </main></body></html>"""
 
     path.write_text(document, encoding="utf-8")

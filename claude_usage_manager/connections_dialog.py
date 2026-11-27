@@ -1,7 +1,6 @@
 """Окно настройки источников. Вход всегда выполняет официальный клиент."""
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
@@ -10,7 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -106,7 +105,7 @@ def launch_login(provider: str, connection: Connection) -> None:
         if sys.platform == "darwin":
             _open_on_mac(str(app))
         else:
-            subprocess.Popen([str(app)], cwd=utils.data_dir(), env=env)
+            subprocess.Popen([str(app)], cwd=utils.client_workdir(), env=env)
         return
     if executable is None:
         raise FileNotFoundError("Программа не найдена.")
@@ -115,7 +114,7 @@ def launch_login(provider: str, connection: Connection) -> None:
     else:
         flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
         subprocess.Popen(
-            [str(executable), *_LOGIN_ARGS[provider]], cwd=utils.data_dir(), env=env, creationflags=flags,
+            [str(executable), *_LOGIN_ARGS[provider]], cwd=utils.client_workdir(), env=env, creationflags=flags,
         )
 
 
@@ -177,11 +176,20 @@ class _ProviderPage(QWidget):
         layout.addLayout(actions)
 
         self.statusline: QPushButton | None = None
+        self.statusline_off: QPushButton | None = None
         if provider in {"claude", "antigravity"}:
+            row = QHBoxLayout()
             self.statusline = QPushButton("Подключить строку состояния")
             self.statusline.setToolTip("Сразу добавить источник лимитов в настройки выбранного профиля.")
             self.statusline.clicked.connect(self.connect_statusline)
-            layout.addWidget(self.statusline)
+            row.addWidget(self.statusline)
+            # Обратная операция: вернуть строку состояния, которая была в профиле до подключения монитора.
+            self.statusline_off = QPushButton("Отключить строку состояния")
+            self.statusline_off.setToolTip("Вернуть прежнюю строку состояния выбранного профиля. Чужую команду монитор не трогает.")
+            self.statusline_off.clicked.connect(self.disconnect_statusline)
+            row.addWidget(self.statusline_off)
+            row.addStretch(1)
+            layout.addLayout(row)
         self.result = QLabel()
         self.result.setWordWrap(True)
         layout.addWidget(self.result)
@@ -192,9 +200,10 @@ class _ProviderPage(QWidget):
         self.refresh()
 
     def selection(self) -> Connection:
+        # Путь, скопированный из Проводника ("Копировать как путь"), приходит в кавычках.
         return Connection(
             enabled=self.enabled.isChecked(),
-            **{key: item.text() for key, item in self.inputs.items()},
+            **{key: item.text().strip().strip('"').strip() for key, item in self.inputs.items()},
         )
 
     def choose_path(self, field: str) -> None:
@@ -231,6 +240,7 @@ class _ProviderPage(QWidget):
             self.install.hide()
             if self.statusline is not None:
                 self.statusline.setEnabled(False)
+                self.statusline_off.setEnabled(False)
             return
         executable = settings.provider_executable(self.provider, current)
         profile = settings.provider_profile(self.provider, current)
@@ -252,7 +262,10 @@ class _ProviderPage(QWidget):
         self.install.setVisible(executable is None or (self.provider == "antigravity" and app is None))
         self.check.setEnabled(current.enabled)
         if self.statusline is not None:
-            self.statusline.setEnabled(current.enabled and executable is not None)
+            # Для записи строки состояния программа клиента не нужна, нужен только профиль.
+            self.statusline.setEnabled(current.enabled)
+            # Отключить можно и у выключенного источника: для этого его чаще всего и выключают.
+            self.statusline_off.setEnabled(True)
 
     def sign_in(self) -> None:
         try:
@@ -287,19 +300,23 @@ class _ProviderPage(QWidget):
         if not current.enabled or executable is None:
             if self.provider == "antigravity" and current.enabled and settings.antigravity_app(current):
                 self.result.setText("Приложение найдено. Проверь вход в Antigravity или установи agy.")
+            elif current.enabled:
+                self.result.setText("Программа клиента не найдена. Укажи путь к ней или установи клиент "
+                                    "по кнопке \"Страница установки\".")
             return
         process = QProcess(self)
         process.setProgram(str(executable))
         process.setArguments(list(_CHECK_ARGS[self.provider]))
-        process.setWorkingDirectory(str(utils.data_dir()))
+        process.setWorkingDirectory(str(utils.client_workdir()))
         env = QProcessEnvironment()
         for key, value in settings.provider_environment(self.provider, current).items():
             env.insert(key, value)
         process.setProcessEnvironment(env)
         # Для проверки достаточно кода выхода. Клиенты могут печатать сведения учетной записи.
-        process.setStandardInputFile(os.devnull)
-        process.setStandardOutputFile(os.devnull)
-        process.setStandardErrorFile(os.devnull)
+        null_device = QProcess.nullDevice()
+        process.setStandardInputFile(null_device)
+        process.setStandardOutputFile(null_device)
+        process.setStandardErrorFile(null_device)
         process.finished.connect(lambda code, state: self._checked(process, code, state))
         process.errorOccurred.connect(lambda error: self._check_error(process, error))
         timer = QTimer(process)
@@ -344,11 +361,13 @@ class _ProviderPage(QWidget):
             return
         current = self.selection()
         profile = settings.provider_profile(self.provider, current)
+        command = ""
         try:
             if self.provider == "claude":
                 from .claude_local import bridge_command, install_statusline_command
 
-                status = install_statusline_command(bridge_command(profile=profile), settings_path=profile / "settings.json")
+                command = bridge_command(profile=profile)
+                status = install_statusline_command(command, settings_path=profile / "settings.json")
             else:
                 from .antigravity_quota import install_antigravity_statusline
 
@@ -361,8 +380,41 @@ class _ProviderPage(QWidget):
             "already": "Строка состояния уже подключена.",
             "unchanged": "Строка состояния уже подключена.",
             "conflict": "В профиле есть другая настройка строки состояния. Монитор сохранил ее.",
+            "missing": "Каталог настроек agy не найден. Запусти agy один раз или выбери каталог настроек.",
         }
+        if status == "conflict" and command:
+            # Своя строка состояния остается; команду монитора можно вызвать из нее, передав ей тот же ввод.
+            QApplication.clipboard().setText(command)
+            self.result.setText(
+                "В профиле уже есть своя строка состояния, монитор ее не менял. Чтобы получать лимиты, "
+                "передай тот же ввод JSON и этой команде (она скопирована в буфер обмена):\n" + command)
+            self.result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            return
         self.result.setText(messages.get(status, "Клиент не подтвердил подключение строки состояния."))
+
+    def disconnect_statusline(self) -> None:
+        if self.statusline_off is None or not self.statusline_off.isEnabled():
+            return
+        current = self.selection()
+        try:
+            if self.provider == "claude":
+                from .claude_local import remove_statusline_command
+
+                profile = settings.provider_profile(self.provider, current)
+                status = remove_statusline_command(settings_path=profile / "settings.json")
+            else:
+                from .antigravity_quota import remove_antigravity_statusline
+
+                status = remove_antigravity_statusline(cli_profile=settings.antigravity_cli_profile(current))
+        except (OSError, ValueError):
+            self.result.setText("Не удалось отключить строку состояния. Проверь путь и доступ к settings.json.")
+            return
+        messages = {
+            "removed": "Строка состояния монитора отключена, прежняя настройка профиля возвращена.",
+            "absent": "В этом профиле строка состояния не настроена.",
+            "foreign": "В профиле своя строка состояния, монитор ее не менял.",
+        }
+        self.result.setText(messages.get(status, "Строку состояния отключить не удалось."))
 
 
 class ConnectionsDialog(QDialog):

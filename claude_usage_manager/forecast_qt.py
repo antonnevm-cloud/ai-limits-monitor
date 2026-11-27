@@ -1,11 +1,17 @@
 """Прогноз недели в виджете: полоса прогноза в карточке агента и всплывающий график расхода по проектам."""
 from __future__ import annotations
 
+import html
+
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QSizePolicy, QStackedLayout, QToolButton, QVBoxLayout, QWidget,
+)
 
 from .qt_theme import COLORS
+from .windows_ui import keep_tool_window_visible
 from .week_forecast import HALF_LIFE_HOURS, OTHER_LABEL, RATE_WEIGHTED, WEEKDAYS, ChartSeries, WeekChart, WeekForecast, clock_text
 
 ACCENT = "#4C9AF0"
@@ -15,7 +21,7 @@ SERIES_COLORS = ("#7F77DD", "#1D9E75", "#D85A30", "#378ADD", "#C9A227", "#B45FA0
 OTHER_COLOR = "#6B7785"
 SHORT_COLOR = "#E5675E"  # лимита не хватит до сброса
 POPUP_WIDTH = 450
-HOVER_CLOSE_MS = 300
+CHART_TITLE = "Расход за неделю по проектам"
 DAY_PHRASES = ("в понедельник", "во вторник", "в среду", "в четверг", "в пятницу", "в субботу", "в воскресенье")
 FOOTNOTE = "Доли по проектам оценочные: токены проектов распределяют прирост недельного процента."
 
@@ -29,14 +35,22 @@ def number(value: float, digits: int = 0) -> str:
 
 
 def series_color(index: int, name: str) -> str:
-    return OTHER_COLOR if name == OTHER_LABEL else SERIES_COLORS[index % len(SERIES_COLORS)]
+    if name == OTHER_LABEL:
+        return OTHER_COLOR
+    if index < len(SERIES_COLORS):
+        return SERIES_COLORS[index]
+    # После восьми проектов цвета не повторяются: оттенок идет по золотому углу.
+    return QColor.fromHsv(int((index * 137.508) % 360), 150, 200).name()
+
+
+LEGEND_NAME_LIMIT = 28
 
 
 # --------------------------------------------------------------------------- #
 # Тексты (без Qt, проверяются отдельно)
 # --------------------------------------------------------------------------- #
 def status_text(forecast: WeekForecast) -> str:
-    """Вывод прогноза для подсказки: не хватит на N часов или сколько примерно останется к сбросу."""
+    """Сколько часов не хватит или сколько примерно останется к сбросу."""
     if forecast.rate_per_day is None:
         return "мало данных для прогноза"
     hours = forecast.short_hours
@@ -46,7 +60,7 @@ def status_text(forecast: WeekForecast) -> str:
 
 
 def rate_text(forecast: WeekForecast) -> str:
-    """Темп прогноза и как он посчитан: для подсказки полосы и примечания графика."""
+    """Темп прогноза и его расчет для примечания графика."""
     if forecast.rate_per_day is None:
         return "Темпа пока нет: с начала недели прошло мало времени или расхода не было."
     if forecast.method == RATE_WEIGHTED:
@@ -69,12 +83,19 @@ def rate_value(forecast: WeekForecast) -> str:
     return f"{mark}{number(forecast.rate_per_day, 1)}% в сутки"
 
 
+def exhausted_text(forecast: WeekForecast) -> str:
+    """"кончится вс 02:00" по прогнозу; если лимит уже исчерпан - так и сказано, без текущего времени."""
+    if forecast.used >= 100.0:
+        return "лимит исчерпан"
+    return f"кончится {clock_text(forecast.exhausted_at)}"
+
+
 def axis_texts(forecast: WeekForecast) -> tuple[str, str]:
     """Две подписи под полосой: сейчас слева, сброс справа (при нехватке перед ним время, когда лимит кончится)."""
     now = f"сейчас · осталось {number(forecast.remaining)}%"
     reset = f"сброс {clock_text(forecast.resets_at)}"
     if forecast.exhausted_at is not None and forecast.short_hours is not None:
-        return now, f"кончится {clock_text(forecast.exhausted_at)} · {reset}"
+        return now, f"{exhausted_text(forecast)} · {reset}"
     return now, reset
 
 
@@ -89,7 +110,7 @@ def reset_html(forecast: WeekForecast) -> str:
     """Правая подпись под полосой: «сброс пт 20:00» и цветом остаток к сбросу или время, когда лимит кончится."""
     reset = f"сброс {clock_text(forecast.resets_at)}"
     if forecast.exhausted_at is not None and forecast.short_hours is not None:
-        return f'<span style="color:{SHORT_COLOR}">кончится {clock_text(forecast.exhausted_at)}</span> · {reset}'
+        return f'<span style="color:{SHORT_COLOR}">{exhausted_text(forecast)}</span> · {reset}'
     left = reset_remaining_text(forecast)
     return reset if left is None else f'{reset} <span style="color:{COLORS["success"]}">{left}</span>'
 
@@ -157,40 +178,75 @@ class SegmentBar(QWidget):
 
 
 class ForecastBar(QFrame):
-    """Прогноз недели в карточке агента: полоса и строка под ней (сейчас слева, сброс и остаток к сбросу справа).
+    """Полоса и подписи прогноза образуют одну кнопку открытия расхода по проектам."""
 
-    Строки «Прогноз недели» над полосой нет (решение владельца 12.11.2026). Наведение, щелчок и правая кнопка открывают график.
-    """
-
-    entered = Signal()
-    left = Signal()
     clicked = Signal()
-    context_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Forecast")
-        self.setMouseTracking(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        box = QVBoxLayout(self)
-        box.setContentsMargins(12, 10, 12, 8)
-        box.setSpacing(0)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoMousePropagation)
+        stack = QStackedLayout(self)
+        stack.setContentsMargins(2, 2, 2, 2)
+        stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        self.chart_button = QPushButton()
+        self.chart_button.setObjectName("ForecastAction")
+        self.chart_button.setCheckable(True)
+        self.chart_button.setAutoDefault(True)
+        self.chart_button.setAccessibleName(CHART_TITLE)
+        self.chart_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.chart_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chart_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.chart_button.setStyleSheet(f"""
+            QPushButton#ForecastAction {{
+                min-height:0; padding:0; background:{COLORS['control']};
+                border:1px solid {COLORS['border_soft']}; border-radius:6px;
+            }}
+            QPushButton#ForecastAction:hover {{background:{COLORS['panel_alt']}; border-color:{COLORS['accent']};}}
+            QPushButton#ForecastAction:checked, QPushButton#ForecastAction:pressed {{background:{COLORS['selection']};}}
+            QPushButton#ForecastAction:focus {{border-color:{ACCENT};}}
+            QPushButton#ForecastAction:disabled {{background:transparent; border-color:transparent;}}
+        """)
+        self.chart_button.clicked.connect(self.clicked)
+        stack.addWidget(self.chart_button)
+        self.setFocusProxy(self.chart_button)
+
+        # Подписи поверх кнопки пропускают нажатие и сохраняют свои цвета при отключении графика.
+        content = QWidget()
+        content.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        stack.addWidget(content)
+        stack.setCurrentWidget(content)
+        box = QVBoxLayout(content)
+        box.setContentsMargins(10, 5, 10, 5)
+        box.setSpacing(4)
+        top = QHBoxLayout()
+        top.setSpacing(8)
         self.bar = SegmentBar()
-        box.addWidget(self.bar)
-        box.addSpacing(6)
-        bottom = QHBoxLayout()
+        top.addWidget(self.bar, 1)
+        self.action_label = QLabel("Расход")
+        self.action_label.setObjectName("ForecastAxis")
+        self.action_label.setStyleSheet(f"color:{COLORS['project_text']}; font-weight:600;")
+        top.addWidget(self.action_label)
+        box.addLayout(top)
+        bottom = QFormLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(8)
+        bottom.setHorizontalSpacing(0)
+        bottom.setVerticalSpacing(1)
+        bottom.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        bottom.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.now_label = QLabel()
+        # Отступ в размере подписи участвует в расчете переноса строки.
+        self.now_label.setContentsMargins(0, 0, 8, 0)
         self.end_label = QLabel()
         self.end_label.setTextFormat(Qt.TextFormat.RichText)
+        self.end_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         for label in (self.now_label, self.end_label):
             label.setObjectName("ForecastAxis")
-        bottom.addWidget(self.now_label)
-        bottom.addStretch(1)
-        bottom.addWidget(self.end_label)
+        bottom.addRow(self.now_label, self.end_label)
         box.addLayout(bottom)
         self.forecast: WeekForecast | None = None
+        self.chart_button.toggled.connect(self._update_action_hint)
+        self._update_action_hint()
 
     def set_forecast(self, forecast: WeekForecast) -> None:
         self.forecast = forecast
@@ -198,27 +254,27 @@ class ForecastBar(QFrame):
         self.now_label.setText(now)
         self.end_label.setText(reset_html(forecast))
         self.bar.set_values(forecast.now_fraction, forecast.exhaust_fraction if forecast.short_hours is not None else None)
-        self.setToolTip(
-            f"Прогноз недели: {status_text(forecast)}.\n"
-            f"Использовано {number(forecast.used)}% недельного лимита. {rate_text(forecast)}"
-        )
 
-    def enterEvent(self, event) -> None:
-        self.entered.emit()
-        super().enterEvent(event)
+    def set_chart_enabled(self, enabled: bool) -> None:
+        if self.chart_button.isEnabled() == enabled:
+            return
+        self.chart_button.setEnabled(enabled)
+        self.chart_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus if enabled else Qt.FocusPolicy.NoFocus)
+        self.chart_button.setCursor(Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.action_label.setVisible(enabled)
+        if not enabled:
+            self.set_chart_open(False)
+        self._update_action_hint()
 
-    def leaveEvent(self, event: QEvent) -> None:
-        self.left.emit()
-        super().leaveEvent(event)
+    def set_chart_open(self, opened: bool) -> None:
+        self.chart_button.setChecked(opened and self.chart_button.isEnabled())
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-    def contextMenuEvent(self, event) -> None:
-        self.context_requested.emit()
-        event.accept()
+    def _update_action_hint(self) -> None:
+        hint = ""
+        if self.chart_button.isEnabled():
+            hint = "Нажми, чтобы закрыть график." if self.chart_button.isChecked() else "Нажми, чтобы открыть расход за неделю по проектам."
+        self.setToolTip(hint)
+        self.chart_button.setToolTip(hint)
 
 
 # --------------------------------------------------------------------------- #
@@ -370,17 +426,22 @@ class WeekChartView(QWidget):
             width = painter.fontMetrics().horizontalAdvance(name.capitalize())
             painter.drawText(QPointF(self._x(day + 0.5) - width / 2, 188), name.capitalize())
         painter.setPen(secondary)
-        text = f"сейчас: {number(forecast.used)}%"
-        painter.drawText(QPointF(self._x(now_days) - 4 - painter.fontMetrics().horizontalAdvance(text), 26), text)
         metrics = painter.fontMetrics()
+        text = f"сейчас: {number(forecast.used)}%"
+        width = metrics.horizontalAdvance(text)
+        # Подпись не уходит за левый край поля: в начале недели она стоит справа от линии "сейчас".
+        now_x = self._x(now_days) - 4 - width
+        if now_x < X0:
+            now_x = min(self._x(now_days) + 4, X1 - width)
+        painter.drawText(QPointF(now_x, 26 if exhaust is None else 14), text)
         reset_text = f"сброс {clock_text(forecast.resets_at)}"
         reset_x = X1 - 2 - metrics.horizontalAdvance(reset_text)
         reset_y = self._y(100) + 14
         painter.setPen(QColor(DANGER))
         if exhaust is not None:
-            text = f"кончится {clock_text(forecast.exhausted_at)}"
+            text = exhausted_text(forecast)
             width = metrics.horizontalAdvance(text)
-            left = self._x(exhaust * 7.0) - width / 2
+            left = max(X0, min(self._x(exhaust * 7.0) - width / 2, X1 - width))
             if left + width + 6 > reset_x:  # подписи сошлись: сброс уходит строкой ниже
                 reset_y += 14
             painter.drawText(QPointF(left, 30), text)
@@ -408,7 +469,12 @@ class LegendChip(QFrame):
         swatch.setFixedSize(10, 10)
         swatch.setStyleSheet(f"background:{self.color};border-radius:3px;border:none;")
         box.addWidget(swatch)
-        self.text = QLabel(f"{item.name} <b>{number(item.total)}%</b>")
+        # Имя папки показывается как текст; длинное сокращается, чтобы процент оставался виден.
+        name = item.name if len(item.name) <= LEGEND_NAME_LIMIT else item.name[:LEGEND_NAME_LIMIT - 1] + "…"
+        self.text = QLabel(f"{html.escape(name)} <b>{number(item.total)}%</b>")
+        self.text.setTextFormat(Qt.TextFormat.RichText)
+        if name != item.name:
+            self.setToolTip(html.escape(item.name))
         self.text.setObjectName("LegendText")
         box.addWidget(self.text)
         self.set_active(False)  # рамка нужна до расчета размера, иначе содержимое потом срезается
@@ -421,18 +487,18 @@ class LegendChip(QFrame):
         super().enterEvent(event)
 
 
-class ForecastPopup(QWidget):
-    """Всплывающий график «Расход недели по проектам»; отдельное окно без рамки поверх виджета."""
+class ForecastPopup(QDialog):
+    """Окно недельного расхода с закрытием кнопкой или клавишей Escape."""
 
     closed = Signal()
-    entered = Signal()
-    left = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowTitle(CHART_TITLE)
+        self.rejected.connect(self.closed)
         # Окно без фона, скругленная рамка с фоном внутри: у прозрачного окна верхнего уровня фон из стиля не рисуется.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        keep_tool_window_visible(self)
         self.setFixedWidth(POPUP_WIDTH)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -449,39 +515,39 @@ class ForecastPopup(QWidget):
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(8)
-        self.title = QLabel("Расход недели по проектам")
+        self.title = QLabel(CHART_TITLE)
         self.title.setObjectName("PopupHeading")
-        self.pinned_chip = QLabel("закреплено")
-        self.pinned_chip.setObjectName("PopupPinned")
-        self.pinned_chip.setVisible(False)
         self.close_button = QToolButton()
         self.close_button.setObjectName("PopupClose")
         self.close_button.setText("×")
+        self.close_button.setAccessibleName("Закрыть график")
+        self.close_button.setMinimumSize(28, 28)
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.close_button.setStyleSheet(f"QToolButton#PopupClose:focus {{border:1px solid {ACCENT}; border-radius:4px;}}")
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_button.setToolTip("Закрыть")
-        self.close_button.clicked.connect(self.closed)
+        self.close_button.setToolTip("Закрыть график (Esc)")
+        self.close_button.clicked.connect(self.reject)
         head.addWidget(self.title, 1)
-        head.addWidget(self.pinned_chip)
         head.addWidget(self.close_button)
         box.addLayout(head)
-        tiles = QHBoxLayout()
-        tiles.setContentsMargins(0, 0, 0, 0)
-        tiles.setSpacing(8)
+        summary = QFrame()
+        summary.setObjectName("PopupTile")
+        metrics = QFormLayout(summary)
+        metrics.setContentsMargins(10, 6, 10, 6)
+        metrics.setVerticalSpacing(2)
+        metrics.setHorizontalSpacing(12)
+        metrics.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        metrics.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        metrics.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.tiles: list[tuple[QLabel, QLabel]] = []
         for _ in range(3):
-            tile = QFrame()
-            tile.setObjectName("PopupTile")
-            tile_box = QVBoxLayout(tile)
-            tile_box.setContentsMargins(10, 8, 10, 8)
-            tile_box.setSpacing(0)
             caption, value = QLabel(), QLabel()
             caption.setObjectName("TileCaption")
             value.setObjectName("TileValue")
-            tile_box.addWidget(caption)
-            tile_box.addWidget(value)
-            tiles.addWidget(tile, 1)
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            metrics.addRow(caption, value)
             self.tiles.append((caption, value))
-        box.addLayout(tiles)
+        box.addWidget(summary)
         self.view = WeekChartView()
         self.view.highlight_changed.connect(self.set_highlighted)
         box.addWidget(self.view)
@@ -498,10 +564,14 @@ class ForecastPopup(QWidget):
         self.note.setWordWrap(True)
         box.addWidget(self.note)
 
-    def set_pinned(self, pinned: bool) -> None:
-        self.pinned_chip.setVisible(pinned)
-
     def set_data(self, forecast: WeekForecast, chart: WeekChart | None) -> None:
+        # Фоновое обновление сохраняет выбранный проект и не пересобирает легенду без изменений.
+        previous = self.chart
+        selected = (previous.series[self.highlighted].name
+                    if previous is not None and 0 <= self.highlighted < len(previous.series) else None)
+        same_legend = (previous is not None and chart is not None
+                       and [(s.name, round(s.total)) for s in previous.series]
+                       == [(s.name, round(s.total)) for s in chart.series])
         self.forecast = forecast
         self.chart = chart
         short = forecast.short_hours is not None
@@ -509,7 +579,7 @@ class ForecastPopup(QWidget):
         values = (
             ("Израсходовано", f"{number(forecast.used)}%", False),
             ("Темп", rate_value(forecast), False),
-            ("До сброса можно", f"{number(forecast.allowed_per_day)}% в сутки" if forecast.allowed_per_day is not None else "—", short),
+            ("Можно до сброса", f"{number(forecast.allowed_per_day)}% в сутки" if forecast.allowed_per_day is not None else "-", short),
         )
         for (caption, value), (name, text, red) in zip(self.tiles, values):
             caption.setText(name)
@@ -519,8 +589,10 @@ class ForecastPopup(QWidget):
             value.style().polish(value)
         self.view.set_chart(chart)
         self.view.setVisible(chart is not None)
-        self._rebuild_legend()
-        self.set_highlighted(-1)
+        if not same_legend:
+            self._rebuild_legend()
+        names = [item.name for item in chart.series] if chart is not None else []
+        self.set_highlighted(names.index(selected) if selected in names else -1)
 
     def _rebuild_legend(self) -> None:
         for chip in self._chips:
@@ -558,12 +630,8 @@ class ForecastPopup(QWidget):
             self.info.setText(chart_info(self.chart, index))
         else:
             self.info.setText("Для графика пока мало замеров недельного лимита.")
-        self.adjustSize()
-
-    def enterEvent(self, event) -> None:
-        self.entered.emit()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event: QEvent) -> None:
-        self.left.emit()
-        super().leaveEvent(event)
+        # Высота переносимых строк зависит от фактической фиксированной ширины окна.
+        self.ensurePolished()
+        box = self.layout()
+        box.activate()
+        self.setFixedHeight(max(box.totalMinimumSize().height(), box.totalHeightForWidth(self.width())))

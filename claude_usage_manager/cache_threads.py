@@ -18,7 +18,7 @@
   после 16 минут и дольше не сохранился ни разу из 13), помечается «~».
 - Antigravity: в базе разговоров нет данных о кэше, только время последнего
   изменения разговора; оценка 5 минут, помечается «~», проверить её нечем.
-  В виджете не показывается (решение владельца 12.11.2026), сканер читает базу
+  В виджете не показывается, сканер читает базу
   только если ему явно передали каталог.
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ from urllib.parse import unquote
 
 from . import provider_settings
 from .codex_sessions import record_usage, session_metadata, user_text as _codex_user_text
+from .history_jsonl import CODEX_MODEL_FIELDS, jsonl_records
 from .thread_activity import (
     AliveCheck,
     ClaudeUnreadReader,
@@ -88,8 +89,9 @@ ANTIGRAVITY_TTL_DEFAULT = 300
 CODEX_LOOKBACK_DAYS = 60
 GROK_LOG_TAIL_BYTES = 2 * 1024 * 1024
 COOLED_GRACE_SECONDS = 600
-COLLAPSED_THREADS = 3  # тредов до ссылки «ещё N» (решение владельца 12.11.2026)
+COLLAPSED_THREADS = 3  # тредов до ссылки «ещё N»
 TITLE_LIMIT = 60
+CODEX_META_HORIZON_SECONDS = 6 * 3600
 HEAD_BYTES = 256 * 1024
 TAIL_BYTES = 256 * 1024
 TAIL_MAX_BYTES = 4 * 1024 * 1024
@@ -120,7 +122,7 @@ class CacheThread:
     """Один тред с известным моментом, когда его кэш остынет.
 
     `activity` - состояние треда по локальным данным: работает, ждет ответа
-    владельца, завершил ход и не просмотрен; пусто, когда признака нет.
+    пользователя, завершил ход и не просмотрен; пусто, когда признака нет.
     """
 
     agent: str
@@ -175,9 +177,11 @@ def select_threads(
     треды; с `limit` - первые и число скрытых из-за лимита.
     """
     live = [t for t in threads if not t.cooled(now)]
+    # Тред, который сейчас работает или ждет ответа, не пропадает из списка и счетчика после остывания кэша.
     cooled = [
         t for t in threads
-        if t.cooled(now) and (now - t.expires_at).total_seconds() <= grace
+        if t.cooled(now) and ((now - t.expires_at).total_seconds() <= grace
+                              or getattr(t, "activity", "") in ("working", "needs_reply"))
     ]
     live.sort(key=lambda t: (t.fraction(now), t.expires_at))
     cooled.sort(key=lambda t: t.expires_at, reverse=True)
@@ -206,7 +210,7 @@ def _read_tail_lines(path: pathlib.Path, size: int) -> list[str]:
         length = stream.tell()
         offset = max(0, length - size)
         stream.seek(offset)
-        data = stream.read()
+        data = stream.read(length - offset)
     lines = data.decode("utf-8", errors="replace").split("\n")
     if offset > 0 and lines:
         lines = lines[1:]
@@ -224,10 +228,13 @@ def _loads(line: str) -> dict[str, Any] | None:
 def _project_label(cwd: str | None) -> str:
     if not cwd:
         return "—"
-    if "scratch-workspaces" in cwd.casefold():
+    parts = cwd.replace("\\", "/").rstrip("/").split("/")
+    folders = [part.casefold() for part in parts[:-1]]
+    if "scratch-workspaces" in folders and {"claude", "claude-data"}.intersection(
+        folders[:folders.index("scratch-workspaces")]
+    ):
         return "без папки"
-    name = cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    return name or cwd
+    return parts[-1] or cwd
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +323,40 @@ def _claude_head_meta(path: pathlib.Path) -> dict[str, Any]:
             if meaningful_prompt(prompt):
                 meta["first_prompt"] = prompt
     return meta
+
+
+_TITLE_CHUNK = 1024 * 1024
+
+
+def _scan_custom_titles(path: pathlib.Path, offset: int, latest: str) -> tuple[int, str]:
+    """Последнее название (customTitle) в дописанной с `offset` части журнала; читаются только целые строки."""
+    size = path.stat().st_size
+    if offset > size:
+        offset, latest = 0, ""
+    if offset == size:
+        return offset, latest
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        rest = b""
+        while True:
+            chunk = stream.read(_TITLE_CHUNK)
+            if not chunk:
+                break
+            data = rest + chunk
+            end = data.rfind(b"\n")
+            if end < 0:
+                rest = data
+                continue
+            for line in data[:end].split(b"\n"):
+                if b'"customTitle"' not in line:
+                    continue
+                item = _loads(line.decode("utf-8", errors="replace"))
+                title = item.get("customTitle") if item else None
+                if isinstance(title, str) and title.strip():
+                    latest = title.strip()
+            offset += len(data[:end + 1])
+            rest = data[end + 1:]
+    return offset, latest
 
 
 def _parse_claude_file(path: pathlib.Path, head_meta: dict[str, Any]) -> CacheThread | None:
@@ -422,18 +463,8 @@ def _scan_codex_model(path: pathlib.Path, offset: int, model: str) -> tuple[int,
     """
     with path.open("rb") as stream:
         stream.seek(offset)
-        while True:
-            line = stream.readline()
-            if not line or not line.endswith(b"\n"):
-                break
-            offset += len(line)
-            if b'"turn_context"' not in line:
-                continue
-            try:
-                item = json.loads(line)
-            except ValueError:
-                continue
-            payload = item.get("payload") if isinstance(item, dict) and item.get("type") == "turn_context" else None
+        for offset, item in jsonl_records(stream, (b'"turn_context"',), CODEX_MODEL_FIELDS):
+            payload = item.get("payload") if item and item.get("type") == "turn_context" else None
             found = payload.get("model") if isinstance(payload, dict) else None
             if isinstance(found, str) and found:
                 model = found
@@ -855,8 +886,9 @@ class ThreadScanner:
         self._antigravity_dir = antigravity_dir  # в виджете не показывается: без явного каталога базу не читаем
         self._desktop_dirs = desktop_dirs
         self._desktop: DesktopSessionIndex | None = None
-        self._parsed: dict[str, tuple[int, int, CacheThread | None]] = {}
+        self._parsed: dict[str, tuple[tuple[int, int, int, int], CacheThread | None]] = {}
         self._head_meta: dict[str, dict[str, Any]] = {}
+        self._custom_titles: dict[str, tuple[int, str]] = {}
         self._codex_models: dict[str, tuple[int, str]] = {}
         self._grok_log: tuple[tuple[int, int], dict[str, dt.datetime]] | None = None
         self._grok_meta: dict[str, tuple[int, int, GrokSession | None]] = {}
@@ -882,6 +914,9 @@ class ThreadScanner:
             claude = provider_settings.provider_profile("claude") if provider_settings.provider_enabled("claude") else None
             if claude != self._claude_dir:
                 self._desktop = None
+                self._desktop_resolved.clear()
+                self._desktop_sessions.clear()
+                self._claude_paths.clear()
                 self._claude_blocked.clear()
                 self._claude_dir = claude
             self._codex_dir = (provider_settings.provider_profile("codex") / "sessions"
@@ -890,6 +925,8 @@ class ThreadScanner:
             if grok != self._grok_dir:
                 self._grok_dir = grok
                 self._grok_log = None
+                self._grok_meta.clear()
+                self._grok_index.clear()
                 self._grok_events.clear()
         seen: set[str] = set()
         result = {
@@ -898,6 +935,10 @@ class ThreadScanner:
             "grok": self._scan_grok() if self._grok_dir else [],
             "antigravity": self._scan_antigravity() if self._antigravity_dir else [],
         }
+        if not result["claude"]:
+            self._claude_blocked.clear()
+        if not result["grok"]:
+            self._grok_events.clear()
         result["claude"] = self._with_activity("claude", result["claude"], lambda threads: self._claude_activity(threads))
         result["codex"] = self._with_activity("codex", result["codex"], lambda threads: self._codex_activity(threads, now))
         result["grok"] = self._with_activity("grok", result["grok"], lambda threads: self._grok_activity(threads))
@@ -905,6 +946,8 @@ class ThreadScanner:
             del self._parsed[key]
         for key in [k for k in self._head_meta if f"claude:{k}" not in seen]:
             del self._head_meta[key]
+        for key in [k for k in self._custom_titles if f"claude:{k}" not in seen]:
+            del self._custom_titles[key]
         for key in [k for k in self._codex_models if f"codex:{k}" not in seen]:
             del self._codex_models[key]
         return result
@@ -960,6 +1003,16 @@ class ThreadScanner:
             # при следующей записи в файл оно читается заново, и название появляется.
             if meta["first_prompt"] or meta["titles"]:
                 self._head_meta[str(path)] = meta
+        # Название, заданное пользователем в середине длинного журнала, ищется по дописанной части файла:
+        # иначе оно пропадало, когда уходило из начала и хвоста журнала.
+        offset, latest = self._custom_titles.get(str(path), (0, ""))
+        try:
+            offset, latest = _scan_custom_titles(path, offset, latest)
+        except OSError:
+            pass
+        self._custom_titles[str(path)] = (offset, latest)
+        if latest:
+            meta = {**meta, "titles": [*meta["titles"], latest]}
         return _parse_claude_file(path, meta)
 
     def _scan_codex(self, now: dt.datetime, seen: set[str]) -> list[CacheThread]:
@@ -973,6 +1026,10 @@ class ThreadScanner:
             )
             if thread:
                 threads.append(thread)
+        # Названия и состояние из баз Codex нужны только недавним тредам: давно остывшие в список
+        # не попадут, а запросы по всем сессиям за 60 дней занимали почти весь интервал скана.
+        threads = [thread for thread in threads
+                   if (now - thread.expires_at).total_seconds() <= CODEX_META_HORIZON_SECONDS]
         return self._apply_codex_meta(threads, root)
 
     def _codex_model_of(self, path: pathlib.Path) -> str:
@@ -1147,10 +1204,15 @@ class ThreadScanner:
         if horizon is not None and stat.st_mtime < horizon:
             return None
         seen.add(key)
-        signature = (stat.st_mtime_ns, stat.st_size)
+        signature = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
         cached = self._parsed.get(key)
-        if cached and cached[:2] == signature:
-            return cached[2]
+        if cached:
+            previous, thread = cached
+            if previous == signature:
+                return thread
+            if previous[:2] != signature[:2] or signature[3] <= previous[3]:
+                self._head_meta.pop(str(path), None)
+                self._codex_models.pop(str(path), None)
         try:
             thread = loader(path)
         except OSError:
@@ -1159,5 +1221,5 @@ class ThreadScanner:
             # Один испорченный журнал не должен ронять скан остальных (и лог каждые 10 секунд).
             get_logger().warning("Журнал %s пропущен при сканировании кэша тредов", path, exc_info=True)
             thread = None
-        self._parsed[key] = (*signature, thread)
+        self._parsed[key] = (signature, thread)
         return thread

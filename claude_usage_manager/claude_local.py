@@ -1,6 +1,7 @@
 """Local, documented Claude Code status-line quota input. Never contacts Anthropic."""
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 import hashlib
@@ -75,6 +76,22 @@ def _atomic_json(path: pathlib.Path, value: dict[str, Any]) -> None:
             json.dump(value, stream, ensure_ascii=False, sort_keys=True)
             stream.write("\n")
         os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_settings(path: pathlib.Path, value: dict[str, Any]) -> None:
+    """Записать чужой settings.json читаемо, в прежнем порядке ключей и в файл по ссылке."""
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -166,18 +183,19 @@ def read_statusline_quota(*, path: pathlib.Path | None = None,
         return result
 
 
-def _manual_date(value: str, now: dt.datetime) -> dt.datetime:
+def _manual_date(value: str) -> dt.datetime:
+    # Наивное местное время переводится по правилам часового пояса на саму дату,
+    # а не по смещению текущего момента: срок после перевода часов не сдвигается на час.
     parsed = dt.datetime.strptime(value.strip(), "%Y-%m-%d %H:%M")
-    local_zone = now.astimezone().tzinfo or dt.timezone.utc
-    parsed = parsed.replace(tzinfo=local_zone).astimezone(dt.timezone.utc)
-    if parsed <= now.astimezone(dt.timezone.utc):
-        raise ValueError("Срок сброса уже истёк: " + value)
-    return parsed
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def parse_manual_resets(text: str, *, now: dt.datetime | None = None) -> list[dt.datetime | None]:
-    """One offer per line, ISO local time or '-' when the offer has no expiry."""
-    moment = now or dt.datetime.now(dt.timezone.utc)
+    """One offer per line, ISO local time or '-' when the offer has no expiry.
+
+    Срок, истекший, пока окно было открыто, просто не сохраняется: остальной список не теряется.
+    """
+    moment = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     values: list[dt.datetime | None] = []
     for line in text.splitlines():
         line = line.strip()
@@ -187,11 +205,13 @@ def parse_manual_resets(text: str, *, now: dt.datetime | None = None) -> list[dt
             raise ValueError("Можно учесть не более 30 сбросов.")
         if line in ("-", "—", "без срока"):
             values.append(None)
-        else:
-            try:
-                values.append(_manual_date(line, moment))
-            except (ValueError, OverflowError) as error:
-                raise ValueError("Неверный срок (нужен YYYY-MM-DD HH:MM): " + line) from error
+            continue
+        try:
+            stamp = _manual_date(line)
+        except (ValueError, OverflowError, OSError) as error:
+            raise ValueError("Неверный срок (нужен YYYY-MM-DD HH:MM): " + line) from error
+        if stamp > moment:
+            values.append(stamp)
     return values
 
 
@@ -270,9 +290,23 @@ def bridge_command(*, profile: pathlib.Path | None = None) -> str:
     return statusline_command("--claude-statusline", *args)
 
 
+def _powershell_words(command: str) -> list[str] | None:
+    """Слова команды из формы PowerShell -EncodedCommand, которую пишет монитор без Git Bash."""
+    match = re.search(r"-EncodedCommand\s+([A-Za-z0-9+/=]+)", command)
+    if not match:
+        return None
+    try:
+        script = base64.b64decode(match.group(1), validate=True).decode("utf-16-le")
+    except (ValueError, UnicodeError):
+        return None
+    quotes = "'‘’‚‛"
+    words = re.findall(f"[{quotes}]((?:[^{quotes}]|[{quotes}]{{2}})*)[{quotes}]", script.split("|")[0])
+    return [re.sub(f"([{quotes}])\\1", r"\1", word) for word in words]
+
+
 def _owned_command(command: str) -> bool:
     try:
-        words = shlex.split(command, posix=True)
+        words = _powershell_words(command) or shlex.split(command, posix=True)
         at = words.index("--claude-statusline")
     except ValueError:
         return False
@@ -287,6 +321,17 @@ def _owned_command(command: str) -> bool:
     if options and (len(options) > 2 or not re.fullmatch(r"default|[a-f0-9]{64}", options[0])):
         return False
     return ours and (len(options) < 2 or pathlib.Path(options[1]).is_absolute())
+
+
+def _previous_from_backup(settings: pathlib.Path) -> dict[str, Any] | None:
+    try:
+        backup = json.loads(settings.with_name(settings.name + ".ai-limits-backup").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    candidate = backup.get("statusLine") if isinstance(backup, dict) else None
+    if isinstance(candidate, dict) and not _owned_command(str(candidate.get("command", ""))):
+        return candidate
+    return None
 
 
 def install_statusline_command(command: str, *,
@@ -321,23 +366,79 @@ def install_statusline_command(command: str, *,
             return "conflict"
     elif current is not None:
         return "conflict"
-    raw["statusLine"] = {"type": "command", "command": command}
+    try:
+        saved = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    # Прежняя строка состояния пользователя нужна, чтобы вернуть ее при отключении и удалении монитора.
+    # Здесь current либо пуст, либо уже команда монитора: тогда прежнее значение лежит в резервной копии.
+    if isinstance(saved, dict) and "previous" in saved:
+        previous = saved["previous"]
+    else:
+        previous = _previous_from_backup(settings) if isinstance(current, dict) else None
+    # Дополнительные ключи statusLine (padding и другие) остаются.
+    raw["statusLine"] = {**(current if isinstance(current, dict) else {}), "type": "command", "command": command}
     settings.parent.mkdir(parents=True, exist_ok=True)
     if settings.exists():
         if settings.read_bytes() != original:
             raise ValueError("Настройки Claude изменились. Открой подключение еще раз.")
-        backup = settings.with_name(settings.name + ".ai-limits-backup")
-        if not backup.exists():
-            shutil.copy2(settings, backup)
-    _atomic_json(settings, raw)
-    _atomic_json(receipt, {"command_hash": digest(command)})
+        shutil.copy2(settings.resolve(), settings.with_name(settings.name + ".ai-limits-backup"))
+    _write_settings(settings, raw)
+    _atomic_json(receipt, {"command_hash": digest(command), "settings": str(settings), "previous": previous})
     return "installed"
+
+
+def remove_statusline_command(*, settings_path: pathlib.Path | None = None) -> str:
+    """Вернуть строку состояния, которая была до подключения монитора. Чужую команду не трогает."""
+    settings = settings_path or claude_root() / "settings.json"
+    if not settings.is_file():
+        return "absent"
+    identity = hashlib.sha256(os.path.normcase(str(settings.resolve())).encode("utf-8")).hexdigest()
+    receipt = data_dir() / "claude-hooks" / (identity + ".json")
+    original = settings.read_bytes()
+    raw = json.loads(original.decode("utf-8-sig"))
+    if not isinstance(raw, dict):
+        raise ValueError("Настройки Claude должны содержать JSON-объект.")
+    current = raw.get("statusLine")
+    existing = current.get("command") if isinstance(current, dict) else None
+    if not isinstance(existing, str):
+        return "absent"
+    try:
+        saved = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    known = saved.get("command_hash") == hashlib.sha256(existing.encode("utf-8")).hexdigest()
+    if not (known or _owned_command(existing)):
+        return "foreign"
+    # Подключение прежней версии: прежнее значение осталось только в резервной копии.
+    previous = saved["previous"] if "previous" in saved else _previous_from_backup(settings)
+    if isinstance(previous, dict):
+        raw["statusLine"] = previous
+    else:
+        raw.pop("statusLine", None)
+    if settings.read_bytes() != original:
+        raise ValueError("Настройки Claude изменились. Повтори отключение.")
+    _write_settings(settings, raw)
+    receipt.unlink(missing_ok=True)
+    return "removed"
+
+
+def _source_enabled() -> bool:
+    try:
+        from .provider_settings import provider_enabled
+
+        return provider_enabled("claude")
+    except Exception:  # noqa: BLE001 - поврежденные настройки не должны ломать строку состояния клиента
+        return True
 
 
 def statusline_main(args: list[str] | None = None) -> int:
     """Claude Code invokes this command with JSON on stdin; no Qt, tokens, or HTTP."""
     try:
-        raw = sys.stdin.buffer.read(MAX_PAYLOAD + 1)
+        # У программы без консоли стандартный ввод отсутствует, если вызывающий процесс его не передал.
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(MAX_PAYLOAD + 1) if stream is not None else b""
         if len(raw) > MAX_PAYLOAD:
             print("Claude")
             return 0
@@ -350,7 +451,11 @@ def statusline_main(args: list[str] | None = None) -> int:
                 return 2
             os.environ["AI_LIMITS_DATA_DIR"] = options[1]
         key = options[0] if options and options[0] != "default" else ""
-        valid = ingest_statusline(payload, path=_snapshot_path(key))
+        if _source_enabled():
+            valid = ingest_statusline(payload, path=_snapshot_path(key))
+        else:
+            # Источник выключен в подключениях: строку состояния показываем, замеры не сохраняем.
+            valid = isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict)
         windows = payload.get("rate_limits", {}) if isinstance(payload, dict) else {}
         labels = []
         if valid and isinstance(windows, dict):

@@ -12,17 +12,25 @@ from PySide6.QtCore import QByteArray,QObject,QRunnable,Qt,QThreadPool,QTimer,Si
 from PySide6.QtGui import QCloseEvent,QIcon
 from PySide6.QtWidgets import QApplication,QCheckBox,QComboBox,QDialog,QDialogButtonBox,QFrame,QGridLayout,QHBoxLayout,QLabel,QMainWindow,QProgressBar,QPushButton,QScrollArea,QTreeWidget,QTreeWidgetItem,QVBoxLayout,QWidget
 
+from . import APP_VERSION
 from .database import Database
 from .icon import ensure_icon
+from .provider_settings import load_connections
+from .quota_columns import remaining_level
 from .models import QuotaSnapshot
 from .qt_gui import apply_windows_dark_frame
 from .qt_theme import COLORS,build_stylesheet
 from .quota_monitor_model import PROVIDERS,PROVIDER_LABELS,LimitCell,MonitorRow,ProviderState,build_rows,cached_states,manual_reset_tooltip,manual_reset_urgency,refresh_states
 from .utils import get_logger,now_local,setup_logging
 
-MONITOR_NAME="AI Limits Monitor — Подробно"
-MONITOR_VERSION="1.0.0-details"
+MONITOR_NAME="AI Limits Monitor · Подробно"
+MONITOR_VERSION=APP_VERSION
 DEFAULT_REFRESH=60
+# Собственные ключи окна: общие с виджетом ключи затирали настройки друг друга.
+TOPMOST_SETTING="limits_window_always_on_top"
+REFRESH_SETTING="limits_window_refresh_seconds"
+WIDGET_REFRESH_SETTING="monitor_refresh_seconds"
+GAUGE_COLORS={"danger":COLORS["danger"],"warning":COLORS["warning"],"ok":COLORS["success"]}
 _MUTEX_NAME="AIUsageMonitor_Details_SingleInstance_v1"
 _ALREADY_EXISTS=183
 
@@ -72,7 +80,8 @@ class Gauge(QFrame):
         if c is None or c.remaining is None:
             self.kind.setText("—");self.value.setText("—");self.bar.setValue(0);self.reset.setText("нет окна");return
         x=max(0,min(100,c.remaining));self.kind.setText(c.label);self.value.setText(f"{x:.0f}%");self.bar.setValue(round(x))
-        color=COLORS["danger"] if x<=20 else COLORS["warning"] if x<=45 else COLORS["success"]
+        # Пороги общие с виджетом и считаются по показанному (округленному) числу.
+        color=GAUGE_COLORS[remaining_level(x)]
         self.bar.setStyleSheet(f"QProgressBar::chunk{{background:{color};border-radius:2px;}}")
         self.reset.setText(fmt_reset(c.resets_at)+(f" · {stale_label}" if stale else ""))
 
@@ -132,10 +141,13 @@ class SettingsDialog(QDialog):
     def __init__(self,rows,visibility,seconds,topmost,parent=None):
         super().__init__(parent);self.setWindowTitle("Настройки AI Limits Monitor");self.resize(560,620);self.visibility=dict(visibility)
         v=QVBoxLayout(self);v.setContentsMargins(16,16,16,16);v.setSpacing(12)
-        grid=QGridLayout();grid.addWidget(QLabel("Опрос Codex и Antigravity"),0,0);self.interval=QComboBox()
-        for label,val in (("15 секунд",15),("30 секунд",30),("1 минута",60),("2 минуты",120),("5 минут",300)):self.interval.addItem(label,val)
-        idx=self.interval.findData(seconds);self.interval.setCurrentIndex(idx if idx>=0 else self.interval.findData(60));grid.addWidget(self.interval,0,1)
-        self.topmost=QCheckBox("Поверх остальных окон");self.topmost.setChecked(topmost);grid.addWidget(self.topmost,1,0,1,2);v.addLayout(grid)
+        grid=QGridLayout();self.interval=None
+        if seconds is not None:
+            # Без своего опроса (окно внутри виджета) интервал задается в настройках виджета.
+            grid.addWidget(QLabel("Опрос Codex и Antigravity"),0,0);self.interval=QComboBox()
+            for label,val in (("15 секунд",15),("30 секунд",30),("1 минута",60),("2 минуты",120),("5 минут",300)):self.interval.addItem(label,val)
+            idx=self.interval.findData(seconds);self.interval.setCurrentIndex(idx if idx>=0 else self.interval.findData(60));grid.addWidget(self.interval,0,1)
+        self.topmost=QCheckBox("Это окно поверх остальных окон");self.topmost.setChecked(topmost);grid.addWidget(self.topmost,1,0,1,2);v.addLayout(grid)
         hint=QLabel("Включай и убирай отдельные строки. Новые модели автоматически появятся в списке.");hint.setObjectName("MonitorHint");hint.setWordWrap(True);v.addWidget(hint)
         self.tree=QTreeWidget();self.tree.setObjectName("MonitorSettingsTree");self.tree.setHeaderLabels(["Агент / модель"]);self.tree.setRootIsDecorated(True)
         for provider in PROVIDERS:
@@ -165,12 +177,14 @@ class SettingsDialog(QDialog):
             for j in range(p.childCount()):
                 c=p.child(j);key=c.data(0,Qt.ItemDataRole.UserRole)
                 if key:mapping[str(key)]=c.checkState(0)==Qt.CheckState.Checked
-        return int(self.interval.currentData()),self.topmost.isChecked(),mapping
+        return (int(self.interval.currentData()) if self.interval is not None else None),self.topmost.isChecked(),mapping
 
 
 class MonitorWindow(QMainWindow):
-    def __init__(self,db,*,auto_refresh:bool=True):
-        super().__init__();self.db=db;self.pool=QThreadPool.globalInstance();self.worker=None;self.states=cached_states(db);self.rows=build_rows(self.states);self.visibility=self._load_visibility();self.seconds=self._load_seconds();self.topmost=db.get_setting("monitor_always_on_top","1")!="0"
+    def __init__(self,db,*,auto_refresh:bool=True,refresh_handler=None):
+        # refresh_handler - обновление через виджет и его сборщик; окно тогда само квоты не опрашивает.
+        self._refresh_handler=refresh_handler
+        super().__init__();self.db=db;self.pool=QThreadPool.globalInstance();self.worker=None;self.states=cached_states(db);self.rows=build_rows(self.states);self.visibility=self._load_visibility();self.seconds=self._load_seconds();self.topmost=db.get_setting(TOPMOST_SETTING,"0")!="0"
         self.setWindowTitle(f"{MONITOR_NAME} {MONITOR_VERSION}");self.setWindowIcon(QIcon(str(ensure_icon())));self.setMinimumSize(650,420);self.resize(760,640);self._build();self._restore_geometry();self._apply_topmost();self._render()
         self.timer=QTimer(self);self.timer.timeout.connect(self.refresh);self.timer.start(self.seconds*1000);
         if auto_refresh:QTimer.singleShot(250,self.refresh)
@@ -187,7 +201,8 @@ class MonitorWindow(QMainWindow):
         try:data=json.loads(self.db.get_setting("monitor_visibility","{}") or "{}");return {str(k):bool(v) for k,v in data.items()} if isinstance(data,dict) else {}
         except json.JSONDecodeError:return {}
     def _load_seconds(self):
-        try:value=int(self.db.get_setting("monitor_refresh_seconds",str(DEFAULT_REFRESH)) or DEFAULT_REFRESH)
+        key=WIDGET_REFRESH_SETTING if self._refresh_handler is not None else REFRESH_SETTING
+        try:value=int(self.db.get_setting(key,str(DEFAULT_REFRESH)) or DEFAULT_REFRESH)
         except ValueError:value=DEFAULT_REFRESH
         return value if value in {15,30,60,120,300} else DEFAULT_REFRESH
     def _visible(self,row):return self.visibility.get(row.key,row.default_visible)
@@ -196,13 +211,25 @@ class MonitorWindow(QMainWindow):
             item=self.content_layout.takeAt(0);w=item.widget()
             if w:w.deleteLater()
         count=0
+        try:enabled={key for key,connection in load_connections().items() if connection.enabled}
+        except Exception:enabled=set(PROVIDERS)
+        if self._refresh_handler is not None:self.seconds=self._load_seconds()
         for provider in PROVIDERS:
+            if provider not in enabled:
+                # Выключенный источник не показывает пустые шкалы и не входит в счетчики.
+                continue
             state=self.states.get(provider) or ProviderState(provider,QuotaSnapshot(provider=provider),False,"Нет данных");rows=[r for r in self.rows.get(provider,[]) if self._visible(r)]
             if rows or state.error:self.content_layout.insertWidget(self.content_layout.count()-1,ProviderSection(provider,state,rows));count+=len(rows)
-        stamps=[s.snapshot.updated_at for s in self.states.values() if s.snapshot.updated_at];latest=max(stamps) if stamps else None;live=sum(s.live for s in self.states.values());local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in self.states.values());cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in self.states.values())
-        text=(f"Обновлено {latest.astimezone():%H:%M:%S}" if latest else "Нет снимков")+f" · live {live}/4 · строк {count}"+(f" · локальные {local}" if local else "")+(f" · кэш {cached}" if cached else "");self.status.setText(text);self.subtitle.setText(f"Остаток лимитов · опрос Codex/Antigravity каждые {refresh_label(self.seconds)}")
+        if not enabled:
+            msg=QLabel("Все источники выключены. Включи нужные в окне подключений виджета.");msg.setObjectName("ProviderMessage");msg.setWordWrap(True);self.content_layout.insertWidget(0,msg)
+        states=[s for p,s in self.states.items() if p in enabled]
+        stamps=[s.snapshot.updated_at for s in states if s.snapshot.updated_at];latest=max(stamps) if stamps else None;live=sum(s.live for s in states);local=sum((not s.live) and bool(s.snapshot.fallback_source) for s in states);cached=sum((not s.live) and not s.snapshot.fallback_source and s.snapshot.has_data() for s in states)
+        text=(f"Обновлено {latest.astimezone():%H:%M:%S}" if latest else "Нет снимков")+f" · live {live}/{len(enabled)} · строк {count}"+(f" · локальные {local}" if local else "")+(f" · кэш {cached}" if cached else "");self.status.setText(text);self.subtitle.setText(f"Остаток лимитов · опрос Codex/Antigravity каждые {refresh_label(self.seconds)}")
     @Slot()
     def refresh(self):
+        if self._refresh_handler is not None:
+            # Те же данные, что в виджете: запрос идет через его сборщик, окно перерисуется по результату.
+            self._refresh_handler();self.status.setText("Обновление запрошено…");return
         if self.worker:return
         self.refresh_btn.setEnabled(False);self.refresh_btn.setText("Обновление…");worker=Worker(self.db);worker.signals.finished.connect(self._done);worker.signals.failed.connect(self._failed);self.worker=worker;self.pool.start(worker)
     @Slot(object)
@@ -214,9 +241,13 @@ class MonitorWindow(QMainWindow):
     def _failed(self,details):self.worker=None;self.refresh_btn.setEnabled(True);self.refresh_btn.setText("Обновить");get_logger().error("AI Limits Monitor refresh: %s",details);self.status.setText("Ошибка обновления · показаны последние данные")
     @Slot()
     def open_settings(self):
-        d=SettingsDialog(self.rows,self.visibility,self.seconds,self.topmost,self);d.setStyleSheet(QApplication.instance().styleSheet())
+        own_polling=self._refresh_handler is None
+        d=SettingsDialog(self.rows,self.visibility,self.seconds if own_polling else None,self.topmost,self);d.setStyleSheet(QApplication.instance().styleSheet())
         if d.exec()!=QDialog.DialogCode.Accepted:return
-        self.seconds,self.topmost,self.visibility=d.result_settings();self.db.set_setting("monitor_refresh_seconds",str(self.seconds));self.db.set_setting("monitor_always_on_top","1" if self.topmost else "0");self.db.set_setting("monitor_visibility",json.dumps(self.visibility,ensure_ascii=False,sort_keys=True));self.timer.setInterval(self.seconds*1000);self._apply_topmost();self._render()
+        seconds,self.topmost,self.visibility=d.result_settings()
+        if own_polling and seconds is not None:
+            self.seconds=seconds;self.db.set_setting(REFRESH_SETTING,str(seconds));self.timer.setInterval(seconds*1000)
+        self.db.set_setting(TOPMOST_SETTING,"1" if self.topmost else "0");self.db.set_setting("monitor_visibility",json.dumps(self.visibility,ensure_ascii=False,sort_keys=True));self._apply_topmost();self._render()
     def _apply_topmost(self):
         flags=self.windowFlags();desired=flags|Qt.WindowType.WindowStaysOnTopHint if self.topmost else flags&~Qt.WindowType.WindowStaysOnTopHint
         if desired!=flags:

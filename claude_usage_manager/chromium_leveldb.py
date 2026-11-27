@@ -269,7 +269,10 @@ class LevelDbKeyReader:
                 cached = (stat.st_mtime_ns, stat.st_size, found)
                 self._cache[key] = cached
             versions.extend(cached[2])
-        for key in [k for k in self._cache if k not in seen]:
+        # Удаляются только исчезнувшие файлы этого каталога: один читатель обслуживает несколько
+        # хранилищ приложения, и записи соседних каталогов в кэше остаются.
+        prefix = str(directory)
+        for key in [k for k in self._cache if k not in seen and str(pathlib.Path(k).parent) == prefix]:
             del self._cache[key]
         if not versions:
             return None
